@@ -1,0 +1,2 @@
+ALTER TABLE public.schedules DROP CONSTRAINT schedules_comparator_chk;
+ALTER TABLE public.schedules ADD CONSTRAINT schedules_comparator_chk CHECK (comparator IS NULL OR comparator = ANY (ARRAY['gte','lte','eq','gt','lt']));

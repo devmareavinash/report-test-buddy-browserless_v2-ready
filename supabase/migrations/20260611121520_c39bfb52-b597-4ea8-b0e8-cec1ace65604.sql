@@ -1,0 +1,1 @@
+ALTER TABLE public.reports ADD COLUMN IF NOT EXISTS default_sql_template_id uuid REFERENCES public.sql_templates(id) ON DELETE SET NULL;

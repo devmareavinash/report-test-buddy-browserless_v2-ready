@@ -1,0 +1,2 @@
+ALTER TABLE public.reports ADD COLUMN IF NOT EXISTS reference_credential_profile_id uuid REFERENCES public.credential_profiles(id) ON DELETE SET NULL;
+ALTER TABLE public.scripts ADD COLUMN IF NOT EXISTS reference_credential_profile_id uuid REFERENCES public.credential_profiles(id) ON DELETE SET NULL;

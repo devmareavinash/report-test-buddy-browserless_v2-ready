@@ -1,0 +1,1 @@
+ALTER TABLE public.scripts ADD COLUMN IF NOT EXISTS credential_profile_id uuid REFERENCES public.credential_profiles(id) ON DELETE SET NULL;

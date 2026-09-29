@@ -1,0 +1,110 @@
+{
+  "family": "rtb",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "2048",
+  "memory": "8192",
+  "executionRoleArn": "arn:aws:iam::717998086494:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::717998086494:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "Main",
+      "image": "717998086494.dkr.ecr.us-east-1.amazonaws.com/rtb-web:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 80,
+          "protocol": "tcp",
+          "name": "http"
+        }
+      ],
+      "environment": [
+        { "name": "BACKEND_UPSTREAM", "value": "127.0.0.1:8000" }
+      ],
+      "dependsOn": [
+        { "containerName": "backend", "condition": "START" }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "wget -qO- http://127.0.0.1/healthz || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/rtb",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "web"
+        }
+      }
+    },
+    {
+      "name": "backend",
+      "image": "717998086494.dkr.ecr.us-east-1.amazonaws.com/rtb-backend:latest",
+      "essential": true,
+      "portMappings": [{ "containerPort": 8000, "protocol": "tcp" }],
+      "environment": [
+        { "name": "BROWSERLESS_HOST", "value": "http://127.0.0.1:3000" },
+        { "name": "BROWSERLESS_OSS", "value": "true" },
+        { "name": "SNOWFLAKE_SSO_URL", "value": "http://127.0.0.1:8002" },
+        { "name": "LOCAL_FUNCTIONS_URL", "value": "http://127.0.0.1:8000/functions/v1" },
+        { "name": "ORCHESTRATE_CONCURRENCY", "value": "3" },
+        { "name": "PORT", "value": "8000" }
+      ],
+      "secrets": [
+        { "name": "SUPABASE_URL", "valueFrom": "arn:aws:secretsmanager:us-east-1:717998086494:secret:rtb/prod:SUPABASE_URL::" },
+        { "name": "SUPABASE_ANON_KEY", "valueFrom": "arn:aws:secretsmanager:us-east-1:717998086494:secret:rtb/prod:SUPABASE_ANON_KEY::" },
+        { "name": "SUPABASE_SERVICE_ROLE_KEY", "valueFrom": "arn:aws:secretsmanager:us-east-1:717998086494:secret:rtb/prod:SUPABASE_SERVICE_ROLE_KEY::" },
+        { "name": "BROWSERLESS_TOKEN", "valueFrom": "arn:aws:secretsmanager:us-east-1:717998086494:secret:rtb/prod:BROWSERLESS_TOKEN::" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/rtb",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "backend"
+        }
+      }
+    },
+    {
+      "name": "snowflake-sso",
+      "image": "717998086494.dkr.ecr.us-east-1.amazonaws.com/rtb-snowflake-sso:latest",
+      "essential": false,
+      "portMappings": [{ "containerPort": 8002, "protocol": "tcp" }],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/rtb",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "snowflake-sso"
+        }
+      }
+    },
+    {
+      "name": "browserless",
+      "image": "ghcr.io/browserless/chromium:v2.55.4",
+      "essential": true,
+      "portMappings": [{ "containerPort": 3000, "protocol": "tcp" }],
+      "environment": [
+        { "name": "CONCURRENT", "value": "10" },
+        { "name": "QUEUED", "value": "10" },
+        { "name": "TIMEOUT", "value": "420000" },
+        { "name": "CORS", "value": "true" },
+        { "name": "DEFAULT_LAUNCH_ARGS", "value": "[\"--disable-dev-shm-usage\",\"--ignore-certificate-errors\",\"--window-size=1920,1080\",\"--force-device-scale-factor=1\"]" }
+      ],
+      "secrets": [
+        { "name": "TOKEN", "valueFrom": "arn:aws:secretsmanager:us-east-1:717998086494:secret:rtb/prod:BROWSERLESS_TOKEN::" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/rtb",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "browserless"
+        }
+      }
+    }
+  ]
+}

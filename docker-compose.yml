@@ -1,0 +1,114 @@
+# Four containers: web (UI :8080), backend (Deno :8000), snowflake-sso (:8002),
+# browserless Chromium OSS (:3000). On AWS, only publish 8080 in the security group.
+# Do not expose 8000 / 8002 / 3000 to the internet.
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VITE_SUPABASE_URL: ${VITE_SUPABASE_URL}
+        VITE_SUPABASE_PUBLISHABLE_KEY: ${VITE_SUPABASE_PUBLISHABLE_KEY}
+        VITE_SUPABASE_PROJECT_ID: ${VITE_SUPABASE_PROJECT_ID}
+        VITE_USE_LOCAL_BACKEND: "true"
+        HTTP_PROXY: ${HTTP_PROXY:-http://10.185.190.10:8080}
+        HTTPS_PROXY: ${HTTPS_PROXY:-http://10.185.190.10:8080}
+        http_proxy: ${HTTP_PROXY:-http://10.185.190.10:8080}
+        https_proxy: ${HTTPS_PROXY:-http://10.185.190.10:8080}
+        NO_PROXY: ${NO_PROXY:-127.0.0.1,localhost}
+        no_proxy: ${NO_PROXY:-127.0.0.1,localhost}
+    environment:
+      BACKEND_UPSTREAM: backend:8000
+    ports:
+      - "127.0.0.1:8080:80"
+    restart: unless-stopped
+    depends_on:
+      - backend
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-http://10.185.190.10:8080}
+        HTTPS_PROXY: ${HTTPS_PROXY:-http://10.185.190.10:8080}
+        NO_PROXY: ${NO_PROXY:-127.0.0.1,localhost}
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+      LOVABLE_API_KEY: ${LOVABLE_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://chat.int.bayer.com/anthropic}
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-sonnet-4.5}
+      # Bypass Skyhigh for compose + host sidecar. Do not inherit .env NO_PROXY alone —
+      # host.docker.internal must be listed or Deno proxies SSO and fails.
+      HTTP_PROXY: ${HTTP_PROXY:-http://10.185.190.10:8080}
+      HTTPS_PROXY: ${HTTPS_PROXY:-http://10.185.190.10:8080}
+      NO_PROXY: 127.0.0.1,localhost,browserless,snowflake-sso,backend,host.docker.internal,chat.int.bayer.com
+      no_proxy: 127.0.0.1,localhost,browserless,snowflake-sso,backend,host.docker.internal,chat.int.bayer.com
+      # Force compose-network hostnames (ignore Codespaces/local .env overrides)
+      BROWSERLESS_HOST: http://browserless:3000
+      BROWSERLESS_TOKEN: ${BROWSERLESS_TOKEN:-local-dev-token}
+      BROWSERLESS_OSS: "true"
+      ORCHESTRATE_CONCURRENCY: ${ORCHESTRATE_CONCURRENCY:-3}
+      # Must be host.docker.internal — do NOT use .env's 127.0.0.1 (that is for native Deno).
+      # Inside the backend container, 127.0.0.1 is the container itself.
+      SNOWFLAKE_SSO_URL: http://snowflake-sso:8002
+      LOCAL_FUNCTIONS_URL: http://127.0.0.1:8000/functions/v1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    depends_on:
+      - browserless
+
+  snowflake-sso:
+    profiles: ["docker-sso"]
+    build:
+      context: .
+      dockerfile: backend/snowflake-sso/Dockerfile
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-http://10.185.190.10:8080}
+        HTTPS_PROXY: ${HTTPS_PROXY:-http://10.185.190.10:8080}
+        NO_PROXY: ${NO_PROXY:-127.0.0.1,localhost}
+    ports:
+      - "127.0.0.1:8002:8002"
+    environment:
+      # Corp VDI: Docker DNS can't resolve *.snowflakecomputing.com — use Skyhigh proxy.
+      # Leave unset on AWS ECS. insecure_mode auto-enables when a proxy is present.
+      HTTP_PROXY: ${HTTP_PROXY:-http://10.185.190.10:8080}
+      HTTPS_PROXY: ${HTTPS_PROXY:-http://10.185.190.10:8080}
+      NO_PROXY: ${NO_PROXY:-127.0.0.1,localhost,backend,browserless,web}
+      no_proxy: ${NO_PROXY:-127.0.0.1,localhost,backend,browserless,web}
+      SNOWFLAKE_INSECURE_SSL: ${SNOWFLAKE_INSECURE_SSL:-true}
+    restart: unless-stopped
+
+  browserless:
+    image: ghcr.io/browserless/chromium:v2.55.4
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      TOKEN: ${BROWSERLESS_TOKEN:-local-dev-token}
+      CONCURRENT: ${BROWSERLESS_CONCURRENT:-10}
+      QUEUED: ${BROWSERLESS_QUEUED:-10}
+      TIMEOUT: ${BROWSERLESS_TIMEOUT_MS:-420000}
+      CORS: "true"
+      # Do not pass the VDI Skyhigh proxy into Chromium (ERR_PROXY_CONNECTION_FAILED
+      # inside Docker). Ignore MITM TLS certs for MSTR; keep a 1x 1920x1080 viewport.
+      DEFAULT_LAUNCH_ARGS: ${BROWSERLESS_LAUNCH_ARGS:-["--ignore-certificate-errors","--ignore-certificate-errors-spki-list","--window-size=1920,1080","--force-device-scale-factor=1"]}
+    # VDI: Bayer Ethernet DNS (10.30.189.4/6) returns NXDOMAIN for mstr-*.bayer.com
+    # so Chrome is forced through the PAC (Netskope). Public DNS has the real AWS
+    # ALB records, and this host can TCP :443 to those IPs without a proxy.
+    # Do not list Bayer DNS first — NXDOMAIN is authoritative and will not fall
+    # through. Do not set Chromium --proxy-server to Skyhigh (ERR_PROXY_CONNECTION_FAILED).
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "mstr-prod.bayer.com:54.84.130.141"
+      - "mstr-qa.bayer.com:54.84.103.229"
+    shm_size: "2g"
+    restart: unless-stopped

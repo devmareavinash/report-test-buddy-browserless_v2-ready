@@ -1,0 +1,1 @@
+DELETE FROM public.sql_templates WHERE id='dc82c14c-ddbf-4096-8f8c-0c3df615d043';

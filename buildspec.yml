@@ -1,0 +1,45 @@
+version: 0.2
+
+# ECR repos: rtb-web, rtb-backend, rtb-snowflake-sso, rtb-browserless
+# Set in CodeBuild env: VITE_SUPABASE_URL, VITE_SUPABASE_PUBLISHABLE_KEY, VITE_SUPABASE_PROJECT_ID
+
+env:
+  variables:
+    IMAGE_TAG: latest
+
+phases:
+  pre_build:
+    commands:
+      - ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - export REG=$ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - echo "Registry $REG"
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $REG
+      - if [ -f nginx.aws.conf ]; then cp -f nginx.aws.conf nginx.conf; fi
+  build:
+    commands:
+      - ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - REG=$ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - |
+        docker build \
+          --build-arg VITE_SUPABASE_URL="$VITE_SUPABASE_URL" \
+          --build-arg VITE_SUPABASE_PUBLISHABLE_KEY="$VITE_SUPABASE_PUBLISHABLE_KEY" \
+          --build-arg VITE_SUPABASE_PROJECT_ID="$VITE_SUPABASE_PROJECT_ID" \
+          --build-arg VITE_USE_LOCAL_BACKEND=true \
+          -t $REG/rtb-web:$IMAGE_TAG .
+      - docker build -f backend/Dockerfile -t $REG/rtb-backend:$IMAGE_TAG .
+      - docker build -f backend/snowflake-sso/Dockerfile -t $REG/rtb-snowflake-sso:$IMAGE_TAG .
+      - docker pull ghcr.io/browserless/chromium:v2.55.4
+      - docker tag ghcr.io/browserless/chromium:v2.55.4 $REG/rtb-browserless:v2.55.4
+  post_build:
+    commands:
+      - ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - REG=$ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - docker push $REG/rtb-web:$IMAGE_TAG
+      - docker push $REG/rtb-backend:$IMAGE_TAG
+      - docker push $REG/rtb-snowflake-sso:$IMAGE_TAG
+      - docker push $REG/rtb-browserless:v2.55.4
+      - echo "Pushed rtb-web, rtb-backend, rtb-snowflake-sso, rtb-browserless"
+
+artifacts:
+  files:
+    - buildspec.yml

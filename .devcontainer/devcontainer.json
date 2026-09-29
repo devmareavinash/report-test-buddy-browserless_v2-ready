@@ -1,0 +1,22 @@
+{
+  "name": "Browserless OSS (GitHub Codespaces)",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "moby": true
+    }
+  },
+  "forwardPorts": [3000],
+  "portsAttributes": {
+    "3000": {
+      "label": "Browserless OSS",
+      "onAutoForward": "notify",
+      "visibility": "public"
+    }
+  },
+  "postCreateCommand": "docker compose up -d browserless",
+  "hostRequirements": {
+    "memory": "8gb",
+    "cpus": 4
+  }
+}

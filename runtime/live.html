@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Live runtime — __JOB_ID__</title>
+  <style>
+    html,body{margin:0;background:#0b0b0f;color:#cbd5e1;font:12px ui-monospace,Menlo,monospace;height:100%}
+    .bar{padding:6px 10px;border-bottom:1px solid #1f2937;display:flex;gap:10px;align-items:center}
+    .dot{width:8px;height:8px;border-radius:50%;background:#22c55e;animation:p 1s infinite}
+    @keyframes p{50%{opacity:.3}}
+    img{display:block;max-width:100%;height:auto;margin:0 auto;background:#111}
+    .empty{padding:40px;text-align:center;color:#64748b}
+  </style>
+</head>
+<body>
+  <div class="bar"><span class="dot"></span> live · job __JOB_ID__</div>
+  <div id="wrap" class="empty">waiting for first frame…</div>
+  <script>
+    const wrap = document.getElementById("wrap");
+    let img;
+    async function tick() {
+      try {
+        const r = await fetch("/frame/__JOB_ID__.png?t=" + Date.now());
+        if (r.ok) {
+          const blob = await r.blob();
+          const url = URL.createObjectURL(blob);
+          if (!img) { wrap.className = ""; wrap.innerHTML = ""; img = new Image(); wrap.appendChild(img); }
+          const old = img.src; img.src = url; if (old) URL.revokeObjectURL(old);
+        }
+      } catch {}
+      setTimeout(tick, 800);
+    }
+    tick();
+  </script>
+</body>
+</html>

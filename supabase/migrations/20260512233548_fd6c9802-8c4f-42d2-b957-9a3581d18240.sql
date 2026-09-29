@@ -1,0 +1,1 @@
+ALTER TABLE public.reports ADD CONSTRAINT reports_workstream_id_fkey FOREIGN KEY (workstream_id) REFERENCES public.workstreams(id) ON DELETE CASCADE;
