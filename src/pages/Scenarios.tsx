@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useSearchParams } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { ScenarioResultCard } from "@/components/ScenarioResultCard";
 import { toast } from "sonner";
 import { fetchLatestRunResultsByScenarioIds, fetchFilterMatrixByScenarioIds, overallStatusFromComboPairs, pairCombosWithResults } from "@/lib/latestTestResults";
+import { useExecutionLocks } from "@/hooks/useExecutionLocks";
 
 export default function Scenarios() {
   const [params] = useSearchParams();
@@ -21,6 +22,9 @@ export default function Scenarios() {
   const [status, setStatus] = useState(urlStatus);
   const [criticality, setCriticality] = useState(urlCriticality);
   const [wsId, setWsId] = useState(urlWs);
+  const executionLocks = useExecutionLocks();
+  const activeRunCount = executionLocks.data?.activeRuns?.length || 0;
+  const previousActiveRunCount = useRef(0);
 
   const { data: workstreams } = useQuery({
     queryKey: ["ws-list"],
@@ -66,6 +70,8 @@ export default function Scenarios() {
     // agent-analyze writes RCA asynchronously after a failed result is inserted.
     // Poll only while at least one failed/pending combination has no RCA yet.
     refetchInterval: (query) => {
+      const activeRuns = executionLocks.data?.activeRuns?.length || 0;
+      if (activeRuns > 0) return 3000;
       const rows = (query.state.data as any[] | undefined) || [];
       const waiting = rows.some((row: any) =>
         (row.comboPairs || []).some((pair: any) => {
@@ -77,7 +83,16 @@ export default function Scenarios() {
       );
       return waiting ? 5000 : false;
     },
+    staleTime: 0,
+    refetchOnMount: "always",
   });
+
+  useEffect(() => {
+    if (activeRunCount > 0 || previousActiveRunCount.current > activeRunCount) {
+      refetch();
+    }
+    previousActiveRunCount.current = activeRunCount;
+  }, [activeRunCount, refetch]);
 
   const filtered = useMemo(() => {
     const q = search.toLowerCase().trim();

@@ -1,16 +1,8 @@
+import { useEffect } from "react";
 import { GridComparePanels, isChartTable, toTableModel } from "@/components/KpiGrid";
-import { configuredKpiNames, evalNumericKpiPass, isKpiValueNoise, lookupStoredKpiValue, resolveKpiTol, unwrapStoredValues } from "@/lib/kpi-values";
+import { deriveStoredResultRows, resolveKpiTol, storedKpiSpec, type StoredResultStatus } from "@/lib/kpi-values";
 import { compareTables, summarizeTableCompare } from "@/lib/tableCompare";
 import { pickTrendView } from "@/lib/trend-payload";
-
-type Tol = { value?: number; unit?: string; op?: string };
-
-function toNum(v: any): number {
-  if (v === null || v === undefined) return NaN;
-  if (typeof v === "number") return v;
-  const n = Number(String(v).replace(/[,\s%$]/g, ""));
-  return Number.isFinite(n) ? n : NaN;
-}
 
 function fmt(v: any): string {
   if (v === null || v === undefined) return "—";
@@ -28,29 +20,12 @@ function badge(s: "pass" | "fail" | "pending") {
   return <span className={`mono uppercase text-[10px] px-1.5 py-0.5 rounded border ${cls}`}>{s}</span>;
 }
 
-function lookup(map: Record<string, any>, name: string): any {
-  return lookupStoredKpiValue(map, name);
-}
-
-function evalRow(actual: any, expected: any, tol?: Tol): boolean | null {
-  if (actual == null || expected == null) return null;
-  if (isChartTable(actual) && isChartTable(expected)) {
-    // Grid / graph: cell-wise so the configured comparator + tolerance apply.
-    // JSON.stringify equality ignored both and failed on any single cell.
-    // Change/delta rows are skipped -- see tableCompare.isChangeRow.
-    return compareTables(
-      toTableModel(actual) as any,
-      toTableModel(expected) as any,
-      { value: Number(tol?.value) || 0, unit: (tol?.unit === "abs" ? "abs" : "pct"), op: (tol?.op as any) || "eq" },
-      { skipChangeRows: true },
-    ).pass;
-  }
-  const numeric = evalNumericKpiPass(actual, expected, tol);
-  if (numeric !== null) return numeric;
-  const a = toNum(actual);
-  const e = toNum(expected);
-  if (Number.isFinite(a) || Number.isFinite(e)) return null;
-  return String(actual) === String(expected);
+function compareSymbol(op?: string) {
+  if (op === "lte") return "≤";
+  if (op === "gte") return "≥";
+  if (op === "gt") return ">";
+  if (op === "lt") return "<";
+  return "=";
 }
 
 export function StoredResultTable({
@@ -60,6 +35,7 @@ export function StoredResultTable({
   scenarioType,
   status,
   diff,
+  onDerivedStatusChange,
 }: {
   actual: any;
   expected: any;
@@ -67,27 +43,19 @@ export function StoredResultTable({
   scenarioType?: string;
   status?: string | null;
   diff?: any;
+  onDerivedStatusChange?: (status: StoredResultStatus) => void;
 }) {
   const isTrend = String(scenarioType || "").toLowerCase() === "trend";
   const isRef = String(scenarioType || "").toLowerCase() === "reference_match";
-  const actualMap = unwrapStoredValues(actual);
-  const expectedMap = unwrapStoredValues(expected);
-  const tols = (spec?.kpi_tolerances && typeof spec.kpi_tolerances === "object") ? spec.kpi_tolerances : {};
-  const names = (() => {
-    const configured = configuredKpiNames(spec);
-    const available = [...Object.keys(actualMap), ...Object.keys(expectedMap)]
-      .filter((k) => !isKpiValueNoise(k));
-    const configuredHasStoredValue = configured.some((k) =>
-      lookup(actualMap, k) !== undefined || lookup(expectedMap, k) !== undefined
-    );
-    if (configured.length && configuredHasStoredValue) return configured;
-    // When no tolerances are stored we fall back to the payload's own keys -- but
-    // those include scrape bookkeeping (time_bucket, area, navigation, ...). Left
-    // unfiltered they render as phantom KPI rows stuck at "pending", which is why
-    // this page showed FAIL while the Latest result tab showed PASS.
-    return Array.from(new Set(available))
-      .filter((k) => !isKpiValueNoise(k));
-  })();
+  const effectiveSpec = storedKpiSpec(actual, spec);
+  const tols = effectiveSpec.kpi_tolerances || {};
+  const derived = deriveStoredResultRows({ actual, expected, spec, scenarioType, diff, fallbackStatus: status });
+  const rows = derived.rows;
+
+  useEffect(() => {
+    onDerivedStatusChange?.(derived.status);
+  }, [derived.status, onDerivedStatusChange]);
+
   const trend = isTrend
     ? pickTrendView(actual, actual?.values, actual?.extracted, actual?.extracted?.result, expected, diff)
     : null;
@@ -152,34 +120,15 @@ export function StoredResultTable({
     );
   }
 
-  if (!names.length) {
+  if (!rows.length) {
     return <div className="text-muted-foreground">No KPI values extracted yet.</div>;
   }
-
-  const rows = names.map((k) => {
-    let a = lookup(actualMap, k);
-    let e = lookup(expectedMap, k);
-    if (a == null && isChartTable(actual?.values?.tableData || actual?.tableData)) {
-      a = actual?.values?.tableData || actual?.tableData;
-    }
-    if (e == null && isChartTable(expected?.values?.tableData || expected?.tableData)) {
-      e = expected?.values?.tableData || expected?.tableData;
-    }
-    const aN = toNum(a);
-    const eN = toNum(e);
-    const both = Number.isFinite(aN) && Number.isFinite(eN);
-    const diff = both ? aN - eN : null;
-    const deltaPct = both && eN !== 0 ? (diff! / Math.abs(eN)) * 100 : null;
-    const tol = resolveKpiTol(tols, k);
-    const pass = evalRow(a, e, tol);
-    return { k, a, e, diff, deltaPct, pass };
-  });
 
   return (
     <div className="space-y-2">
       <div className="flex items-center gap-2 text-xs">
         <span className="text-muted-foreground">Overall Status:</span>
-        {badge((status as any) || "pending")}
+        {badge(derived.status)}
       </div>
       <div className="border border-border rounded overflow-hidden bg-background">
         <table className="w-full text-xs">
@@ -232,7 +181,7 @@ export function StoredResultTable({
                     if (!tc) {
                       return (
                         <span className="text-muted-foreground">
-                          {r.pass === false ? "≠" : r.pass === true ? "=" : "—"}
+                          {r.pass === false ? "≠" : r.pass === true ? compareSymbol(resolveKpiTol(tols, r.k).op) : "—"}
                         </span>
                       );
                     }

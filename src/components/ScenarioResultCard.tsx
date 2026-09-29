@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { StatusChip } from "@/components/StatusChip";
 import { StoredResultTable } from "@/components/StoredResultTable";
-import { storedRunLog, storedRunLogIsRca } from "@/lib/kpi-values";
+import { deriveStoredResultStatus, storedRunLog, storedRunLogIsRca } from "@/lib/kpi-values";
 import { fetchCanonicalScript } from "@/lib/canonicalScript";
 import { ChevronDown, ChevronRight, Wrench, Pencil, Clock, Save, History, Play } from "lucide-react";
 import { toast } from "sonner";
@@ -66,22 +66,6 @@ export function ScenarioResultCard({
             result: r,
           }))
         : (l ? [{ label: l?.actual?.filter || l?.expected?.filter || "combo 1", comboId: null, result: l }] : []));
-  const comboRows: any[] = configuredPairs.map((p) => p.result).filter(Boolean);
-  const issueResult =
-    configuredPairs.map((p) => p.result).find((r) => r?.status === "fail" && String(r?.analysis || "").trim())
-    || configuredPairs.map((p) => p.result).find((r) => r?.status === "fail")
-    || configuredPairs.map((p) => p.result).find((r) => r?.status === "pending")
-    || l;
-  const overallStatus = (() => {
-    if (!configuredPairs.length) return "pending";
-    const st = configuredPairs.map((p) => String(p.result?.status || "pending").toLowerCase());
-    if (st.some((x) => x === "fail")) return "fail";
-    if (st.some((x) => x === "pending")) return "pending";
-    return st.every((x) => x === "pass") ? "pass" : (st[0] || "pending");
-  })();
-  const runLog = storedRunLog(issueResult);
-  const runLogIsRca = storedRunLogIsRca(issueResult);
-
   const { data: scriptInfo, isLoading: scriptInfoLoading } = useQuery({
     queryKey: ["scenario-script-tolerance", scenarioId],
     enabled: true,
@@ -90,6 +74,42 @@ export function ScenarioResultCard({
     staleTime: 0,
     refetchOnMount: "always",
   });
+  const spec = (scriptInfo as any)?.assertion_spec;
+  const pairsWithDerived = configuredPairs.map((p) => {
+    const r = p.result;
+    const derivedStatus = r
+      ? deriveStoredResultStatus({
+          actual: r.actual,
+          expected: r.expected,
+          spec,
+          scenarioType,
+          diff: r.diff,
+          fallbackStatus: r.status,
+        })
+      : "pending";
+    return { ...p, derivedStatus };
+  });
+  const issuePair =
+    pairsWithDerived.find((p) => p.result?.analysis && p.derivedStatus === "fail")
+    || pairsWithDerived.find((p) => p.derivedStatus === "fail")
+    || pairsWithDerived.find((p) => p.derivedStatus === "pending")
+    || pairsWithDerived.find((p) => p.result)
+    || null;
+  const issueResult = issuePair?.result || l;
+  const issueStatus = issuePair?.derivedStatus || (issueResult ? deriveStoredResultStatus({ actual: issueResult.actual, expected: issueResult.expected, spec, scenarioType, diff: issueResult.diff, fallbackStatus: issueResult.status }) : "pending");
+  const overallStatus = (() => {
+    if (!pairsWithDerived.length) return "pending";
+    const st = pairsWithDerived.map((p) => p.derivedStatus);
+    if (st.some((x) => x === "fail")) return "fail";
+    if (st.some((x) => x === "pending")) return "pending";
+    return st.every((x) => x === "pass") ? "pass" : "pending";
+  })();
+  const runLog = storedRunLog(issueResult);
+  const runLogIsRca = storedRunLogIsRca(issueResult);
+  const latestDerivedStatus = l
+    ? deriveStoredResultStatus({ actual: l.actual, expected: l.expected, spec, scenarioType, diff: l.diff, fallbackStatus: l.status })
+    : "pending";
+
   const proposeFix = async (trId: string) => {
     toast.loading("Generating proposal…", { id: trId });
     try {
@@ -162,9 +182,9 @@ export function ScenarioResultCard({
           {open ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
         </button>
         <StatusChip status={overallStatus} />
-        {configuredPairs.length > 0 && (
+        {pairsWithDerived.length > 0 && (
           <span className="text-xs text-muted-foreground mono whitespace-nowrap" title="filter combinations in the latest result per combo">
-            {comboRows.filter((r: any) => String(r?.status).toLowerCase() === "pass").length}/{configuredPairs.length} combo{configuredPairs.length === 1 ? "" : "s"}
+            {pairsWithDerived.filter((p: any) => p.derivedStatus === "pass").length}/{pairsWithDerived.length} combo{pairsWithDerived.length === 1 ? "" : "s"}
           </span>
         )}
         {(l?.criticality || l?.severity) && <StatusChip status={l.criticality || l.severity} />}
@@ -176,7 +196,7 @@ export function ScenarioResultCard({
             <div className="text-xs text-muted-foreground mono truncate">{scenarioMeta}</div>
           )}
         </div>
-        {issueResult && (issueResult.status === "fail" || issueResult.status === "pending") && runLog && (
+        {issueResult && (issueStatus === "fail" || issueStatus === "pending") && runLog && (
           <div className="hidden md:block max-w-md text-xs text-destructive truncate" title={runLog}>
             {runLogIsRca ? "RCA: " : "Log: "}{runLog}
           </div>
@@ -211,9 +231,9 @@ export function ScenarioResultCard({
           {scriptInfoLoading && (
             <div className="text-muted-foreground">Loading the Latest Result KPI configuration…</div>
           )}
-          {!scriptInfoLoading && configuredPairs.length > 0 && (
+          {!scriptInfoLoading && pairsWithDerived.length > 0 && (
             <>
-              {issueResult && (issueResult.status === "fail" || issueResult.status === "pending") && runLog && (
+              {issueResult && (issueStatus === "fail" || issueStatus === "pending") && runLog && (
                 <div className="border border-destructive/30 bg-destructive/5 rounded p-2">
                   <span className="text-muted-foreground mono">{runLogIsRca ? "RCA: " : "Log: "}</span>
                   <span>{runLog}</span>
@@ -222,8 +242,10 @@ export function ScenarioResultCard({
               {(() => {
                 // One test_results row per filter combination. Rendering only the
                 // first showed a single combo here while Latest result showed all.
-                if (configuredPairs.length === 1 && configuredPairs[0].result) {
-                  const r = configuredPairs[0].result;
+                if (pairsWithDerived.length === 1 && pairsWithDerived[0].result) {
+                  const pair = pairsWithDerived[0];
+                  const r = pair.result;
+                  const derivedStatus = pair.derivedStatus;
                   return (
                     <div className="space-y-2">
                       <StoredResultTable
@@ -231,10 +253,10 @@ export function ScenarioResultCard({
                         expected={r.expected}
                         spec={(scriptInfo as any)?.assertion_spec}
                         scenarioType={scenarioType}
-                        status={r.status}
+                        status={derivedStatus || r.status}
                         diff={r.diff}
                       />
-                      {(r.status === "fail" || r.status === "pending") && (
+                      {(derivedStatus === "fail" || derivedStatus === "pending") && (
                         <RcaEditor trId={r.id} initial={r.analysis || ""} onSave={saveRca} />
                       )}
                     </div>
@@ -242,12 +264,12 @@ export function ScenarioResultCard({
                 }
                 return (
                   <div className="space-y-3">
-                    {configuredPairs.map((pair, i: number) => {
+                    {pairsWithDerived.map((pair, i: number) => {
                       const r = pair.result;
                       return (
                       <div key={pair.comboId || r?.id || i} className="border border-border rounded-md">
                         <div className="flex items-center gap-2 px-2 py-1 bg-secondary/40 border-b border-border">
-                          <StatusChip status={r?.status || "pending"} />
+                          <StatusChip status={pair.derivedStatus || r?.status || "pending"} />
                           <span className="mono text-xs">
                             {pair.label || `combo ${i + 1}`}
                           </span>
@@ -266,7 +288,7 @@ export function ScenarioResultCard({
                         <div className="p-2">
                           {r ? (
                             <div className="space-y-2">
-                              {(r.status === "fail" || r.status === "pending") && storedRunLog(r) && (
+                              {(pair.derivedStatus === "fail" || pair.derivedStatus === "pending") && storedRunLog(r) && (
                                 <div className="border border-destructive/30 bg-destructive/5 rounded p-2">
                                   <span className="text-muted-foreground mono">
                                     {storedRunLogIsRca(r) ? "RCA: " : "Log: "}
@@ -279,10 +301,10 @@ export function ScenarioResultCard({
                                 expected={r.expected}
                                 spec={(scriptInfo as any)?.assertion_spec}
                                 scenarioType={scenarioType}
-                                status={r.status}
+                                status={pair.derivedStatus || r.status}
                                 diff={r.diff}
                               />
-                              {(r.status === "fail" || r.status === "pending") && (
+                              {(pair.derivedStatus === "fail" || pair.derivedStatus === "pending") && (
                                 <RcaEditor trId={r.id} initial={r.analysis || ""} onSave={saveRca} />
                               )}
                             </div>
@@ -297,7 +319,7 @@ export function ScenarioResultCard({
                   </div>
                 );
               })()}
-              {l && l.status !== "pass" && l.healing_proposal && (
+              {l && latestDerivedStatus !== "pass" && l.healing_proposal && (
                 <div className="border border-border rounded-md p-2 bg-background/40">
                   <div className="text-muted-foreground mono mb-1">
                     Proposed fix · status: {l.healing_status || "proposed"}
@@ -308,7 +330,7 @@ export function ScenarioResultCard({
             </>
           )}
           <div className="flex flex-wrap gap-2 pt-2 border-t border-border">
-            {l && (l.status === "fail" || l.status === "pending") && (
+            {l && latestDerivedStatus !== "pass" && (
               <Button size="sm" variant="outline" onClick={() => proposeFix(l.id)}>
                 <Wrench className="h-3 w-3 mr-1" /> Propose fix
               </Button>

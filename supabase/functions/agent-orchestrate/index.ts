@@ -200,11 +200,38 @@ function toNum(v: any): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+function normKpiKey(k: string): string {
+  return String(k || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function lookupKpiValue(map: Record<string, any> | null | undefined, name: string): any {
+  if (!map || typeof map !== "object") return undefined;
+  if ((map as any)[name] !== undefined) return (map as any)[name];
+  const want = normKpiKey(name);
+  const exact = Object.keys(map).find((key) => normKpiKey(key) === want);
+  if (exact) return (map as any)[exact];
+  // Legacy scripts often emit "Row Count - <title>" while the configured KPI is "Count".
+  if (want === "count") {
+    const rowCounts = Object.keys(map).filter((key) => /^rowcount/.test(normKpiKey(key)));
+    if (rowCounts.length === 1) return (map as any)[rowCounts[0]];
+  }
+  return undefined;
+}
+
+function lookupKpiTol(tols: Record<string, any> | null | undefined, name: string): any {
+  if (!tols || typeof tols !== "object") return undefined;
+  if ((tols as any)[name] !== undefined) return (tols as any)[name];
+  const want = normKpiKey(name);
+  const exact = Object.keys(tols).find((key) => normKpiKey(key) === want);
+  return exact ? (tols as any)[exact] : undefined;
+}
+
 /**
  * Refresh-date KPIs ("Sep 11 - 2026", "6/30/2026", "30 Jun 2026") must NOT go
  * through toNum: stripping non-digits leaves "11-2026" and parseFloat returns
  * 11, so the Latest-result tab showed a bare day-of-month instead of the date.
- * Dates are compared as text, so keep the original string.
+ * Dates are stored as text for display, then compared by calendar day with
+ * the configured KPI operator (eq/lte/gte/gt/lt).
  */
 const DATE_VALUE_RE = new RegExp(
   [
@@ -221,6 +248,61 @@ function looksLikeDateValue(v: any): boolean {
   const s = v.trim();
   if (!s) return false;
   return DATE_VALUE_RE.test(s);
+}
+
+function normalizeDateText(v: any): string {
+  return String(v ?? "").replace(/\s+/g, " ").replace(/\s*[-,]\s*/g, " ").trim().toLowerCase();
+}
+
+const MONTH_INDEX: Record<string, number> = {
+  jan: 0, january: 0,
+  feb: 1, february: 1,
+  mar: 2, march: 2,
+  apr: 3, april: 3,
+  may: 4,
+  jun: 5, june: 5,
+  jul: 6, july: 6,
+  aug: 7, august: 7,
+  sep: 8, sept: 8, september: 8,
+  oct: 9, october: 9,
+  nov: 10, november: 10,
+  dec: 11, december: 11,
+};
+
+function utcDateValue(year: number, month: number, day: number): number | null {
+  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return null;
+  const ts = Date.UTC(year, month, day);
+  const d = new Date(ts);
+  return d.getUTCFullYear() === year && d.getUTCMonth() === month && d.getUTCDate() === day ? ts : null;
+}
+
+function parseDateValue(v: any): number | null {
+  if (!looksLikeDateValue(v)) return null;
+  const raw = String(v ?? "").trim();
+  const yearFirst = raw.match(/^(\d{4})\s*-\s*(\d{1,2})\s*-\s*(\d{1,2})$/);
+  if (yearFirst) return utcDateValue(Number(yearFirst[1]), Number(yearFirst[2]) - 1, Number(yearFirst[3]));
+
+  const numeric = raw.match(/^(\d{1,2})\s*[\/.\-]\s*(\d{1,2})\s*[\/.\-]\s*(\d{2,4})$/);
+  if (numeric) return utcDateValue(Number(numeric[3].length === 2 ? `20${numeric[3]}` : numeric[3]), Number(numeric[1]) - 1, Number(numeric[2]));
+
+  const monthFirst = raw.match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2})\s*[-,]?\s*(\d{2,4})$/);
+  if (monthFirst) return utcDateValue(Number(monthFirst[3].length === 2 ? `20${monthFirst[3]}` : monthFirst[3]), MONTH_INDEX[monthFirst[1].toLowerCase()], Number(monthFirst[2]));
+
+  const dayFirst = raw.match(/^(\d{1,2})\s+([A-Za-z]{3,9})\.?\s*[-,]?\s*(\d{2,4})$/);
+  if (dayFirst) return utcDateValue(Number(dayFirst[3].length === 2 ? `20${dayFirst[3]}` : dayFirst[3]), MONTH_INDEX[dayFirst[2].toLowerCase()], Number(dayFirst[1]));
+  return null;
+}
+
+function evalDatePass(actual: any, expected: any, op: string, toleranceDays = 0): boolean | null {
+  const a = parseDateValue(actual);
+  const e = parseDateValue(expected);
+  if (a == null || e == null) return normalizeDateText(actual) === normalizeDateText(expected);
+  const allowance = Math.abs(Number(toleranceDays) || 0) * 24 * 60 * 60 * 1000;
+  if (op === "lte") return a <= e + allowance;
+  if (op === "gte") return a >= e - allowance;
+  if (op === "gt") return a > e + allowance;
+  if (op === "lt") return a < e - allowance;
+  return Math.abs(a - e) <= allowance;
 }
 
 const STRUCTURED_KPI_KEYS = new Set(["grid", "graph", "data", "table", "tabledata", "series", "chart", "rows", "heatmap", "viz", "dataset"]);
@@ -737,7 +819,7 @@ Deno.serve(async (req) => {
                 };
                 sqlRow = refError ? null : refScraped;
                 for (const lbl of kpiLabels.length ? kpiLabels : Object.keys(scraped)) {
-                  const raw = (refScraped as any)[lbl];
+                  const raw = lookupKpiValue(refScraped, lbl);
                   expectedMap[lbl] = (raw != null && typeof raw === "object")
                     ? raw
                     : (looksLikeDateValue(raw) ? String(raw).trim() : toNum(raw));
@@ -866,7 +948,7 @@ Deno.serve(async (req) => {
                 // comparator + tolerance apply. JSON.stringify equality ignored both
                 // and failed the whole visual on any single differing cell.
                 // Change/delta rows (NBRx Change, TRx Change, ...) are skipped.
-                const gTolEntry: any = kpiTol[mainGrid.k];
+                const gTolEntry: any = lookupKpiTol(kpiTol, mainGrid.k);
                 const gTolVal = gTolEntry && typeof gTolEntry === "object" ? Number(gTolEntry.value) : Number(gTolEntry);
                 const gTolUnit = (gTolEntry && typeof gTolEntry === "object" && gTolEntry.unit) === "abs" ? "abs" : "pct";
                 let gTolOp = (gTolEntry && typeof gTolEntry === "object" && gTolEntry.op) || "eq";
@@ -907,12 +989,13 @@ Deno.serve(async (req) => {
               }
 
               for (const lbl of labels) {
-                const rawA = (scraped as any)[lbl];
+                const rawA = lookupKpiValue(scraped, lbl);
                 if (isStructuredVal(rawA) || STRUCTURED_KPI_KEYS.has(String(lbl).toLowerCase().replace(/[^a-z0-9]/g, ""))) {
                   if (actualMap[lbl] === undefined) actualMap[lbl] = rawA;
                   continue;
                 }
-                // Refresh dates stay as text — see looksLikeDateValue.
+                // Refresh dates stay as text for display, but compare them with
+                // the configured operator (eq/lte/gte/gt/lt), not equality only.
                 if (looksLikeDateValue(rawA)) {
                   const aStr = String(rawA).trim();
                   actualMap[lbl] = aStr;
@@ -922,9 +1005,20 @@ Deno.serve(async (req) => {
                     // Nothing to compare against: presence is the only check.
                     diffMap[lbl] = { value: aStr, kind: "date" };
                   } else {
-                    const norm = (x: string) => x.replace(/\s+/g, " ").replace(/\s*[-,]\s*/g, " ").trim().toLowerCase();
-                    const datePass = eStr != null && norm(aStr) === norm(eStr);
-                    diffMap[lbl] = { kind: "date", actual: aStr, expected: eStr, pass: datePass };
+                    const tEntry: any = lookupKpiTol(kpiTol, lbl);
+                    const tVal = tEntry && typeof tEntry === "object" ? Number(tEntry.value) : Number(tEntry);
+                    const tUnit = (tEntry && typeof tEntry === "object" && tEntry.unit) || "pct";
+                    let tOp = (tEntry && typeof tEntry === "object" && tEntry.op) || "eq";
+                    if (isRef && comparator_override) tOp = comparator_override;
+                    const toleranceDays = tUnit === "abs" && Number.isFinite(tVal) ? tVal : 0;
+                    const datePass = eStr != null && evalDatePass(aStr, eStr, tOp, toleranceDays) === true;
+                    diffMap[lbl] = {
+                      kind: "date",
+                      actual: aStr,
+                      expected: eStr,
+                      pass: datePass,
+                      tolerance: Number.isFinite(tVal) ? { value: tVal, unit: tUnit, op: tOp } : { value: 0, unit: "pct", op: tOp },
+                    };
                     if (!datePass) comboPass = false;
                   }
                   continue;
@@ -941,7 +1035,7 @@ Deno.serve(async (req) => {
                   else diffMap[lbl] = { value: a };
                 } else {
                   // Tolerance-aware evaluation, matching the UI logic in RunScenarioCard
-                  const tEntry: any = kpiTol[lbl];
+                  const tEntry: any = lookupKpiTol(kpiTol, lbl);
                   const tVal = tEntry && typeof tEntry === "object" ? Number(tEntry.value) : Number(tEntry);
                   const tUnit = (tEntry && typeof tEntry === "object" && tEntry.unit) || "pct";
                   let tOp = (tEntry && typeof tEntry === "object" && tEntry.op) || "eq";
@@ -1003,7 +1097,7 @@ Deno.serve(async (req) => {
               const VALID_OPS = new Set(["lte","gte","eq","gt","lt"]);
               const overrideOp = (isRef && comparator_override && VALID_OPS.has(comparator_override)) ? comparator_override : null;
               for (const lbl of labels) {
-                const tEntry: any = kpiTol[lbl];
+                const tEntry: any = lookupKpiTol(kpiTol, lbl);
                 if (tEntry && typeof tEntry === "object") {
                   const baseOp = VALID_OPS.has(tEntry.op) ? tEntry.op : "eq";
                   tolerancesSnapshot[lbl] = { value: Number(tEntry.value) || 0, unit: tEntry.unit === "abs" ? "abs" : "pct", op: overrideOp || baseOp };

@@ -3579,9 +3579,11 @@ function getGlobalOp(tolerances: Record<string, Tolerance>): CompareOp {
 }
 
 function getTol(tolerances: Record<string, Tolerance>, k: string): Tolerance {
-  const globalOp = getGlobalOp(tolerances);
-  const base = tolerances[k] ?? { value: 0, unit: "pct" as const };
-  return { value: base.value, unit: base.unit ?? "pct", op: globalOp };
+  const norm = (s: string) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const direct = tolerances[k];
+  const hit = direct ? k : Object.keys(tolerances || {}).find((key) => norm(key) === norm(k));
+  const base = (hit ? tolerances[hit] : undefined) ?? { value: 0, unit: "pct" as const, op: "eq" as const };
+  return { value: base.value, unit: base.unit ?? "pct", op: isValidOp(base.op) ? base.op : "eq" };
 }
 
 function canonicalizeForCompare(v: any): any {
@@ -3615,6 +3617,85 @@ function tableDiffFor(actual: any, expected: any, tol: Tolerance) {
   return compareTables(ta as any, tb as any, tol, { skipChangeRows: true });
 }
 
+const DATE_VALUE_RE = new RegExp(
+  [
+    String.raw`\d{1,2}\s*[\/.\-]\s*\d{1,2}\s*[\/.\-]\s*\d{2,4}`,
+    String.raw`[A-Za-z]{3,9}\.?\s+\d{1,2}\s*[-,]?\s*\d{2,4}`,
+    String.raw`\d{1,2}\s+[A-Za-z]{3,9}\.?\s*[-,]?\s*\d{2,4}`,
+    String.raw`\d{4}-\d{2}-\d{2}`,
+  ].join("|"),
+  "i",
+);
+
+function looksLikeDateValue(v: any): boolean {
+  return typeof v === "string" && !!v.trim() && DATE_VALUE_RE.test(v.trim());
+}
+
+function normalizeDateText(v: any): string {
+  return String(v ?? "").replace(/\s+/g, " ").replace(/\s*[-,]\s*/g, " ").trim().toLowerCase();
+}
+
+const MONTH_INDEX: Record<string, number> = {
+  jan: 0, january: 0,
+  feb: 1, february: 1,
+  mar: 2, march: 2,
+  apr: 3, april: 3,
+  may: 4,
+  jun: 5, june: 5,
+  jul: 6, july: 6,
+  aug: 7, august: 7,
+  sep: 8, sept: 8, september: 8,
+  oct: 9, october: 9,
+  nov: 10, november: 10,
+  dec: 11, december: 11,
+};
+
+function utcDateValue(year: number, month: number, day: number): number | null {
+  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return null;
+  const ts = Date.UTC(year, month, day);
+  const d = new Date(ts);
+  return d.getUTCFullYear() === year && d.getUTCMonth() === month && d.getUTCDate() === day ? ts : null;
+}
+
+function parseDateValue(v: any): number | null {
+  if (!looksLikeDateValue(v)) return null;
+  const raw = String(v ?? "").trim();
+  const yearFirst = raw.match(/^(\d{4})\s*-\s*(\d{1,2})\s*-\s*(\d{1,2})$/);
+  if (yearFirst) return utcDateValue(Number(yearFirst[1]), Number(yearFirst[2]) - 1, Number(yearFirst[3]));
+
+  const numeric = raw.match(/^(\d{1,2})\s*[\/.\-]\s*(\d{1,2})\s*[\/.\-]\s*(\d{2,4})$/);
+  if (numeric) return utcDateValue(Number(numeric[3].length === 2 ? `20${numeric[3]}` : numeric[3]), Number(numeric[1]) - 1, Number(numeric[2]));
+
+  const monthFirst = raw.match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2})\s*[-,]?\s*(\d{2,4})$/);
+  if (monthFirst) return utcDateValue(Number(monthFirst[3].length === 2 ? `20${monthFirst[3]}` : monthFirst[3]), MONTH_INDEX[monthFirst[1].toLowerCase()], Number(monthFirst[2]));
+
+  const dayFirst = raw.match(/^(\d{1,2})\s+([A-Za-z]{3,9})\.?\s*[-,]?\s*(\d{2,4})$/);
+  if (dayFirst) return utcDateValue(Number(dayFirst[3].length === 2 ? `20${dayFirst[3]}` : dayFirst[3]), MONTH_INDEX[dayFirst[2].toLowerCase()], Number(dayFirst[1]));
+  return null;
+}
+
+function evalDatePass(actual: any, expected: any, tol: Tolerance): boolean | null {
+  const a = parseDateValue(actual);
+  const e = parseDateValue(expected);
+  if (a == null || e == null) return normalizeDateText(actual) === normalizeDateText(expected);
+  const op: CompareOp = tol?.op ?? "eq";
+  const dayMs = 24 * 60 * 60 * 1000;
+  const allowance = Number.isFinite(tol?.value) && tol?.unit === "abs" ? Math.abs(tol.value) * dayMs : 0;
+  if (op === "lte") return a <= e + allowance;
+  if (op === "gte") return a >= e - allowance;
+  if (op === "gt") return a > e + allowance;
+  if (op === "lt") return a < e - allowance;
+  return Math.abs(a - e) <= allowance;
+}
+
+function compareSymbol(op?: string) {
+  if (op === "lte") return "≤";
+  if (op === "gte") return "≥";
+  if (op === "gt") return ">";
+  if (op === "lt") return "<";
+  return "=";
+}
+
 function evalPass(actual: any, expected: any, tol: Tolerance): boolean | null {
   if (expected === null || expected === undefined || actual === null || actual === undefined) return null;
   if (looksLikeLocatorJunk(actual) || looksLikeLocatorJunk(expected)) return null;
@@ -3631,6 +3712,9 @@ function evalPass(actual: any, expected: any, tol: Tolerance): boolean | null {
   if (Array.isArray(actual) || Array.isArray(expected) ||
       (typeof actual === "object") || (typeof expected === "object")) {
     return JSON.stringify(canonicalizeForCompare(actual)) === JSON.stringify(canonicalizeForCompare(expected));
+  }
+  if (looksLikeDateValue(actual) || looksLikeDateValue(expected)) {
+    return evalDatePass(actual, expected, tol);
   }
   const a = toNum(actual);
   const e = toNum(expected);
@@ -3997,7 +4081,7 @@ function FilterComparisonTable({
                       // Grid / graph: name the offending cells instead of a bare "≠".
                       const tc = tableDiffFor(r.actual, r.expected, getTol(tolerances, r.kpi));
                       if (!tc) {
-                        return <span className="text-muted-foreground">{r.pass === false ? "≠" : r.pass === true ? "=" : "—"}</span>;
+                        return <span className="text-muted-foreground">{r.pass === false ? "≠" : r.pass === true ? compareSymbol(getTol(tolerances, r.kpi).op) : "—"}</span>;
                       }
                       return (
                         <div className="space-y-0.5">
@@ -4161,7 +4245,7 @@ function KpiRowsTable({
                     // Grid / graph: name the offending cells instead of a bare "≠".
                     const tc = tableDiffFor(r.a, r.exp, getTol(tolerances, r.k));
                     if (!tc) {
-                      return <span className="text-muted-foreground">{r.pass === false ? "≠" : r.pass === true ? "=" : "—"}</span>;
+                      return <span className="text-muted-foreground">{r.pass === false ? "≠" : r.pass === true ? compareSymbol(getTol(tolerances, r.k).op) : "—"}</span>;
                     }
                     return (
                       <div className="space-y-0.5">

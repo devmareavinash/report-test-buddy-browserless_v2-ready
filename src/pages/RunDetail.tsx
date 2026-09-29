@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { RunScenarioCard } from "@/components/RunScenarioCard";
 import { StatusChip } from "@/components/StatusChip";
+import { deriveStoredResultStatus } from "@/lib/kpi-values";
 import { Button } from "@/components/ui/button";
 import { XCircle, Trash2 } from "lucide-react";
 import { toast } from "@/hooks/use-toast";
@@ -121,11 +122,24 @@ export default function RunDetail() {
     return Array.from(m.values()).filter((r) => wsId === "all" || r.workstream_id === wsId);
   }, [merged, wsId]);
 
+  const withDerivedStatus = useMemo(() => {
+    return (merged || []).map((r: any) => {
+      const derivedStatus = deriveStoredResultStatus({
+        actual: r.actual,
+        expected: r.expected,
+        scenarioType: r.scenarios?.type,
+        diff: r.diff,
+        fallbackStatus: r.status,
+      });
+      return { ...r, derivedStatus };
+    });
+  }, [merged]);
+
   const filtered = useMemo(() => {
     const q = search.toLowerCase().trim();
-    return (merged || []).filter((r: any) => {
+    return (withDerivedStatus || []).filter((r: any) => {
       const s = r.scenarios;
-      if (status !== "all" && r.status !== status) return false;
+      if (status !== "all" && r.derivedStatus !== status) return false;
       if (criticality !== "all") {
         const c = (r.criticality || s?.criticality || "medium").toLowerCase();
         if (c !== criticality) return false;
@@ -140,17 +154,17 @@ export default function RunDetail() {
         r.analysis?.toLowerCase().includes(q)
       );
     });
-  }, [merged, search, status, wsId, reportId, criticality]);
+  }, [withDerivedStatus, search, status, wsId, reportId, criticality]);
 
   const counts = useMemo(() => {
     let pass = 0, fail = 0, pending = 0;
-    for (const r of merged || []) {
-      if (r.status === "pass") pass++;
-      else if (r.status === "fail") fail++;
+    for (const r of withDerivedStatus || []) {
+      if (r.derivedStatus === "pass") pass++;
+      else if (r.derivedStatus === "fail") fail++;
       else pending++;
     }
     return { pass, fail, pending };
-  }, [merged]);
+  }, [withDerivedStatus]);
   const displayedRunStatus = isRunning
     ? "running"
     : counts.fail > 0
@@ -300,7 +314,6 @@ export default function RunDetail() {
                 const meta = s
                   ? `${s.reports?.workstreams?.name || "—"} / ${s.reports?.name || "—"} · ${s.type || "—"} · ${s.criticality}`
                   : undefined;
-                const hasFail = group.some((g) => g.status === "fail");
                 return (
                   <RunScenarioCard
                     key={sid}
