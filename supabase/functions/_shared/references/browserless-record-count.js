@@ -1,3 +1,4 @@
+// RECORD_COUNT_TEMPLATE_VERSION: 2026-10-05.4
 export default async ({ page }) => {
 
   // === AUTO-INJECTED SESSION-AWARE AUTH CHECK (do not remove) ===
@@ -879,11 +880,14 @@ export default async ({ page }) => {
   const waitForShowDataPopup = async (maxMs = 10000) => {
     const start = Date.now();
     while (Date.now() - start < maxMs) {
-      const { result } = await findShowDataPopupContainer();
-      if (result && result.found && !result.hasSpinner) break;
+      const found = await findShowDataPopupContainer();
+      if (found.result && found.result.found && !found.result.hasSpinner) {
+        await sleep(500);
+        return { ok: true, frame_url: found.frame ? found.frame.url() : null };
+      }
       await sleep(600);
     }
-    await sleep(500);
+    return { ok: false, error: 'Show Data popup did not become ready before timeout' };
   };
 
   const extractShowDataTable = async () => {
@@ -1020,14 +1024,26 @@ export default async ({ page }) => {
       const popupSel =
         '[role="dialog"], .mstrmojo-Popup, .mstrmojo-popup, .mstrmojo-RootPopup, ' +
         '[class*="Popup"], [class*="popup"], [class*="modal" i], [class*="dialog" i]';
-      const popups = Array.from(document.querySelectorAll(popupSel)).filter(isVisible);
+      const popups = Array.from(document.querySelectorAll(popupSel)).filter(el =>
+        isVisible(el) && (
+          el.querySelector('table, [role="grid"], [role="row"], [aria-rowcount]') ||
+          /\bshow\s+data\b/i.test(norm(el.innerText || el.textContent || ''))
+        )
+      );
       const candidates = popups.length ? popups : [document];
       const parseCount = raw => {
         const text = norm(raw);
         const patterns = [
           /\bRows?\s*:\s*([\d,]+)\b/i,
+          /\bRows?\s*\(\s*([\d,]+)\s*\)/i,
+          /\bTotal\s+Rows?\s*:?\s*([\d,]+)\b/i,
+          /\bRecords?\s*:\s*([\d,]+)\b/i,
+          /\bTotal\s+Records?\s*:?\s*([\d,]+)\b/i,
           /\b([\d,]+)\s+Rows?\b/i,
+          /\b([\d,]+)\s+Records?\b/i,
           /\b\d+\s*[-–]\s*\d+\s+of\s+([\d,]+)\b/i,
+          /\b\d+\s+to\s+\d+\s+of\s+([\d,]+)\b/i,
+          /\bof\s+([\d,]+)\s*(?:Rows?|Records?)?\b/i,
         ];
         for (const re of patterns) {
           const m = text.match(re);
@@ -1043,14 +1059,15 @@ export default async ({ page }) => {
       // Prefer direct header text so values inside the grid do not form a
       // misleading number.
       for (const root of candidates) {
-        const all = [root, ...Array.from(root.querySelectorAll('*'))];
+        const headerSel = [
+          '[class*="header" i]', '[class*="title" i]', '[class*="caption" i]',
+          '[class*="status" i]', '[class*="footer" i]', '[class*="pager" i]',
+          '[class*="pagination" i]', '[aria-label]', '[title]',
+        ].join(',');
+        const all = [root, ...Array.from(root.querySelectorAll(headerSel))];
         for (const el of all) {
           if (el !== document && !isVisible(el)) continue;
-          let direct = '';
-          for (const n of Array.from(el.childNodes || [])) {
-            if (n.nodeType === Node.TEXT_NODE) direct += n.textContent || '';
-          }
-          const hit = parseCount(direct);
+          const hit = parseCount(el.innerText || el.textContent || '');
           if (hit) return { ...hit, via: 'show-data-header' };
         }
       }
@@ -1076,9 +1093,11 @@ export default async ({ page }) => {
         }
       }
 
-      const samples = popups.slice(0, 3).map(el =>
-        norm(el.innerText || el.textContent || '').slice(0, 240)
-      );
+      const samples = popups.slice(0, 3).map(el => ({
+        text: norm(el.innerText || el.textContent || '').slice(0, 500),
+        aria_rowcount: Array.from(el.querySelectorAll('[aria-rowcount]'))
+          .map(node => node.getAttribute('aria-rowcount')).filter(Boolean).slice(0, 5),
+      }));
       return {
         count: null,
         error: 'Rows count was not found at the top of the Show Data popup',
@@ -1160,10 +1179,16 @@ export default async ({ page }) => {
       const kpiKey = KPI_PREFIX + ' - ' + tab;
       const tabClick = await clickByText(tab, { openers: NAV_OPENERS });
       row[kpiKey + '_navigation'] = tabClick;
+      const navigationWarning = tabClick && tabClick.error
+        ? { error: 'Sub-tab label was not found; using the report page already opened by its URL', navigation: tabClick }
+        : null;
       if (tabClick && tabClick.error) {
-        row[kpiKey] = null;
-        row[kpiKey + '_debug'] = { error: 'Sub-tab did not open', navigation: tabClick };
-        continue;
+        row.extract_debug = {
+          warning: 'Sub-tab label was not found; continuing on the report page',
+          tab,
+          navigation: tabClick,
+          page_url: page.url(),
+        };
       }
 
       await waitForDashboard();
@@ -1190,15 +1215,33 @@ export default async ({ page }) => {
       row[kpiKey + '_show_data'] = openResult;
       if (!openResult.ok) {
         row[kpiKey] = null;
-        row[kpiKey + '_debug'] = { error: openResult.error, open_result: openResult };
+        row[kpiKey + '_debug'] = {
+          error: openResult.error,
+          open_result: openResult,
+          navigation_warning: navigationWarning,
+        };
         continue;
       }
-      await waitForShowDataPopup();
+      const popupReady = await waitForShowDataPopup();
+      if (!popupReady.ok) {
+        row[kpiKey] = null;
+        row[kpiKey + '_debug'] = {
+          error: popupReady.error,
+          open_result: openResult,
+          popup_ready: popupReady,
+          navigation_warning: navigationWarning,
+        };
+        await closeShowDataPopup();
+        continue;
+      }
       await waitForLoadingToFinish(10000);
       await sleep(800);
       const countResult = await extractShowDataRowCount();
       row[kpiKey] = countResult.count;
-      row[kpiKey + '_debug'] = countResult;
+      row[kpiKey + '_debug'] = {
+        ...countResult,
+        navigation_warning: navigationWarning,
+      };
       await closeShowDataPopup();
       await sleep(500);
     }

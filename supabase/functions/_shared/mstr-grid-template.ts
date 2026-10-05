@@ -170,7 +170,13 @@ export function isRecordCountScenario(scenario: any): boolean {
 }
 
 export function parseSubTabs(scenario: any): string[] {
-  const desc = String(scenario?.description || "");
+  // Scenario authors commonly put the quoted sub-tab in the title and leave
+  // the description empty. Parse both so deterministic record-count
+  // generation does not incorrectly fall through to the generic KPI template.
+  const desc = [scenario?.title, scenario?.description]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .join("\n");
   const tabs: string[] = [];
   const seen = new Set<string>();
   for (const m of desc.matchAll(/[''‘’""“”]([^''‘’""“”]{3,80})[''‘’""“”]/g)) {

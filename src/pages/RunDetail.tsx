@@ -124,16 +124,21 @@ export default function RunDetail() {
 
   const withDerivedStatus = useMemo(() => {
     return (merged || []).map((r: any) => {
-      const derivedStatus = deriveStoredResultStatus({
-        actual: r.actual,
-        expected: r.expected,
-        scenarioType: r.scenarios?.type,
-        diff: r.diff,
-        fallbackStatus: r.status,
-      });
+      const storedStatus = r.status === "pass" || r.status === "fail" || r.status === "pending"
+        ? r.status
+        : null;
+      const derivedStatus = !isRunning && storedStatus
+        ? storedStatus
+        : deriveStoredResultStatus({
+            actual: r.actual,
+            expected: r.expected,
+            scenarioType: r.scenarios?.type,
+            diff: r.diff,
+            fallbackStatus: r.status,
+          });
       return { ...r, derivedStatus };
     });
-  }, [merged]);
+  }, [merged, isRunning]);
 
   const filtered = useMemo(() => {
     const q = search.toLowerCase().trim();
@@ -165,15 +170,29 @@ export default function RunDetail() {
     }
     return { pass, fail, pending };
   }, [withDerivedStatus]);
-  const displayedRunStatus = isRunning
-    ? "running"
-    : counts.fail > 0
-      ? "failed"
-      : counts.pending > 0
-        ? "running"
-        : counts.pass > 0
-          ? "completed"
-          : run?.status;
+  const storedSummary = (run as any)?.summary || {};
+  const hasFinalSummary =
+    !isRunning &&
+    Number.isFinite(Number(storedSummary.pass)) &&
+    Number.isFinite(Number(storedSummary.fail)) &&
+    Number(storedSummary.total) > 0;
+  // While executing, derived rows provide live progress. Once finalized, the
+  // persisted run status/summary are authoritative and must match the Runs
+  // list. A historical KPI that currently derives as pending must never turn a
+  // completed run back into "running".
+  const displayedCounts = hasFinalSummary
+    ? {
+        pass: Number(storedSummary.pass),
+        fail: Number(storedSummary.fail),
+        pending: Math.max(
+          0,
+          Number(storedSummary.total) -
+            Number(storedSummary.pass) -
+            Number(storedSummary.fail),
+        ),
+      }
+    : counts;
+  const displayedRunStatus = run?.status;
 
   return (
     <AppLayout>
@@ -185,7 +204,7 @@ export default function RunDetail() {
               {displayedRunStatus && <StatusChip status={displayedRunStatus} />}
             </h1>
             <div className="text-sm text-muted-foreground mt-1">
-              {counts.pass} passed · {counts.fail} failed · {counts.pending} pending · trigger {run?.trigger_source}
+              {displayedCounts.pass} passed · {displayedCounts.fail} failed · {displayedCounts.pending} pending · trigger {run?.trigger_source}
             </div>
           </div>
           <div className="flex items-center gap-2">

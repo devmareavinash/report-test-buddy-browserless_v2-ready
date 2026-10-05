@@ -205,7 +205,12 @@ if (-not $SkipBrowserless) {
     # scripts finished, surfacing as a 504 from the proxy.
     $timeoutMs = if ($env:BROWSERLESS_TIMEOUT_MS) { $env:BROWSERLESS_TIMEOUT_MS } else { "840000" }
     $args = '["--ignore-certificate-errors","--ignore-certificate-errors-spki-list","--window-size=1920,1080","--force-device-scale-factor=1"]'
-    $dockerCmd = "docker run --rm -p 3000:3000 --shm-size=2g -e TOKEN=$token -e CONCURRENT=10 -e QUEUED=10 -e TIMEOUT=$timeoutMs -e CORS=true -e 'DEFAULT_LAUNCH_ARGS=$args' ghcr.io/browserless/chromium:v2.55.4"
+    # Starting many Chromium processes simultaneously can exhaust a 4 GB Docker
+    # Desktop VM before any process exposes its DevTools endpoint. Keep a small
+    # launch pool and queue the remaining orchestration requests.
+    $concurrent = if ($env:BROWSERLESS_CONCURRENT) { $env:BROWSERLESS_CONCURRENT } else { "3" }
+    $queued = if ($env:BROWSERLESS_QUEUED) { $env:BROWSERLESS_QUEUED } else { "20" }
+    $dockerCmd = "docker run --rm -p 3000:3000 --shm-size=2g --dns 8.8.8.8 --dns 1.1.1.1 --add-host mstr-prod.bayer.com:54.84.130.141 --add-host mstr-qa.bayer.com:54.84.103.229 -e TOKEN=$token -e CONCURRENT=$concurrent -e QUEUED=$queued -e TIMEOUT=$timeoutMs -e CORS=true -e 'DEFAULT_LAUNCH_ARGS=$args' ghcr.io/browserless/chromium:v2.55.4"
     Start-ChildCommand $root $dockerCmd
     Wait-Port 3000 "Browserless" 180 | Out-Null
   }

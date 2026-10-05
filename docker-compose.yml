@@ -91,8 +91,10 @@ services:
       - "127.0.0.1:3000:3000"
     environment:
       TOKEN: ${BROWSERLESS_TOKEN:-local-dev-token}
-      CONCURRENT: ${BROWSERLESS_CONCURRENT:-10}
-      QUEUED: ${BROWSERLESS_QUEUED:-10}
+      # Docker Desktop commonly has a 4 GB VM limit. A burst of 5–10 Chromium
+      # launches can miss Puppeteer's 30-second startup deadline; queue instead.
+      CONCURRENT: ${BROWSERLESS_CONCURRENT:-3}
+      QUEUED: ${BROWSERLESS_QUEUED:-20}
       TIMEOUT: ${BROWSERLESS_TIMEOUT_MS:-420000}
       CORS: "true"
       # Do not pass the VDI Skyhigh proxy into Chromium (ERR_PROXY_CONNECTION_FAILED

@@ -44,32 +44,66 @@ function makeCallFn(callerAuthorization: string) {
 }
 
 // Atomically merge a child report's contribution into the workstream parent run.
-// Read-modify-write with retries; finalises the parent run when all children done.
+// The database function locks the parent row before incrementing `done`. Doing
+// this as a client-side read/modify/write loses increments when hosted child
+// invocations finish concurrently, leaving the parent permanently "running".
 async function finalizeChild(sb: any, runId: string, addPass: number, addFail: number, hadError: boolean, errMsg?: string) {
-  for (let attempt = 0; attempt < 6; attempt++) {
-    const { data: cur } = await sb.from("runs").select("summary, status").eq("id", runId).maybeSingle();
-    if (!cur) return;
-    const s: any = cur.summary || {};
-    const childCount = Number(s.child_count || 0);
-    const done = Number(s.done || 0) + 1;
-    const merged: any = {
-      pass: Number(s.pass || 0) + addPass,
-      fail: Number(s.fail || 0) + addFail,
-      total: Number(s.total || 0) + addPass + addFail,
+  const { error } = await sb.rpc("finalize_workstream_child", {
+    p_run_id: runId,
+    p_add_pass: addPass,
+    p_add_fail: addFail,
+    p_had_error: hadError,
+    p_error_message: errMsg || null,
+  });
+  if (!error) return;
+
+  // Local/portable fallback for databases where the migration has not been
+  // deployed yet. Compare the JSONB value we read in the UPDATE predicate so
+  // concurrent children cannot overwrite each other's increments.
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const { data: current, error: readError } = await sb
+      .from("runs")
+      .select("summary, status")
+      .eq("id", runId)
+      .maybeSingle();
+    if (readError) throw new Error(`Failed to read workstream run: ${readError.message}`);
+    if (!current || current.status !== "running") return;
+
+    const summary: any = current.summary || {};
+    const childCount = Number(summary.child_count || 0);
+    const done = Number(summary.done || 0) + 1;
+    const errors = hadError
+      ? [...(Array.isArray(summary.errors) ? summary.errors : []), errMsg || "child error"]
+      : summary.errors;
+    const nextSummary: any = {
+      ...summary,
+      pass: Number(summary.pass || 0) + addPass,
+      fail: Number(summary.fail || 0) + addFail,
+      total: Number(summary.total || 0) + addPass + addFail,
       done,
       child_count: childCount,
     };
-    if (hadError) merged.errors = [...(Array.isArray(s.errors) ? s.errors : []), errMsg || "child error"];
+    if (errors?.length) nextSummary.errors = errors;
     const isLast = childCount > 0 && done >= childCount;
-    const patch: any = { summary: merged };
+    const patch: any = { summary: nextSummary };
     if (isLast) {
-      patch.status = (merged.fail > 0 || hadError || (merged.errors && merged.errors.length)) ? "completed" : "completed";
+      patch.status = "completed";
       patch.finished_at = new Date().toISOString();
     }
-    const { error } = await sb.from("runs").update(patch).eq("id", runId);
-    if (!error) return;
-    await new Promise((r) => setTimeout(r, 100 + attempt * 150));
+
+    const { data: updated, error: updateError } = await sb
+      .from("runs")
+      .update(patch)
+      .eq("id", runId)
+      .eq("status", "running")
+      .filter("summary", "eq", JSON.stringify(summary))
+      .select("id")
+      .maybeSingle();
+    if (updateError) throw new Error(`Failed to finalize workstream child: ${updateError.message}`);
+    if (updated) return;
+    await new Promise((resolve) => setTimeout(resolve, 25 + attempt * 25));
   }
+  throw new Error(`Failed to finalize workstream child after concurrent update retries: ${error.message}`);
 }
 
 function orchestrateConcurrency(override?: unknown): number {
@@ -204,6 +238,15 @@ function normKpiKey(k: string): string {
   return String(k || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
+function configuredStructuredKpiAlias(rawKey: string, configuredLabels: string[]): string {
+  const exact = configuredLabels.find((label) => normKpiKey(label) === normKpiKey(rawKey));
+  if (exact) return exact;
+  // A single configured KPI is an unambiguous alias for a lone extracted
+  // grid/graph key such as "tableData". With multiple configured KPIs we keep
+  // the raw key rather than attaching the table to the wrong KPI.
+  return configuredLabels.length === 1 ? configuredLabels[0] : rawKey;
+}
+
 function lookupKpiValue(map: Record<string, any> | null | undefined, name: string): any {
   if (!map || typeof map !== "object") return undefined;
   if ((map as any)[name] !== undefined) return (map as any)[name];
@@ -307,21 +350,42 @@ function evalDatePass(actual: any, expected: any, op: string, toleranceDays = 0)
 
 const STRUCTURED_KPI_KEYS = new Set(["grid", "graph", "data", "table", "tabledata", "series", "chart", "rows", "heatmap", "viz", "dataset"]);
 
+function isExtractionNoiseKey(k: string): boolean {
+  const normalized = normKpiKey(k);
+  if (!normalized || String(k || "").startsWith("__")) return true;
+  if ([
+    "filtersapplied", "screenshot", "ok", "error", "url", "title", "note",
+    "result", "extracted", "navigation",
+  ].includes(normalized)) return true;
+  return [
+    "gridready", "debug", "showdata", "navigation", "filters",
+  ].some((suffix) => normalized.endsWith(suffix));
+}
+
 function isStructuredVal(v: any): boolean {
   if (v == null || typeof v === "boolean") return false;
   if (Array.isArray(v)) return v.length > 0;
   if (typeof v !== "object") return false;
-  return Object.keys(v).some((k) => STRUCTURED_KPI_KEYS.has(k.toLowerCase().replace(/[^a-z0-9]/g, "")));
+  return Object.entries(v).some(([k, nested]) => {
+    if (!STRUCTURED_KPI_KEYS.has(normKpiKey(k))) return false;
+    if (Array.isArray(nested)) return nested.length > 0;
+    if (!nested || typeof nested !== "object") return false;
+    return Object.values(nested).some((value) =>
+      Array.isArray(value) ? value.length > 0 : Boolean(value && typeof value === "object")
+    );
+  });
 }
 
 function pickStructured(map: Record<string, any> | null | undefined): { k: string; v: any } | null {
   if (!map || typeof map !== "object") return null;
   for (const k of Object.keys(map)) {
+    if (isExtractionNoiseKey(k)) continue;
     if (STRUCTURED_KPI_KEYS.has(k.toLowerCase().replace(/[^a-z0-9]/g, "")) && map[k] && typeof map[k] === "object") {
-      return { k, v: map[k] };
+      if (isStructuredVal({ [k]: map[k] })) return { k, v: map[k] };
     }
   }
   for (const [k, v] of Object.entries(map)) {
+    if (isExtractionNoiseKey(k)) continue;
     if (isStructuredVal(v)) return { k, v };
   }
   return null;
@@ -368,7 +432,7 @@ function pickComboKpis(payload: any, comboLabel: string | null): Record<string, 
     if (!comboLabel) {
       const flat: Record<string, any> = {};
       for (const [k, v] of Object.entries(root)) {
-        if (["filters_applied", "screenshot", "ok", "error", "url", "title", "note", "result", "extracted", "navigation"].includes(k)) continue;
+        if (isExtractionNoiseKey(k)) continue;
         if (v && typeof v === "object") {
           if (k === "grains" || Array.isArray(v) && (k === "periods" || k === "missing")) flat[k] = v;
           else if (isStructuredVal(v)) flat[k] = v;
@@ -383,7 +447,7 @@ function pickComboKpis(payload: any, comboLabel: string | null): Record<string, 
       if (node && typeof node === "object") {
         const flat: Record<string, any> = {};
         for (const [k, v] of Object.entries(node)) {
-          if (k === "filters_applied" || k === "navigation") continue;
+          if (isExtractionNoiseKey(k)) continue;
           if (v && typeof v === "object") {
             if (k === "grains" || Array.isArray(v) && (k === "periods" || k === "missing")) flat[k] = v;
             else if (isStructuredVal(v)) flat[k] = v;
@@ -575,11 +639,12 @@ Deno.serve(async (req) => {
     // each child processes its report and atomically finalises the parent run when last.
     if (!existing_run_id && scope_type === "workstream") {
       const dispatch = async () => {
-        // Cap in-flight child reports. Local Deno awaits each child until that
-        // report finishes, so this pool actually limits Browserless load.
-        // Parent summary updates are stored in one JSONB column. Process report
-        // children serially until the aggregation is moved to an atomic DB RPC.
-        const reportConcurrency = 1;
+        // Spread the configured browser budget across reports. Serial report
+        // execution can exceed the caller JWT lifetime on a full workstream,
+        // after which no child can persist results or finalize the parent.
+        // Parent aggregation is now atomic (RPC or compare-and-swap fallback),
+        // so report children can safely finish concurrently.
+        const reportConcurrency = Math.min(concurrency, Math.max(1, reportIds.length));
         const childConcurrency = Math.max(1, Math.floor(concurrency / reportConcurrency));
         await mapPool(reportIds, reportConcurrency, async (rid) => {
           try {
@@ -658,7 +723,9 @@ Deno.serve(async (req) => {
               });
               return { pass: 0, fail: 1 };
             }
-            // Shared DB row — never per-user. Generate only when no saved playwright_code exists.
+            // Saved scripts may contain page-specific selectors that generic
+            // templates cannot reproduce. Never replace them automatically;
+            // regeneration remains an explicit operator action.
             if (!scriptHasSavedCode(script)) {
               const gen = await callFn("agent-scripts", { scenario_id: s.id });
               if (gen?.script?.playwright_code) {
@@ -912,6 +979,10 @@ Deno.serve(async (req) => {
               const kpiTol: Record<string, any> = ((script as any)?.assertion_spec || {}).kpi_tolerances || {};
               const mainGrid = pickStructured(scraped);
               const expGrid = pickStructured(expectedMap);
+              const structuredLabel = mainGrid
+                ? configuredStructuredKpiAlias(mainGrid.k, kpiLabels)
+                : null;
+              const structuredSourceKeys: Record<string, string> = {};
 
               if (isTrend) {
                 const grainMap = scraped.grains && typeof scraped.grains === "object" ? scraped.grains : null;
@@ -942,13 +1013,20 @@ Deno.serve(async (req) => {
                   error: comboPass ? null : (scraped.trend_error || "gap_in_periods"),
                 };
               } else {
-              if (mainGrid) actualMap[mainGrid.k] = mainGrid.v;
+              if (mainGrid && structuredLabel) {
+                actualMap[structuredLabel] = mainGrid.v;
+                structuredSourceKeys[structuredLabel] = mainGrid.k;
+                if (expGrid) {
+                  expectedMap[structuredLabel] = expGrid.v;
+                  if (expGrid.k !== structuredLabel) delete expectedMap[expGrid.k];
+                }
+              }
               if (mainGrid && expGrid) {
                 // Grid / graph Show Data: compare cell by cell so the configured
                 // comparator + tolerance apply. JSON.stringify equality ignored both
                 // and failed the whole visual on any single differing cell.
                 // Change/delta rows (NBRx Change, TRx Change, ...) are skipped.
-                const gTolEntry: any = lookupKpiTol(kpiTol, mainGrid.k);
+                const gTolEntry: any = lookupKpiTol(kpiTol, structuredLabel || mainGrid.k);
                 const gTolVal = gTolEntry && typeof gTolEntry === "object" ? Number(gTolEntry.value) : Number(gTolEntry);
                 const gTolUnit = (gTolEntry && typeof gTolEntry === "object" && gTolEntry.unit) === "abs" ? "abs" : "pct";
                 let gTolOp = (gTolEntry && typeof gTolEntry === "object" && gTolEntry.op) || "eq";
@@ -965,7 +1043,7 @@ Deno.serve(async (req) => {
                     { skipChangeRows: true },
                   );
                   gridPass = cmp.pass;
-                  diffMap[mainGrid.k] = {
+                  diffMap[structuredLabel || mainGrid.k] = {
                     structured: true,
                     pass: gridPass,
                     cellwise: true,
@@ -980,12 +1058,12 @@ Deno.serve(async (req) => {
                 } else {
                   // Unrecognised shape: fall back to the previous exact match.
                   gridPass = structuredEqual(mainGrid.v, expGrid.v);
-                  diffMap[mainGrid.k] = { structured: true, pass: gridPass, cellwise: false };
+                  diffMap[structuredLabel || mainGrid.k] = { structured: true, pass: gridPass, cellwise: false };
                 }
                 if (!gridPass) comboPass = false;
               } else if (mainGrid && (isRef || sqlTplId) && !expGrid) {
                 comboPass = false;
-                diffMap[mainGrid.k] = { structured: true, error: "no_expected_grid" };
+                diffMap[structuredLabel || mainGrid.k] = { structured: true, error: "no_expected_grid" };
               }
 
               for (const lbl of labels) {
@@ -1060,6 +1138,13 @@ Deno.serve(async (req) => {
                   diffMap[lbl] = {
                     pct, expected: e, actual: a,
                     tolerance: Number.isFinite(tVal) ? { value: tVal, unit: tUnit, op: tOp } : null,
+                    ...(
+                      a == null
+                        ? { error: "no_value" }
+                        : e == null
+                          ? { error: "no_expected_value" }
+                          : {}
+                    ),
                   };
                   if (!pass) comboPass = false;
                 }
@@ -1114,7 +1199,15 @@ Deno.serve(async (req) => {
               const { data: tr, error: trError } = await sb.from("test_results").insert({
                 run_id: run.id, scenario_id: s.id, status,
                 expected: { source: sqlMeta.source, filter: combo.label, where_clause: sqlMeta.where_clause, values: expectedMap, row: sqlRow, sql: sqlMeta },
-                actual: { filter: combo.label, values: actualMap, filters_applied: pickComboFiltersApplied(runResp, combo.label) || combo.filters || null, tolerances_snapshot: tolerancesSnapshot },
+                actual: {
+                  filter: combo.label,
+                  values: actualMap,
+                  filters_applied: pickComboFiltersApplied(runResp, combo.label) || combo.filters || null,
+                  tolerances_snapshot: tolerancesSnapshot,
+                  structured_source_keys: Object.keys(structuredSourceKeys).length
+                    ? structuredSourceKeys
+                    : null,
+                },
                 diff: diffMap,
                 criticality: crit,
                 severity: crit,

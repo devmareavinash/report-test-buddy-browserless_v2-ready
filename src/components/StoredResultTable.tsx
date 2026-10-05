@@ -28,6 +28,13 @@ function compareSymbol(op?: string) {
   return "=";
 }
 
+function extractionErrorLabel(error?: string | null) {
+  if (error === "no_value") return "Actual value was not extracted";
+  if (error === "no_expected_value") return "Reference value was not extracted";
+  if (error === "no_expected_grid") return "Reference grid was not extracted";
+  return error ? error.replace(/_/g, " ") : "";
+}
+
 export function StoredResultTable({
   actual,
   expected,
@@ -161,7 +168,9 @@ export function StoredResultTable({
                   </>
                 )}
                 <td className="p-2 mono align-top">
-                  {r.diff !== null ? (
+                  {r.error ? (
+                    <span className="text-destructive">{extractionErrorLabel(r.error)}</span>
+                  ) : r.diff !== null ? (
                     <span className={r.pass === false ? "text-destructive" : "text-muted-foreground"}>
                       {r.diff > 0 ? "+" : ""}{fmt(r.diff)}
                       {r.deltaPct !== null && (

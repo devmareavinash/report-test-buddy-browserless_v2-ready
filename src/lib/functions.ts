@@ -31,17 +31,26 @@ function jwtExpMs(token: string): number | null {
   }
 }
 
-async function authHeaders() {
+async function authHeaders(forceRefresh = false) {
   let { data } = await supabase.auth.getSession();
   let token = data.session?.access_token || "";
   const expMs = token ? jwtExpMs(token) : null;
-  if (token && expMs != null && expMs < Date.now() + 60_000) {
+  if (token && (forceRefresh || (expMs != null && expMs < Date.now() + 60_000))) {
     try {
       const refreshed = await supabase.auth.refreshSession();
       if (refreshed.data.session?.access_token) {
         token = refreshed.data.session.access_token;
+      } else if (forceRefresh) {
+        throw new Error("Session refresh returned no access token");
       }
-    } catch {
+    } catch (error) {
+      if (forceRefresh) {
+        throw new Error(
+          `Could not refresh the login session before starting the run: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
       // VDI proxy can block refresh; send the existing token (local Deno
       // accepts a recently expired user JWT).
     }
@@ -64,7 +73,9 @@ export async function invokeFunction<T = any>(name: string, body: any): Promise<
     const path = `/functions/v1/${name}`;
     const response = await fetch(`${functionsBaseUrl()}${path}`, {
       method: "POST",
-      headers: await authHeaders(),
+      // Long workstream runs must begin with a full token lifetime. Internal
+      // child calls inherit this token, and no service-role key is required.
+      headers: await authHeaders(name === "agent-orchestrate"),
       body: JSON.stringify(body ?? {}),
     });
     const text = await response.text();

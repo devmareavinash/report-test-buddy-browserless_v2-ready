@@ -300,7 +300,12 @@ Deno.serve(async (req) => {
         const parsedNavSteps = parseGridNavSteps(scenario);
         const subTabs = parseSubTabs(scenario);
         if (subTabs.length > 0) {
-          const navSteps = sanitizeRecordCountNavSteps(parsedNavSteps, subTabs);
+          const reportName = String(scenario.reports?.name || "").trim().toLowerCase();
+          const navSteps = sanitizeRecordCountNavSteps(parsedNavSteps, subTabs)
+            // The report URL already opens this screen. Clicking the report
+            // name again can navigate away from its sub-tabs before filters
+            // are applied.
+            .filter((step) => !reportName || step.trim().toLowerCase() !== reportName);
           const playwright_code = await assembleRecordCountScript({
             reportUrl: normalizeReportUrl(targetUrl),
             navSteps,

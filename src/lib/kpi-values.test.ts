@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { configuredKpiNames, deriveStoredResultStatus, isKpiValueNoise, lookupStoredKpiValue, resolveKpiTol, storedKpiSpec, storedKpiTolerances, unwrapStoredValues } from "./kpi-values";
+import { configuredKpiNames, deriveStoredResultRows, deriveStoredResultStatus, isKpiValueNoise, lookupStoredKpiValue, resolveKpiTol, storedKpiSpec, storedKpiTolerances, toStoredTableModel, unwrapStoredValues } from "./kpi-values";
 
 describe("lookupStoredKpiValue", () => {
   it("uses a legacy Row Count KPI when the configured KPI is Count", () => {
@@ -39,6 +39,24 @@ describe("lookupStoredKpiValue", () => {
 });
 
 describe("stored KPI tolerances", () => {
+  it("shows a structured result under its configured KPI alias", () => {
+    const table = { columns: ["Metric", "Value"], rows: [["TRx", 42]] };
+    const result = deriveStoredResultRows({
+      actual: {
+        values: { "Segment Summary": table },
+        structured_source_keys: { "Segment Summary": "tableData" },
+        tolerances_snapshot: {
+          "Segment Summary": { value: 0, unit: "pct", op: "eq" },
+        },
+      },
+      expected: { values: { "Segment Summary": table } },
+      fallbackStatus: "fail",
+    });
+
+    expect(result.rows.map((row) => row.k)).toEqual(["Segment Summary"]);
+    expect(result.status).toBe("pass");
+  });
+
   it("prefers the saved run snapshot over current scenario tolerances", () => {
     const actual = {
       tolerances_snapshot: {
@@ -114,6 +132,75 @@ describe("deriveStoredResultStatus", () => {
       expected: { error: "missing_filter_mapping" },
       fallbackStatus: "pending",
     })).toBe("fail");
+  });
+
+  it("keeps a KPI failed when its stored diff records no extracted value", () => {
+    const result = deriveStoredResultRows({
+      actual: {
+        values: { Count: null },
+        tolerances_snapshot: {
+          Count: { value: 0, unit: "pct", op: "eq" },
+        },
+      },
+      expected: { values: { Count: null } },
+      diff: { Count: { error: "no_value" } },
+      fallbackStatus: "fail",
+    });
+
+    expect(result.status).toBe("fail");
+    expect(result.rows).toEqual([
+      expect.objectContaining({ k: "Count", pass: false, error: "no_value" }),
+    ]);
+  });
+
+  it("does not treat grid-readiness diagnostics as a structured KPI value", () => {
+    const diagnostics = {
+      rows: 25,
+      cells: 230,
+      frame_url: "https://example.test/report",
+      textLength: 1535,
+      fingerprint: "25|230|1535|1397|375",
+      stable_polls: 3,
+    };
+    const result = deriveStoredResultRows({
+      actual: {
+        values: { Count: null },
+        tolerances_snapshot: {
+          Count: { value: 0, unit: "pct", op: "eq" },
+        },
+      },
+      expected: { values: { Count: diagnostics } },
+      diff: { Count: { error: "no_value" } },
+      fallbackStatus: "fail",
+    });
+
+    expect(toStoredTableModel(diagnostics)).toBeNull();
+    expect(result.rows[0]).toEqual(expect.objectContaining({
+      k: "Count",
+      a: null,
+      e: diagnostics,
+      pass: false,
+      error: "no_value",
+    }));
+  });
+
+  it("preserves a legacy persisted failure when KPI values and diff details are missing", () => {
+    const result = deriveStoredResultRows({
+      actual: {
+        values: { Count: null },
+        tolerances_snapshot: {
+          Count: { value: 0, unit: "pct", op: "eq" },
+        },
+      },
+      expected: { values: { Count: null } },
+      fallbackStatus: "fail",
+    });
+
+    expect(result.status).toBe("fail");
+    expect(result.derived).toBe(false);
+    expect(result.rows).toEqual([
+      expect.objectContaining({ k: "Count", pass: false }),
+    ]);
   });
 
   it("does not treat informational messages as errors when KPI values are present", () => {

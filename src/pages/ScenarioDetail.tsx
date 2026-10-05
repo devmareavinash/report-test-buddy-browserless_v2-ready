@@ -1019,10 +1019,16 @@ export default function ScenarioDetail() {
   };
   const displayActual = (hasManual && manualActual)
     ? manualActual
-    : (kpiMapFromStored(latest?.actual) || unwrapSuiteKpis(latest?.actual) || {});
+    : aliasConfiguredKpis(
+        kpiMapFromStored(latest?.actual) || unwrapSuiteKpis(latest?.actual) || {},
+        kpiTolerances,
+      );
   const displayExpected = (hasManual && manualExpected)
     ? manualExpected
-    : (kpiMapFromStored(latest?.expected) || unwrapSuiteKpis(latest?.expected) || {});
+    : aliasConfiguredKpis(
+        kpiMapFromStored(latest?.expected) || unwrapSuiteKpis(latest?.expected) || {},
+        kpiTolerances,
+      );
   const displayDiff = hasManual ? null : latest?.diff;
 
   // Hydrate FilterComparisonTable from stored test_results (and the last playwright job
@@ -2317,13 +2323,6 @@ function toTableModel(v: any): { columns: string[]; rows: any[][] } | null {
     return { columns: ["Label", "Value"], rows: v.labels.map((l: any, i: number) => [l, v.values[i]]) };
   }
 
-  const primitiveEntries = Object.entries(v).filter(([k, val]) => {
-    if (isKpiNoiseKey(k) || STRUCTURED_KPI_KEYS.has(k.toLowerCase().replace(/[^a-z0-9]/g, ""))) return false;
-    return val !== null && val !== undefined && typeof val !== "object";
-  });
-  if (primitiveEntries.length >= 2) {
-    return { columns: ["Key", "Value"], rows: primitiveEntries.map(([k, val]) => [k, val]) };
-  }
   return null;
 }
 
@@ -2382,6 +2381,11 @@ function KpiValue({ value, large }: { value: any; large?: boolean }) {
   }
   const table = toTableModel(value);
   if (table) return <MiniDataTable columns={table.columns} rows={table.rows} large={large} />;
+  // Runtime diagnostics (frame_url, fingerprint, stable_polls, etc.) are
+  // objects, but they are not KPI values. Never render them as a KPI scalar.
+  if (value && typeof value === "object") {
+    return <span className="text-muted-foreground">—</span>;
+  }
   return <span className="mono font-semibold">{fmt(value)}</span>;
 }
 
@@ -2595,16 +2599,7 @@ function findNamedKpi(node: any, name: string, depth = 0): any {
 }
 
 function isStructuredKpiValue(v: any): boolean {
-  if (v == null || typeof v === "boolean") return false;
-  if (Array.isArray(v)) {
-    if (!v.length) return false;
-    const first = v[0];
-    return Array.isArray(first) || (first && typeof first === "object") || v.length > 1;
-  }
-  if (typeof v !== "object") return false;
-  const keys = Object.keys(v).filter((k) => !isKpiNoiseKey(k));
-  return keys.some((k) => STRUCTURED_KPI_KEYS.has(k.toLowerCase().replace(/[^a-z0-9]/g, "")))
-    || keys.length >= 2;
+  return !!toTableModel(v);
 }
 
 function looksLikeStructuredKpiName(name: string) {

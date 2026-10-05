@@ -310,6 +310,7 @@ export type StoredResultKpiRow = {
   diff: number | null;
   deltaPct: number | null;
   pass: boolean | null;
+  error?: string | null;
 };
 
 export function evalStoredKpiValue(
@@ -377,6 +378,7 @@ export function deriveStoredResultRows({
   actual,
   expected,
   spec,
+  diff: storedDiff,
   fallbackStatus,
 }: {
   actual: any;
@@ -398,7 +400,7 @@ export function deriveStoredResultRows({
   const effectiveSpec = storedKpiSpec(actual, spec);
   const tols = effectiveSpec.kpi_tolerances || {};
   const names = storedResultKpiNames(actual, expected, spec);
-  const rows = names.map((k) => {
+  let rows = names.map((k) => {
     let a = lookupStoredKpiValue(actualMap, k);
     let e = lookupStoredKpiValue(expectedMap, k);
     if (a == null && isStoredTableValue(actual?.values?.tableData || actual?.tableData)) {
@@ -413,11 +415,34 @@ export function deriveStoredResultRows({
     const diff = both ? aN - eN : null;
     const deltaPct = both && eN !== 0 ? (diff! / Math.abs(eN)) * 100 : null;
     const tol = resolveKpiTol(tols, k);
-    const pass = evalStoredKpiValue(a, e, tol);
-    return { k, a, e, diff, deltaPct, pass };
+    const diffEntry = storedDiff && typeof storedDiff === "object"
+      ? lookupStoredKpiValue(storedDiff, k)
+      : null;
+    const error = diffEntry && typeof diffEntry === "object" && typeof diffEntry.error === "string"
+      ? diffEntry.error
+      : null;
+    // The orchestrator records explicit KPI failures such as `no_value` in
+    // the diff map. Missing actual/expected values alone compare as pending,
+    // so preserve that execution-time failure instead of contradicting the
+    // persisted row status in Run Detail.
+    const pass = error
+      ? false
+      : evalStoredKpiValue(a, e, tol);
+    return { k, a, e, diff, deltaPct, pass, error };
   });
   if (!rows.length) return { rows, status: toStoredStatus(fallbackStatus), derived: false };
-  return { rows, status: overallFromStoredKpiRows(rows), derived: true };
+  const calculatedStatus = overallFromStoredKpiRows(rows);
+  const persistedStatus = toStoredStatus(fallbackStatus);
+  // Older stored results may contain only the authoritative result status,
+  // without a KPI-level diff error. Do not turn such a recorded failure back
+  // into pending merely because the missing values cannot be re-compared.
+  if (calculatedStatus === "pending" && persistedStatus === "fail") {
+    if (rows.length === 1 && rows[0].pass == null) {
+      rows = [{ ...rows[0], pass: false }];
+    }
+    return { rows, status: "fail", derived: false };
+  }
+  return { rows, status: calculatedStatus, derived: true };
 }
 
 export function deriveStoredResultStatus(args: Parameters<typeof deriveStoredResultRows>[0]): StoredResultStatus {
