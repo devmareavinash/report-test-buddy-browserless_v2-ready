@@ -47,6 +47,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+trap {
+  Write-Host "`n    X   Startup stopped: $($_.Exception.Message)" -ForegroundColor Red
+  Write-Host "        at line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())" -ForegroundColor DarkGray
+  exit 1
+}
 $script:DockerDown = $false
 
 # ---------------------------------------------------------------- helpers ----
@@ -79,7 +84,15 @@ function Start-ChildCommand($workDir, $command) {
 
 # Docker Desktop can be installed but the engine stopped - `docker run` then fails instantly.
 function Test-DockerEngine {
-  try { docker info *> $null; return ($LASTEXITCODE -eq 0) } catch { return $false }
+  # Run `docker info` in a separate process with a timeout. Calling it inline with
+  # ErrorActionPreference=Stop can end the whole script silently on Windows PowerShell
+  # when Docker writes to stderr (e.g. engine stopped), and it can hang for minutes.
+  try {
+    $p = Start-Process -FilePath "docker" -ArgumentList "info" -NoNewWindow -PassThru `
+         -RedirectStandardOutput "$env:TEMP\rtb-docker-out.txt" -RedirectStandardError "$env:TEMP\rtb-docker-err.txt"
+    if (-not $p.WaitForExit(20000)) { try { $p.Kill() } catch {}; return $false }
+    return ($p.ExitCode -eq 0)
+  } catch { return $false }
 }
 
 function Test-Port($port) {
