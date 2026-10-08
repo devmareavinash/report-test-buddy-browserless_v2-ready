@@ -71,6 +71,42 @@ export function isChartTable(v: any): boolean {
   return !!toTableModel(v);
 }
 
+function normalizedColumnName(value: string) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+export function alignComparedTableColumns(
+  actual: { columns: string[]; rows: any[][] },
+  expected: { columns: string[]; rows: any[][] },
+) {
+  const columns = [...expected.columns];
+  const known = new Set(columns.map(normalizedColumnName));
+  for (const column of actual.columns) {
+    const normalized = normalizedColumnName(column);
+    if (!known.has(normalized)) {
+      columns.push(column);
+      known.add(normalized);
+    }
+  }
+
+  const align = (table: { columns: string[]; rows: any[][] }) => {
+    const indexes = new Map(
+      table.columns.map((column, index) => [normalizedColumnName(column), index]),
+    );
+    return {
+      columns,
+      rows: table.rows.map((row) =>
+        columns.map((column) => {
+          const index = indexes.get(normalizedColumnName(column));
+          return index === undefined ? "" : row?.[index];
+        })
+      ),
+    };
+  };
+
+  return { actual: align(actual), expected: align(expected) };
+}
+
 export function MiniDataTable({ columns, rows, large }: { columns: string[]; rows: any[][]; large?: boolean }) {
   return (
     <div className={`${large ? "max-h-96" : "max-h-64"} max-w-full overflow-auto rounded border border-border bg-background`}>
@@ -109,6 +145,9 @@ export function GridComparePanels({
 }) {
   const a = toTableModel(actual);
   const e = toTableModel(expected);
+  const aligned = a && e ? alignComparedTableColumns(a, e) : null;
+  const displayedActual = aligned?.actual || a;
+  const displayedExpected = aligned?.expected || e;
   if (hideExpected) {
     return a ? <MiniDataTable columns={a.columns} rows={a.rows} large /> : (
       <div className="text-muted-foreground text-[11px]">No grid data</div>
@@ -118,13 +157,13 @@ export function GridComparePanels({
     <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 w-full min-w-0">
       <div className="min-w-0 space-y-1">
         <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{leftLabel}</div>
-        {a ? <MiniDataTable columns={a.columns} rows={a.rows} large /> : (
+        {displayedActual ? <MiniDataTable columns={displayedActual.columns} rows={displayedActual.rows} large /> : (
           <div className="text-muted-foreground text-[11px] border border-dashed border-border rounded p-2">No grid data</div>
         )}
       </div>
       <div className="min-w-0 space-y-1">
         <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{rightLabel || "Reference"}</div>
-        {e ? <MiniDataTable columns={e.columns} rows={e.rows} large /> : (
+        {displayedExpected ? <MiniDataTable columns={displayedExpected.columns} rows={displayedExpected.rows} large /> : (
           <div className="text-muted-foreground text-[11px] border border-dashed border-border rounded p-2">No grid data</div>
         )}
       </div>

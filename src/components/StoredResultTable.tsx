@@ -74,7 +74,7 @@ export function StoredResultTable({
       <div className="space-y-2">
         <div className="flex items-center gap-2 text-xs">
           <span className="text-muted-foreground">Overall Status:</span>
-          {badge((status as any) || "pending")}
+          {badge(derived.status)}
           <span className="text-muted-foreground">consecutive week / month / quarter periods</span>
         </div>
         {grains.map((g) => {
@@ -117,7 +117,7 @@ export function StoredResultTable({
       <div className="space-y-2">
         <div className="flex items-center gap-2 text-xs">
           <span className="text-muted-foreground">Overall Status:</span>
-          {badge((status as any) || "pending")}
+          {badge(derived.status)}
           <span className="text-muted-foreground">consecutive week / month / quarter periods</span>
         </div>
         <div className="text-muted-foreground">

@@ -81,10 +81,9 @@ export function RunScenarioCard({
   const resultsWithDerived = useMemo(() =>
     (results || []).map((r) => ({
       ...r,
-      // RunDetail supplies an authoritative persisted status for finalized
-      // runs. Preserve it instead of re-deriving historical failures as
-      // pending from incomplete/legacy KPI payloads.
-      derivedStatus: (r as any).derivedStatus || deriveStoredResultStatus({
+      // Recalculate with this scenario's saved assertion spec so the summary
+      // badge and expanded KPI table cannot disagree.
+      derivedStatus: deriveStoredResultStatus({
           actual: r.actual,
           expected: r.expected,
           spec,

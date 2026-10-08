@@ -68,7 +68,7 @@ function collectMaps(src: any, depth = 0, out: any[] = [], seen = new Set<any>()
   }
   for (const [k, v] of Object.entries(src)) {
     if (!v || typeof v !== "object" || Array.isArray(v)) continue;
-    if (k === "grains" || v.grains || Array.isArray(v.periods) || v.consecutive != null || /^combo[_ ]?\d+$/i.test(k)) {
+    if (k === "grains" || (v as any).grains || Array.isArray((v as any).periods) || (v as any).consecutive != null || /^combo[_ ]?\d+$/i.test(k)) {
       collectMaps(v, depth + 1, out, seen);
     }
   }

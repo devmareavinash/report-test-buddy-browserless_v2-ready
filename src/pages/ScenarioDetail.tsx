@@ -284,7 +284,7 @@ export default function ScenarioDetail() {
     setApplyCredBusy(true);
     try {
       const { field, value } = applyCredDialog;
-      const { error: reportErr } = await supabase.from("reports").update({ [field]: value }).eq("id", reportId);
+      const { error: reportErr } = await supabase.from("reports").update({ [field]: value } as any).eq("id", reportId);
       if (reportErr) throw reportErr;
       const { data: scenarios, error: scenErr } = await supabase.from("scenarios").select("id").eq("report_id", reportId);
       if (scenErr) throw scenErr;
@@ -906,7 +906,7 @@ export default function ScenarioDetail() {
   });
   const latestPerComboResults = useMemo(() => {
     const newest = new Map<string, any>();
-    for (const row of latestStateResults || []) {
+    for (const row of (latestStateResults || []) as any[]) {
       const label = String(
         row?.actual?.filter ??
         row?.expected?.filter ??
@@ -3470,7 +3470,7 @@ async function persistReferenceHeadlessRun(opts: {
   if (!expectedByLabel.size && !Object.keys(fallbackValues).length) return false;
 
   let updated = 0;
-  for (const row of runRows) {
+  for (const row of runRows as any[]) {
     const rowLabel = row.actual?.filter || row.expected?.filter || combos?.[0]?.label;
     const values = (rowLabel && expectedByLabel.get(String(rowLabel)))
       || (expectedByLabel.size === 1 ? [...expectedByLabel.values()][0] : fallbackValues);

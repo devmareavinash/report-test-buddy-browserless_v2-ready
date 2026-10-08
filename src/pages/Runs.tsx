@@ -184,8 +184,14 @@ export default function Runs() {
                   <span className="text-xs text-muted-foreground flex-1 min-w-0 truncate">
                     {labels || r.scope_type}
                   </span>
-                  <span className="text-xs whitespace-nowrap">
-                    {(r.summary as any)?.pass ?? 0}✓ / {(r.summary as any)?.fail ?? 0}✗
+                  <span className="text-xs whitespace-nowrap flex items-center gap-1">
+                    <span className="text-emerald-600 dark:text-emerald-400 font-medium">
+                      {(r.summary as any)?.pass ?? 0}✓
+                    </span>
+                    <span className="text-muted-foreground">/</span>
+                    <span className="text-destructive font-medium">
+                      {(r.summary as any)?.fail ?? 0}✗
+                    </span>
                   </span>
                   <span className="text-xs text-muted-foreground whitespace-nowrap">{r.trigger_source}</span>
                   <span className="text-xs text-muted-foreground whitespace-nowrap">

@@ -55,8 +55,11 @@ async function authHeaders(forceRefresh = false) {
       // accepts a recently expired user JWT).
     }
   }
+  // Long runs on our own server refresh the sign-in with this token (kept in memory only).
+  const refreshToken = forceRefresh && import.meta.env.VITE_RUN_SESSION_REFRESH === "true" ? (await supabase.auth.getSession()).data.session?.refresh_token : undefined;
   token = token || publishableKey || "";
   return {
+    ...(refreshToken ? { "X-Refresh-Token": refreshToken } : {}),
     "Content-Type": "application/json",
     ...(publishableKey ? { apikey: publishableKey } : {}),
     ...(token ? { Authorization: `Bearer ${token}` } : {}),

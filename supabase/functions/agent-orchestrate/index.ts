@@ -1,6 +1,7 @@
 import { corsHeaders } from "../_shared/cors.ts";
-import { getSupabaseForRequest, requireAuth } from "../_shared/auth.ts";
-import { resolveFunctionAuth, resolveFunctionUrl } from "../_shared/internal-functions.ts";
+import { getServiceClient, getSupabaseForAccessToken, getSupabaseForRequest, requireAuth } from "../_shared/auth.ts";
+import { internalAuthSource, resolveFunctionAuth, resolveFunctionUrl } from "../_shared/internal-functions.ts";
+import { RunSession, getRunSession, registerRunSession, releaseRunSession } from "../_shared/run-session.ts";
 import { extractFirstTableAlias, qualifyColumn } from "../_shared/sql-filter.ts";
 import { fetchCanonicalScript, scriptHasSavedCode, updateScriptRow } from "../_shared/canonical-script.ts";
 import { compareTables, summarizeTableCompare, toTableModel } from "../_shared/table-compare.ts";
@@ -17,9 +18,33 @@ import { compareTables, summarizeTableCompare, toTableModel } from "../_shared/t
 
 const PROJECT = Deno.env.get("SUPABASE_URL");
 const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+const ORCHESTRATION_LOG_PATH = Deno.env.get("ORCHESTRATION_LOG_PATH") || "./logs/agent-orchestrate.jsonl";
+let logWrite = Promise.resolve();
 
-function makeCallFn(callerAuthorization: string) {
+function jsonLog(event: string, details: Record<string, unknown> = {}) {
+  const line = JSON.stringify({
+    component: "agent-orchestrate",
+    event,
+    timestamp: new Date().toISOString(),
+    ...details,
+  });
+  console.log(line);
+  logWrite = logWrite.then(async () => {
+    const split = Math.max(ORCHESTRATION_LOG_PATH.lastIndexOf("/"), ORCHESTRATION_LOG_PATH.lastIndexOf("\\"));
+    if (split > 0) await Deno.mkdir(ORCHESTRATION_LOG_PATH.slice(0, split), { recursive: true });
+    await Deno.writeTextFile(ORCHESTRATION_LOG_PATH, `${line}\n`, { append: true, create: true });
+  }).catch((error) => console.error(JSON.stringify({
+    component: "agent-orchestrate",
+    event: "log_write_failed",
+    timestamp: new Date().toISOString(),
+    error: String(error),
+  })));
+}
+
+function makeCallFn(getCallerAuthorization: () => Promise<string>) {
   return async (name: string, body: any) => {
+    const callerAuthorization = await getCallerAuthorization();
+    const startedAt = Date.now();
     const r = await fetch(resolveFunctionUrl(name), {
       method: "POST",
       headers: {
@@ -31,6 +56,15 @@ function makeCallFn(callerAuthorization: string) {
     const text = await r.text();
     let payload: any;
     try { payload = JSON.parse(text); } catch { payload = { raw: text, status: r.status }; }
+    jsonLog(r.ok ? "internal_call_completed" : "internal_call_failed", {
+      function_name: name,
+      run_id: body?.existing_run_id || payload?.run_id || null,
+      report_id: body?.single_report_id || null,
+      auth_source: internalAuthSource(),
+      http_status: r.status,
+      duration_ms: Date.now() - startedAt,
+      error: r.ok ? null : String(payload?.error || payload?.message || payload?.raw || `HTTP ${r.status}`).slice(0, 500),
+    });
     if (!r.ok) {
       const detail = payload?.error || payload?.message || payload?.raw || `HTTP ${r.status}`;
       return {
@@ -47,33 +81,42 @@ function makeCallFn(callerAuthorization: string) {
 // The database function locks the parent row before incrementing `done`. Doing
 // this as a client-side read/modify/write loses increments when hosted child
 // invocations finish concurrently, leaving the parent permanently "running".
-async function finalizeChild(sb: any, runId: string, addPass: number, addFail: number, hadError: boolean, errMsg?: string) {
-  const { error } = await sb.rpc("finalize_workstream_child", {
+async function finalizeChild(sb: any, runId: string, reportId: string, addPass: number, addFail: number, hadError: boolean, errMsg?: string) {
+  jsonLog("child_finalization_started", {
+    run_id: runId, report_id: reportId, add_pass: addPass, add_fail: addFail,
+    had_error: hadError, error: errMsg?.slice(0, 500) || null,
+  });
+  const { error } = await sb.rpc("finalize_workstream_report", {
     p_run_id: runId,
+    p_report_id: reportId,
     p_add_pass: addPass,
     p_add_fail: addFail,
     p_had_error: hadError,
     p_error_message: errMsg || null,
   });
-  if (!error) return;
+  if (!error) {
+    jsonLog("child_finalization_completed", { run_id: runId, report_id: reportId, method: "rpc" });
+    return;
+  }
+  jsonLog("child_finalization_rpc_failed", { run_id: runId, report_id: reportId, error: error.message });
 
-  // Local/portable fallback for databases where the migration has not been
-  // deployed yet. Compare the JSONB value we read in the UPDATE predicate so
-  // concurrent children cannot overwrite each other's increments.
+  // Portable fallback (same rules as the SQL function): one entry per report,
+  // compare-and-swap on summary so concurrent children don't clobber each other.
   for (let attempt = 0; attempt < 12; attempt++) {
     const { data: current, error: readError } = await sb
-      .from("runs")
-      .select("summary, status")
-      .eq("id", runId)
-      .maybeSingle();
+      .from("runs").select("summary, status").eq("id", runId).maybeSingle();
     if (readError) throw new Error(`Failed to read workstream run: ${readError.message}`);
     if (!current || current.status !== "running") return;
-
     const summary: any = current.summary || {};
+    const reports: Record<string, any> = { ...(summary.reports || {}) };
+    if (reports[reportId]) return; // already recorded
+    reports[reportId] = { status: hadError ? "error" : "done", pass: addPass, fail: addFail, error: errMsg || null };
+    const entries = Object.values(reports);
+    const done = entries.length;
+    const failedReports = entries.filter((r: any) => r.status === "error").length;
     const childCount = Number(summary.child_count || 0);
-    const done = Number(summary.done || 0) + 1;
     const errors = hadError
-      ? [...(Array.isArray(summary.errors) ? summary.errors : []), errMsg || "child error"]
+      ? [...(Array.isArray(summary.errors) ? summary.errors : []), errMsg || "report error"]
       : summary.errors;
     const nextSummary: any = {
       ...summary,
@@ -81,29 +124,28 @@ async function finalizeChild(sb: any, runId: string, addPass: number, addFail: n
       fail: Number(summary.fail || 0) + addFail,
       total: Number(summary.total || 0) + addPass + addFail,
       done,
-      child_count: childCount,
+      failed_reports: failedReports,
+      reports,
     };
     if (errors?.length) nextSummary.errors = errors;
-    const isLast = childCount > 0 && done >= childCount;
     const patch: any = { summary: nextSummary };
-    if (isLast) {
-      patch.status = "completed";
+    if (childCount > 0 && done >= childCount) {
+      patch.status = failedReports > 0 ? "failed" : "completed";
       patch.finished_at = new Date().toISOString();
     }
-
     const { data: updated, error: updateError } = await sb
-      .from("runs")
-      .update(patch)
-      .eq("id", runId)
-      .eq("status", "running")
-      .filter("summary", "eq", JSON.stringify(summary))
-      .select("id")
-      .maybeSingle();
-    if (updateError) throw new Error(`Failed to finalize workstream child: ${updateError.message}`);
-    if (updated) return;
+      .from("runs").update(patch).eq("id", runId).eq("status", "running")
+      .filter("summary", "eq", JSON.stringify(summary)).select("id").maybeSingle();
+    if (updateError) throw new Error(`Failed to finalize workstream report: ${updateError.message}`);
+    if (updated) {
+      jsonLog("child_finalization_completed", {
+        run_id: runId, report_id: reportId, method: "compare_and_swap", attempt: attempt + 1,
+      });
+      return;
+    }
     await new Promise((resolve) => setTimeout(resolve, 25 + attempt * 25));
   }
-  throw new Error(`Failed to finalize workstream child after concurrent update retries: ${error.message}`);
+  throw new Error(`Failed to finalize workstream report after retries: ${error.message}`);
 }
 
 function orchestrateConcurrency(override?: unknown): number {
@@ -234,6 +276,22 @@ function toNum(v: any): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+function isNumericScalar(v: any): boolean {
+  if (typeof v === "number") return Number.isFinite(v);
+  if (typeof v !== "string") return false;
+  return /^\s*[-+]?[$€£]?\s*\d[\d,\s]*(?:\.\d+)?\s*%?\s*$/.test(v);
+}
+
+function preserveScalar(v: any): any {
+  if (v == null || typeof v === "object") return v;
+  if (typeof v === "string" && !isNumericScalar(v)) return v.trim();
+  return toNum(v);
+}
+
+function normalizeTextScalar(v: any): string {
+  return String(v ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
 function normKpiKey(k: string): string {
   return String(k || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
@@ -259,6 +317,19 @@ function lookupKpiValue(map: Record<string, any> | null | undefined, name: strin
     if (rowCounts.length === 1) return (map as any)[rowCounts[0]];
   }
   return undefined;
+}
+
+function lookupConfiguredKpiValue(
+  map: Record<string, any> | null | undefined,
+  name: string,
+  aliases: Record<string, string> | null | undefined,
+): any {
+  const rawName = aliases && typeof aliases === "object" ? aliases[name] : null;
+  if (rawName) {
+    const aliased = lookupKpiValue(map, rawName);
+    if (aliased !== undefined) return aliased;
+  }
+  return lookupKpiValue(map, name);
 }
 
 function lookupKpiTol(tols: Record<string, any> | null | undefined, name: string): any {
@@ -474,7 +545,7 @@ function pickComboFiltersApplied(payload: any, comboLabel: string | null): Recor
   for (const root of candidates) {
     if (!root || typeof root !== "object") continue;
     if (comboLabel) {
-      const node = (root as any)[comboLabel];
+      const node = (root as any)[comboLabel] || (root as any).results?.[comboLabel];
       if (node && typeof node === "object" && node.filters_applied && typeof node.filters_applied === "object") {
         return node.filters_applied;
       }
@@ -483,6 +554,21 @@ function pickComboFiltersApplied(payload: any, comboLabel: string | null): Recor
     }
   }
   return null;
+}
+
+function comboExtractionNeedsRetry(payload: any, comboLabel: string | null): boolean {
+  const exec = payload?.extracted;
+  if (payload?.error || payload?.ok === false || exec?.ok === false || exec?.error) return true;
+  const values = pickComboKpis(payload, comboLabel);
+  if (!values || !Object.keys(values).length) return true;
+  const useful = Object.entries(values).filter(([key]) => !isExtractionNoiseKey(key));
+  if (!useful.length || useful.every(([, value]) => value == null)) return true;
+  const grains = values.grains && typeof values.grains === "object"
+    ? Object.values(values.grains)
+    : [];
+  return grains.some((grain: any) =>
+    /still looks weekly|no time periods extracted|could not parse/i.test(String(grain?.trend_error || ""))
+  );
 }
 
 function swapGotoUrl(src: string, newUrl: string, oldUrl?: string): string {
@@ -528,11 +614,29 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
   const unauthorized = await requireAuth(req);
   if (unauthorized) return unauthorized;
-  const callerAuthorization = req.headers.get("Authorization") || (SERVICE_KEY ? `Bearer ${SERVICE_KEY}` : "");
-  const callFn = makeCallFn(callerAuthorization);
-  const sb = getSupabaseForRequest(req);
+  const rawCaller = (req.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "").trim();
+  const body = await req.json().catch(() => ({}));
+  // Without a service key (self-hosted), keep the run signed in by refreshing
+  // the caller's session. Children reuse the parent's session (same process).
+  let session: RunSession | undefined = getRunSession(body?.existing_run_id);
+  let ownsSession = false;
+  const serviceClient = getServiceClient();
+  if (!serviceClient && !session) {
+    const refreshToken = (req.headers.get("X-Refresh-Token") || "").trim() || null;
+    session = new RunSession(rawCaller, refreshToken);
+    ownsSession = true;
+  }
+  const getCallerAuth = async () =>
+    session ? `Bearer ${await session.token()}` : (rawCaller ? `Bearer ${rawCaller}` : (SERVICE_KEY ? `Bearer ${SERVICE_KEY}` : ""));
+  const callFn = makeCallFn(getCallerAuth);
+  const sb = serviceClient ?? (session
+    ? getSupabaseForAccessToken(() => session!.token())
+    : getSupabaseForRequest(req));
+  jsonLog("orchestrate_auth", {
+    auth_source: serviceClient ? "service" : session?.canRefresh ? "caller_refreshing" : "caller",
+    run_id: body?.existing_run_id || null,
+  });
   try {
-    const body = await req.json();
     const {
       scope_type,
       scope_id,
@@ -602,6 +706,10 @@ Deno.serve(async (req) => {
       }).select().single();
       run = data;
       if (!run) throw new Error("run creation failed");
+      jsonLog("run_created", {
+        run_id: run.id, scope_type, scope_id, report_count: reportIds.length, concurrency,
+        auth_source: serviceClient ? "service" : session?.canRefresh ? "caller_refreshing" : "caller",
+      });
 
       // Best-effort race arbitration without requiring a database migration.
       // Both concurrent callers pause before work; the later run cancels itself
@@ -637,6 +745,9 @@ Deno.serve(async (req) => {
 
     // Workstream coordinator: dispatch one child invocation per report (background),
     // each child processes its report and atomically finalises the parent run when last.
+    if (ownsSession && session) registerRunSession(run.id, session);
+    const releaseSession = () => { if (ownsSession) releaseRunSession(run.id); };
+
     if (!existing_run_id && scope_type === "workstream") {
       const dispatch = async () => {
         // Spread the configured browser budget across reports. Serial report
@@ -648,6 +759,7 @@ Deno.serve(async (req) => {
         const childConcurrency = Math.max(1, Math.floor(concurrency / reportConcurrency));
         await mapPool(reportIds, reportConcurrency, async (rid) => {
           try {
+            jsonLog("child_dispatch_started", { run_id: run.id, report_id: rid });
             const child = await callFn("agent-orchestrate", {
               scope_type: "report",
               scope_id: rid,
@@ -660,11 +772,15 @@ Deno.serve(async (req) => {
             if (child?.error || child?.ok === false) {
               throw new Error(child?.error || child?.message || "child orchestration failed");
             }
+            jsonLog("child_dispatch_completed", { run_id: run.id, report_id: rid });
           } catch (e) {
-            console.error("child dispatch failed", rid, e);
-            await finalizeChild(sb, run.id, 0, 1, true, String(e));
+            jsonLog("child_dispatch_failed", {
+              run_id: run.id, report_id: rid, error: String((e as any)?.message || e).slice(0, 500),
+            });
+            await finalizeChild(sb, run.id, rid, 0, 0, true, String((e as any)?.message || e));
           }
         });
+        releaseSession();
       };
       // @ts-ignore
       if (typeof EdgeRuntime !== "undefined" && EdgeRuntime?.waitUntil) {
@@ -686,7 +802,8 @@ Deno.serve(async (req) => {
 
     // Heavy work runs in the background so we don't hit the 150s edge timeout.
     // Client polls runs/test_results to observe progress.
-    const work = async () => {
+    const work = async () => { try { await workInner(); } finally { releaseSession(); } };
+    const workInner = async () => {
       let pass = 0, fail = 0;
       try {
         for (const reportId of reportIds) {
@@ -744,6 +861,7 @@ Deno.serve(async (req) => {
             // Case-level KPI configuration is the source of truth. Report KPI
             // config is only a default for legacy cases that have no saved KPI
             // list or tolerances in their assertion spec.
+            const executableCode = String((script as any)?.playwright_code || "");
             const assertionSpec: any = (script as any)?.assertion_spec || {};
             const configuredKpis: string[] = Array.isArray(assertionSpec.kpis)
               ? assertionSpec.kpis
@@ -767,6 +885,10 @@ Deno.serve(async (req) => {
                 .map((label: any) => String(label || "").trim())
                 .filter((label: string) => label && !label.startsWith("__")),
             ));
+            const kpiAliases: Record<string, string> =
+              assertionSpec.kpi_aliases && typeof assertionSpec.kpi_aliases === "object"
+                ? assertionSpec.kpi_aliases
+                : {};
 
             let matrixQuery = sb.from("scenario_filter_matrix")
               .select("id, label, filters").eq("scenario_id", s.id)
@@ -796,7 +918,7 @@ Deno.serve(async (req) => {
               if (!refCode || !refCode.trim()) {
                 const isEnvSwap = !!refUrl && !!primaryUrl && refUrl !== primaryUrl;
                 if (isEnvSwap) {
-                  refCode = swapGotoUrl(script.playwright_code || "", refUrl, primaryUrl);
+                  refCode = swapGotoUrl(executableCode, refUrl, primaryUrl);
                   if (refCode && (script as any)?.id) {
                     await updateScriptRow(sb, (script as any).id, {
                       assertion_spec: { ...aspec, __reference_playwright_code: refCode, __reference_generated_by: "url_swap" },
@@ -813,16 +935,74 @@ Deno.serve(async (req) => {
               }
             }
 
-            const [runResp, refRespRaw] = await Promise.all([
-              callFn("playwright-runtime", {
-                mode: "headless", scenario_id: s.id, code: script.playwright_code,
-              }),
-              (isRef && !refError && refCode)
-                ? callFn("playwright-runtime", {
-                    mode: "headless", scenario_id: s.id, code: refCode, target: "reference",
-                  })
-                : Promise.resolve(null),
-            ]);
+            // A long matrix script can carry stale filters, tabs, popups, grids,
+            // or chart grain state into the next combination. Give every combo
+            // its own Browserless function call/page and retry once in another
+            // fresh page when extraction is empty or explicitly failed.
+            // playwright-runtime remains unchanged; its existing override narrows
+            // the injected matrix to exactly one combination.
+            const isolatedRunResponses = new Map<string, any>();
+            const isolatedRefResponses = new Map<string, any>();
+            let runResp: any;
+            let refRespRaw: any;
+            if (hasCombos) {
+              const isolated = await mapPool(combos, 1, async (combo) => {
+                const mainBody = {
+                  mode: "headless",
+                  scenario_id: s.id,
+                  code: executableCode,
+                  filter_combinations: [{ label: combo.label, filters: combo.filters || {} }],
+                };
+                let mainResponse = await callFn("playwright-runtime", mainBody);
+                if (comboExtractionNeedsRetry(mainResponse, combo.label)) {
+                  jsonLog("combo_extraction_retry", {
+                    run_id: run.id,
+                    scenario_id: s.id,
+                    combo: combo.label,
+                    target: "main",
+                  });
+                  mainResponse = await callFn("playwright-runtime", mainBody);
+                }
+                let referenceResponse: any = null;
+                if (isRef && !refError && refCode) {
+                  const referenceBody = {
+                    mode: "headless",
+                    scenario_id: s.id,
+                    code: refCode,
+                    target: "reference",
+                    filter_combinations: [{ label: combo.label, filters: combo.filters || {} }],
+                  };
+                  referenceResponse = await callFn("playwright-runtime", referenceBody);
+                  if (comboExtractionNeedsRetry(referenceResponse, combo.label)) {
+                    jsonLog("combo_extraction_retry", {
+                      run_id: run.id,
+                      scenario_id: s.id,
+                      combo: combo.label,
+                      target: "reference",
+                    });
+                    referenceResponse = await callFn("playwright-runtime", referenceBody);
+                  }
+                }
+                return { label: String(combo.label || ""), mainResponse, referenceResponse };
+              });
+              for (const item of isolated) {
+                isolatedRunResponses.set(item.label, item.mainResponse);
+                if (item.referenceResponse) isolatedRefResponses.set(item.label, item.referenceResponse);
+              }
+              runResp = { ok: true, extracted: { result: { results: {} } } };
+              refRespRaw = null;
+            } else {
+              [runResp, refRespRaw] = await Promise.all([
+                callFn("playwright-runtime", {
+                  mode: "headless", scenario_id: s.id, code: executableCode,
+                }),
+                (isRef && !refError && refCode)
+                  ? callFn("playwright-runtime", {
+                      mode: "headless", scenario_id: s.id, code: refCode, target: "reference",
+                    })
+                  : Promise.resolve(null),
+              ]);
+            }
             const runExec = runResp?.extracted;
             if (
               runResp?.error ||
@@ -869,27 +1049,64 @@ Deno.serve(async (req) => {
             }
 
             const comboOutcomes = await mapPool(combos, Math.min(concurrency, 8), async (combo) => {
-              const scraped = pickComboKpis(runResp, combo.label) || {};
+              const comboRunResp = isolatedRunResponses.get(String(combo.label || "")) || runResp;
+              const comboExec = comboRunResp?.extracted;
+              if (
+                comboRunResp?.error ||
+                comboRunResp?.ok === false ||
+                comboExec?.ok === false ||
+                comboExec?.error
+              ) {
+                const comboError =
+                  comboRunResp?.error ||
+                  comboRunResp?.message ||
+                  comboExec?.error ||
+                  comboExec?.message ||
+                  "scrape failed";
+                const { error: insertError } = await sb.from("test_results").insert({
+                  run_id: run.id,
+                  scenario_id: s.id,
+                  status: "fail",
+                  expected: { source: "scrape", filter: combo.label },
+                  actual: { filter: combo.label, error: comboError, filters_applied: combo.filters || null },
+                  diff: null,
+                  criticality: s.criticality || "medium",
+                  severity: s.criticality || "medium",
+                  screenshot_url: comboRunResp?.screenshot_url || null,
+                });
+                if (insertError) throw new Error(`Failed to persist scrape failure: ${insertError.message}`);
+                return { pass: 0, fail: 1 };
+              }
+              const scraped = pickComboKpis(comboRunResp, combo.label) || {};
 
               let expectedMap: Record<string, any> = {};
               let sqlMeta: any = { source: isRef ? "reference_script" : (sqlTplId ? "warehouse" : "none") };
               let sqlRow: Record<string, any> | null = null;
 
               if (isRef) {
-                const refScraped = refError ? {} : (pickComboKpis(refResp, combo.label) || {});
+                const comboRefResp = isolatedRefResponses.get(String(combo.label || "")) || refResp;
+                const comboRefExec = comboRefResp?.extracted;
+                const comboRefError =
+                  refError ||
+                  comboRefResp?.error ||
+                  (comboRefResp?.ok === false ? comboRefResp?.message || "reference scrape failed" : null) ||
+                  (comboRefExec?.ok === false || comboRefExec?.error
+                    ? comboRefExec?.error || comboRefExec?.message || "reference scrape failed"
+                    : null);
+                const refScraped = comboRefError ? {} : (pickComboKpis(comboRefResp, combo.label) || {});
                 sqlMeta = {
                   source: "reference_script",
                   reference_url: (report as any)?.reference_url || null,
-                  ok: !refError,
-                  error: refError,
+                  ok: !comboRefError,
+                  error: comboRefError,
                   ran_without_filters: !hasCombos,
                 };
-                sqlRow = refError ? null : refScraped;
+                sqlRow = comboRefError ? null : refScraped;
                 for (const lbl of kpiLabels.length ? kpiLabels : Object.keys(scraped)) {
-                  const raw = lookupKpiValue(refScraped, lbl);
+                  const raw = lookupConfiguredKpiValue(refScraped, lbl, kpiAliases);
                   expectedMap[lbl] = (raw != null && typeof raw === "object")
                     ? raw
-                    : (looksLikeDateValue(raw) ? String(raw).trim() : toNum(raw));
+                    : (looksLikeDateValue(raw) ? String(raw).trim() : preserveScalar(raw));
                 }
                 const refGrid = pickStructured(refScraped);
                 if (refGrid && expectedMap[refGrid.k] == null) expectedMap[refGrid.k] = refGrid.v;
@@ -913,7 +1130,7 @@ Deno.serve(async (req) => {
                       filter: combo.label,
                       error: message,
                       filters_applied:
-                        pickComboFiltersApplied(runResp, combo.label) ||
+                        pickComboFiltersApplied(comboRunResp, combo.label) ||
                         combo.filters ||
                         null,
                     },
@@ -962,11 +1179,11 @@ Deno.serve(async (req) => {
                     const raw = rows[0][col];
                     expectedMap[lbl] = looksLikeDateValue(raw)
                       ? String(raw).trim()
-                      : toNum(raw);
+                      : preserveScalar(raw);
                   } else if (sqlResp?.scalar != null) {
                     expectedMap[lbl] = looksLikeDateValue(sqlResp.scalar)
                       ? String(sqlResp.scalar).trim()
-                      : toNum(sqlResp.scalar);
+                      : preserveScalar(sqlResp.scalar);
                   }
                   else expectedMap[lbl] = null;
                 }
@@ -977,6 +1194,10 @@ Deno.serve(async (req) => {
               let comboPass = true;
               const labels = (kpiLabels.length ? kpiLabels : Object.keys(scraped));
               const kpiTol: Record<string, any> = ((script as any)?.assertion_spec || {}).kpi_tolerances || {};
+              const structuredLabels = labels.filter((label) =>
+                isStructuredVal(lookupConfiguredKpiValue(scraped, label, kpiAliases))
+              );
+              const hasMultipleStructuredKpis = structuredLabels.length > 1;
               const mainGrid = pickStructured(scraped);
               const expGrid = pickStructured(expectedMap);
               const structuredLabel = mainGrid
@@ -1013,7 +1234,7 @@ Deno.serve(async (req) => {
                   error: comboPass ? null : (scraped.trend_error || "gap_in_periods"),
                 };
               } else {
-              if (mainGrid && structuredLabel) {
+              if (!hasMultipleStructuredKpis && mainGrid && structuredLabel) {
                 actualMap[structuredLabel] = mainGrid.v;
                 structuredSourceKeys[structuredLabel] = mainGrid.k;
                 if (expGrid) {
@@ -1021,7 +1242,7 @@ Deno.serve(async (req) => {
                   if (expGrid.k !== structuredLabel) delete expectedMap[expGrid.k];
                 }
               }
-              if (mainGrid && expGrid) {
+              if (!hasMultipleStructuredKpis && mainGrid && expGrid) {
                 // Grid / graph Show Data: compare cell by cell so the configured
                 // comparator + tolerance apply. JSON.stringify equality ignored both
                 // and failed the whole visual on any single differing cell.
@@ -1061,15 +1282,75 @@ Deno.serve(async (req) => {
                   diffMap[structuredLabel || mainGrid.k] = { structured: true, pass: gridPass, cellwise: false };
                 }
                 if (!gridPass) comboPass = false;
-              } else if (mainGrid && (isRef || sqlTplId) && !expGrid) {
+              } else if (!hasMultipleStructuredKpis && mainGrid && (isRef || sqlTplId) && !expGrid) {
                 comboPass = false;
                 diffMap[structuredLabel || mainGrid.k] = { structured: true, error: "no_expected_grid" };
               }
 
               for (const lbl of labels) {
-                const rawA = lookupKpiValue(scraped, lbl);
+                const rawA = lookupConfiguredKpiValue(scraped, lbl, kpiAliases);
                 if (isStructuredVal(rawA) || STRUCTURED_KPI_KEYS.has(String(lbl).toLowerCase().replace(/[^a-z0-9]/g, ""))) {
                   if (actualMap[lbl] === undefined) actualMap[lbl] = rawA;
+                  if (isStructuredVal(rawA)) structuredSourceKeys[lbl] = lbl;
+                  if (hasMultipleStructuredKpis && (isRef || sqlTplId)) {
+                    const rawE = lookupKpiValue(expectedMap, lbl);
+                    if (!isStructuredVal(rawE)) {
+                      comboPass = false;
+                      diffMap[lbl] = { structured: true, error: "no_expected_grid" };
+                      continue;
+                    }
+
+                    const tolEntry: any = lookupKpiTol(kpiTol, lbl);
+                    const tolValue = tolEntry && typeof tolEntry === "object"
+                      ? Number(tolEntry.value)
+                      : Number(tolEntry);
+                    const tolUnit = (tolEntry && typeof tolEntry === "object" && tolEntry.unit) === "abs"
+                      ? "abs"
+                      : "pct";
+                    let tolOp = (tolEntry && typeof tolEntry === "object" && tolEntry.op) || "eq";
+                    if (isRef && comparator_override) tolOp = comparator_override;
+                    const actualTable = toTableModel(rawA);
+                    const expectedTable = toTableModel(rawE);
+                    let structuredPass: boolean;
+
+                    if (actualTable && expectedTable) {
+                      const cmp = compareTables(
+                        actualTable,
+                        expectedTable,
+                        {
+                          value: Number.isFinite(tolValue) ? tolValue : 0,
+                          unit: tolUnit as any,
+                          op: tolOp as any,
+                        },
+                        { skipChangeRows: true },
+                      );
+                      structuredPass = cmp.pass;
+                      diffMap[lbl] = {
+                        structured: true,
+                        pass: structuredPass,
+                        cellwise: true,
+                        compared_cells: cmp.comparedCells,
+                        skipped_change_rows: cmp.skippedRows,
+                        failed_cells: cmp.failedCells.slice(0, 50),
+                        rows_only_in_actual: cmp.rowsOnlyInActual,
+                        rows_only_in_reference: cmp.rowsOnlyInExpected,
+                        tolerance: {
+                          value: Number.isFinite(tolValue) ? tolValue : 0,
+                          unit: tolUnit,
+                          op: tolOp,
+                        },
+                        summary: summarizeTableCompare(cmp),
+                      };
+                    } else {
+                      structuredPass = structuredEqual(rawA, rawE);
+                      diffMap[lbl] = {
+                        structured: true,
+                        pass: structuredPass,
+                        cellwise: false,
+                      };
+                    }
+                    if (!structuredPass) comboPass = false;
+                  }
                   continue;
                 }
                 // Refresh dates stay as text for display, but compare them with
@@ -1098,6 +1379,27 @@ Deno.serve(async (req) => {
                       tolerance: Number.isFinite(tVal) ? { value: tVal, unit: tUnit, op: tOp } : { value: 0, unit: "pct", op: tOp },
                     };
                     if (!datePass) comboPass = false;
+                  }
+                  continue;
+                }
+                if (typeof rawA === "string" && !isNumericScalar(rawA)) {
+                  const aText = rawA.trim();
+                  const eRaw = expectedMap[lbl] ?? null;
+                  const eText = eRaw == null ? null : String(eRaw).trim();
+                  actualMap[lbl] = aText;
+                  if (!sqlTplId && !isRef) {
+                    diffMap[lbl] = { value: aText, kind: "text" };
+                  } else {
+                    const textPass =
+                      eText != null &&
+                      normalizeTextScalar(aText) === normalizeTextScalar(eText);
+                    diffMap[lbl] = {
+                      kind: "text",
+                      actual: aText,
+                      expected: eText,
+                      pass: textPass,
+                    };
+                    if (!textPass) comboPass = false;
                   }
                   continue;
                 }
@@ -1202,7 +1504,7 @@ Deno.serve(async (req) => {
                 actual: {
                   filter: combo.label,
                   values: actualMap,
-                  filters_applied: pickComboFiltersApplied(runResp, combo.label) || combo.filters || null,
+                  filters_applied: pickComboFiltersApplied(comboRunResp, combo.label) || combo.filters || null,
                   tolerances_snapshot: tolerancesSnapshot,
                   structured_source_keys: Object.keys(structuredSourceKeys).length
                     ? structuredSourceKeys
@@ -1212,7 +1514,7 @@ Deno.serve(async (req) => {
                 criticality: crit,
                 severity: crit,
                 rank_score: comboPass ? 0 : (["low", "medium", "high", "critical"].indexOf(crit || "medium") + 1),
-                screenshot_url: runResp?.screenshot_url || null,
+                screenshot_url: comboRunResp?.screenshot_url || null,
               }).select().single();
               if (trError || !tr) {
                 throw new Error(`Failed to persist test result: ${trError?.message || "unknown error"}`);
@@ -1237,7 +1539,7 @@ Deno.serve(async (req) => {
         }
 
         if (existing_run_id) {
-          await finalizeChild(sb, run.id, pass, fail, false);
+          await finalizeChild(sb, run.id, single_report_id || reportIds[0], pass, fail, false);
         } else {
           await sb.from("runs").update({
             status: "completed", finished_at: new Date().toISOString(),
@@ -1246,7 +1548,7 @@ Deno.serve(async (req) => {
         }
       } catch (e) {
         if (existing_run_id) {
-          await finalizeChild(sb, run.id, pass, fail, true, String(e));
+          await finalizeChild(sb, run.id, single_report_id || reportIds[0], pass, fail, true, String((e as any)?.message || e));
         } else {
           await sb.from("runs").update({
             status: "failed", finished_at: new Date().toISOString(),

@@ -124,21 +124,19 @@ export default function RunDetail() {
 
   const withDerivedStatus = useMemo(() => {
     return (merged || []).map((r: any) => {
-      const storedStatus = r.status === "pass" || r.status === "fail" || r.status === "pending"
-        ? r.status
-        : null;
-      const derivedStatus = !isRunning && storedStatus
-        ? storedStatus
-        : deriveStoredResultStatus({
-            actual: r.actual,
-            expected: r.expected,
-            scenarioType: r.scenarios?.type,
-            diff: r.diff,
-            fallbackStatus: r.status,
-          });
+      // Use the same KPI-level comparison shown inside the expanded card.
+      // The persisted status is only a fallback when stored values cannot be
+      // evaluated, preventing a stale "fail" from contradicting passing KPIs.
+      const derivedStatus = deriveStoredResultStatus({
+        actual: r.actual,
+        expected: r.expected,
+        scenarioType: r.scenarios?.type,
+        diff: r.diff,
+        fallbackStatus: r.status,
+      });
       return { ...r, derivedStatus };
     });
-  }, [merged, isRunning]);
+  }, [merged]);
 
   const filtered = useMemo(() => {
     const q = search.toLowerCase().trim();
@@ -193,6 +191,16 @@ export default function RunDetail() {
       }
     : counts;
   const displayedRunStatus = run?.status;
+  const reportOutcomes: Record<string, any> = storedSummary.reports || {};
+  const failedReportIds = Object.keys(reportOutcomes).filter((rid) => reportOutcomes[rid]?.status === "error");
+  const { data: failedReportNames } = useQuery({
+    queryKey: ["run-failed-report-names", id, failedReportIds.join(",")],
+    enabled: failedReportIds.length > 0,
+    queryFn: async () => {
+      const { data } = await supabase.from("reports").select("id, name").in("id", failedReportIds);
+      return Object.fromEntries((data || []).map((r: any) => [r.id, r.name]));
+    },
+  });
 
   return (
     <AppLayout>
@@ -203,8 +211,15 @@ export default function RunDetail() {
               Run <span className="mono text-base text-muted-foreground">{id?.slice(0, 8)}</span>
               {displayedRunStatus && <StatusChip status={displayedRunStatus} />}
             </h1>
-            <div className="text-sm text-muted-foreground mt-1">
-              {displayedCounts.pass} passed · {displayedCounts.fail} failed · {displayedCounts.pending} pending · trigger {run?.trigger_source}
+            <div className="text-sm mt-1 flex flex-wrap items-center gap-1">
+              <span className="text-emerald-600 dark:text-emerald-400 font-medium">
+                {displayedCounts.pass} passed
+              </span>
+              <span className="text-muted-foreground">·</span>
+              <span className="text-destructive font-medium">{displayedCounts.fail} failed</span>
+              <span className="text-muted-foreground">
+                · {displayedCounts.pending} pending · trigger {run?.trigger_source}
+              </span>
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -257,6 +272,32 @@ export default function RunDetail() {
             )}
           </div>
         </div>
+
+        {failedReportIds.length > 0 && (
+          <Card className="border-destructive/40 bg-destructive/5">
+            <CardContent className="p-3 space-y-2 text-sm">
+              <div className="font-medium text-destructive">
+                {failedReportIds.length} of {Number(storedSummary.child_count) || Object.keys(reportOutcomes).length} reports failed to finish
+              </div>
+              <ul className="space-y-1">
+                {failedReportIds.map((rid) => (
+                  <li key={rid} className="flex flex-col">
+                    <button
+                      type="button"
+                      className="text-left font-medium text-foreground hover:underline"
+                      onClick={() => navigate(`/reports/${rid}`)}
+                    >
+                      {failedReportNames?.[rid] || rid.slice(0, 8)}
+                    </button>
+                    {reportOutcomes[rid]?.error && (
+                      <span className="text-xs text-muted-foreground break-words">{String(reportOutcomes[rid].error)}</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </CardContent>
+          </Card>
+        )}
 
         {(run as any)?.summary?.error && !(results || []).length && (
           <Card className="border-destructive/40 bg-destructive/5">

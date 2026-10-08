@@ -269,4 +269,40 @@ describe("deriveStoredResultStatus", () => {
       fallbackStatus: "pass",
     })).toBe("fail");
   });
+
+  it("derives a passing trend status when every stored grain is consecutive", () => {
+    expect(deriveStoredResultStatus({
+      actual: {
+        values: {
+          grains: {
+            Weekly: { periods: ["06-26", "07-03"], missing: [], consecutive: true },
+            Monthly: { periods: ["Aug-26", "Sep-26"], missing: [], consecutive: true },
+            Quarterly: { periods: ["Q1-26", "Q2-26"], missing: [], consecutive: true },
+          },
+        },
+      },
+      scenarioType: "trend",
+      fallbackStatus: "pending",
+    })).toBe("pass");
+  });
+
+  it("explains a persisted failure when one reference KPI was not extracted", () => {
+    const result = deriveStoredResultRows({
+      actual: { values: { BHID: "BH12603848", "Last Call Date": "Jul 08 - 2026" } },
+      expected: { values: { BHID: "BH12603848", "Last Call Date": null } },
+      spec: {
+        kpi_tolerances: {
+          BHID: { value: 0, unit: "pct", op: "eq" },
+          "Last Call Date": { value: 0, unit: "pct", op: "eq" },
+        },
+      },
+      fallbackStatus: "fail",
+    });
+
+    expect(result.status).toBe("fail");
+    expect(result.rows.find((row) => row.k === "Last Call Date")).toMatchObject({
+      pass: false,
+      error: "no_expected_value",
+    });
+  });
 });

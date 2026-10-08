@@ -59,7 +59,7 @@ export function getSupabaseForRequest(req: Request): SupabaseClient {
   const expiredUser = looksLikeUserJwt(claims, { allowExpiredMs: 24 * 60 * 60 * 1000 })
     && expMs != null
     && expMs < Date.now();
-  if (expiredUser && serviceRole && Deno.env.get("AUTH_STRICT") !== "true") {
+  if (expiredUser && serviceRole && devGraceEnabled()) {
     return createClient(Deno.env.get("SUPABASE_URL")!, serviceRole);
   }
   return createClient(
@@ -78,9 +78,8 @@ export async function requireAuth(req: Request): Promise<Response | null> {
   if (token === Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")) return null;
 
   const claims = decodeJwtPayload(token);
-  const strict = Deno.env.get("AUTH_STRICT") === "true";
-  // VDI / Skyhigh often blocks token refresh. Accept a signed-in user JWT
-  // for 24h past exp unless AUTH_STRICT=true.
+  // Expired-token grace is opt-in only (AUTH_DEV_GRACE=true, for VDI testing).
+  const strict = !devGraceEnabled();
   const expiredGraceMs = strict ? 0 : 24 * 60 * 60 * 1000;
   if (looksLikeUserJwt(claims, { allowExpiredMs: expiredGraceMs })) {
     try {
@@ -91,8 +90,9 @@ export async function requireAuth(req: Request): Promise<Response | null> {
       );
       const { data, error } = await sb.auth.getUser();
       if (!error && data?.user) return null;
+      if (strict) return unauthorized();
     } catch {
-      // Proxy / TLS — fall through to claims accept.
+      if (strict) return unauthorized();
     }
     return null;
   }
@@ -134,5 +134,24 @@ function isNetworkishAuthError(err: unknown): boolean {
     msg.includes("ssl") ||
     msg.includes("proxy") ||
     msg.includes("retryable")
+  );
+}
+
+function devGraceEnabled(): boolean {
+  return Deno.env.get("AUTH_DEV_GRACE") === "true" && Deno.env.get("AUTH_STRICT") !== "true";
+}
+
+/** Server-access client for long-running background work, or null if the key is missing. */
+export function getServiceClient(): SupabaseClient | null {
+  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  return key ? createClient(Deno.env.get("SUPABASE_URL")!, key) : null;
+}
+
+/** Caller-scoped client whose access token can be refreshed during a long run. */
+export function getSupabaseForAccessToken(accessToken: () => Promise<string>): SupabaseClient {
+  return createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_ANON_KEY")!,
+    { accessToken },
   );
 }

@@ -1,4 +1,5 @@
 import { compareTables } from "./tableCompare";
+import { pickTrendView } from "./trend-payload";
 
 /** Shared unwrap + noise filter for stored test_results actual/expected. */
 
@@ -378,6 +379,7 @@ export function deriveStoredResultRows({
   actual,
   expected,
   spec,
+  scenarioType,
   diff: storedDiff,
   fallbackStatus,
 }: {
@@ -394,6 +396,35 @@ export function deriveStoredResultRows({
 } {
   if (firstPayloadError(actual) || firstPayloadError(expected)) {
     return { rows: [], status: "fail", derived: true };
+  }
+  if (String(scenarioType || "").toLowerCase() === "trend") {
+    const trend = pickTrendView(
+      actual,
+      actual?.values,
+      actual?.extracted,
+      actual?.extracted?.result,
+      expected,
+      storedDiff,
+    );
+    if (!trend?.grains.length) {
+      return { rows: [], status: toStoredStatus(fallbackStatus), derived: false };
+    }
+    const statuses = trend.grains.map((grain) => {
+      const failed =
+        grain.consecutive === false ||
+        grain.score === 0 ||
+        grain.missing.length > 0 ||
+        !!grain.trend_error;
+      const passed = grain.consecutive === true || grain.score === 1;
+      return failed ? "fail" : passed ? "pass" : "pending";
+    });
+    const status: StoredResultStatus =
+      statuses.some((value) => value === "fail") || !!trend.trend_error
+        ? "fail"
+        : statuses.every((value) => value === "pass")
+        ? "pass"
+        : "pending";
+    return { rows: [], status, derived: true };
   }
   const actualMap = unwrapStoredValues(actual);
   const expectedMap = unwrapStoredValues(expected);
@@ -436,10 +467,19 @@ export function deriveStoredResultRows({
   // Older stored results may contain only the authoritative result status,
   // without a KPI-level diff error. Do not turn such a recorded failure back
   // into pending merely because the missing values cannot be re-compared.
+  // Mark every unresolved row with the missing extraction side so the KPI
+  // table explains the persisted failure instead of contradicting it.
   if (calculatedStatus === "pending" && persistedStatus === "fail") {
-    if (rows.length === 1 && rows[0].pass == null) {
-      rows = [{ ...rows[0], pass: false }];
-    }
+    rows = rows.map((row) => {
+      if (row.pass != null) return row;
+      const error =
+        row.a == null && row.e != null
+          ? "no_value"
+          : row.e == null && row.a != null
+          ? "no_expected_value"
+          : row.error;
+      return { ...row, pass: false, error };
+    });
     return { rows, status: "fail", derived: false };
   }
   return { rows, status: calculatedStatus, derived: true };
