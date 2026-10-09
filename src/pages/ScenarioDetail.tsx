@@ -3103,6 +3103,16 @@ function findStoredExpected(rows: any[] | undefined, label?: string): Record<str
 function expectedFromSql(sqlRes: any, actualKeys: string[]): Record<string, any> {
   const out: Record<string, any> = {};
   if (!sqlRes?.ok) return out;
+  const columns: string[] = sqlRes.columns || (sqlRes.rows?.[0] ? Object.keys(sqlRes.rows[0]) : []);
+  if (actualKeys.length === 1 && columns.length > 1 && sqlRes.rows?.length) {
+    out[actualKeys[0]] = {
+      columns,
+      rows: sqlRes.rows.map((row: Record<string, any>) =>
+        columns.map((column) => row?.[column] ?? null)
+      ),
+    };
+    return out;
+  }
   for (const k of actualKeys) {
     const exp = expectedForKpi(sqlRes, k);
     if (exp !== null && exp !== undefined) out[k] = exp;
@@ -3336,7 +3346,11 @@ async function persistWarehouseExpected(opts: {
         const c = combos[i];
         const label = comboPersistLabel(c, i);
         const sqlRes = sqlByCombo?.[c.id] || (sqlResult?.ok ? sqlResult : null);
-        const expectedValues = expectedFromSql(sqlRes, Object.keys(sqlRes?.rows?.[0] || {}));
+        const configuredKeys = Object.keys(tolerances || {}).filter((key) => !isKpiNoiseKey(key));
+        const expectedValues = expectedFromSql(
+          sqlRes,
+          configuredKeys.length ? configuredKeys : Object.keys(sqlRes?.rows?.[0] || {}),
+        );
         if (!Object.keys(expectedValues).length && sqlRes?.ok && sqlRes.scalar != null) {
           const col = sqlRes.columns?.[0] || "value";
           expectedValues[col] = sqlRes.scalar;
@@ -3352,7 +3366,11 @@ async function persistWarehouseExpected(opts: {
       }
     } else {
       const sqlRes = sqlResult?.ok ? sqlResult : null;
-      const expectedValues = expectedFromSql(sqlRes, Object.keys(sqlRes?.rows?.[0] || {}));
+      const configuredKeys = Object.keys(tolerances || {}).filter((key) => !isKpiNoiseKey(key));
+      const expectedValues = expectedFromSql(
+        sqlRes,
+        configuredKeys.length ? configuredKeys : Object.keys(sqlRes?.rows?.[0] || {}),
+      );
       if (!Object.keys(expectedValues).length && sqlRes?.ok && sqlRes.scalar != null) {
         const col = sqlRes.columns?.[0] || "value";
         expectedValues[col] = sqlRes.scalar;
@@ -3397,8 +3415,15 @@ async function persistWarehouseExpected(opts: {
     const actualValues = (prevActual.values && typeof prevActual.values === "object")
       ? prevActual.values
       : extractKpisFromBlock(prevActual);
-    const actualKeys = Object.keys(actualValues || {}).filter((k) => !k.startsWith("__"));
-    const expectedValues = expectedFromSql(sqlRes, actualKeys.length ? actualKeys : Object.keys(sqlRes.rows?.[0] || {}));
+    const configuredKeys = Object.keys(tolerances || {}).filter((key) => !isKpiNoiseKey(key));
+    const actualKeys = Object.keys(actualValues || {}).filter((key) =>
+      !key.startsWith("__") && !isKpiNoiseKey(key)
+    );
+    const comparisonKeys = configuredKeys.length ? configuredKeys : actualKeys;
+    const expectedValues = expectedFromSql(
+      sqlRes,
+      comparisonKeys.length ? comparisonKeys : Object.keys(sqlRes.rows?.[0] || {}),
+    );
     if (!Object.keys(expectedValues).length && sqlRes.scalar != null && actualKeys.length === 1) {
       expectedValues[actualKeys[0]] = sqlRes.scalar;
     }
@@ -3930,7 +3955,11 @@ function FilterComparisonTable({
       const both = Number.isFinite(a) && Number.isFinite(e);
       const diff = both ? a - e : null;
       const deltaPct = both && e !== 0 ? (diff! / Math.abs(e)) * 100 : null;
-      const pass = evalPass(v, exp, getTol(tolerances, k));
+      const comparisonExecuted = isReferenceMatch
+        ? !!(pwBlock || refBlock || runResult || refRunResult)
+        : !!(pwBlock || runResult) && !!sqlRes?.ok;
+      const missingRequiredValue = comparisonExecuted && (v == null || exp == null);
+      const pass = missingRequiredValue ? false : evalPass(v, exp, getTol(tolerances, k));
       return { combo: c, comboIdx: idx, kpi: k, actual: v, expected: exp, diff, deltaPct, pass };
     });
     if (!rows.length) {

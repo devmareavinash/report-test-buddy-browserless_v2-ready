@@ -163,14 +163,14 @@ export function StoredResultTable({
                   </td>
                 ) : (
                   <>
-                    <td className="p-2 align-top mono font-semibold">{fmt(r.a)}</td>
-                    <td className="p-2 align-top mono font-semibold">{fmt(r.e)}</td>
+                    <td className="p-2 align-top mono font-semibold">{r.skipped && r.a == null ? "" : fmt(r.a)}</td>
+                    <td className="p-2 align-top mono font-semibold">{r.skipped && r.e == null ? "" : fmt(r.e)}</td>
                   </>
                 )}
                 <td className="p-2 mono align-top">
                   {r.error ? (
                     <span className="text-destructive">{extractionErrorLabel(r.error)}</span>
-                  ) : r.diff !== null ? (
+                  ) : r.skipped ? null : r.diff !== null ? (
                     <span className={r.pass === false ? "text-destructive" : "text-muted-foreground"}>
                       {r.diff > 0 ? "+" : ""}{fmt(r.diff)}
                       {r.deltaPct !== null && (

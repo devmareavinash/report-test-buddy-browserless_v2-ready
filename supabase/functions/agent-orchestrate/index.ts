@@ -188,6 +188,14 @@ async function findActiveRunConflict(
   const candidates = (active || []).filter((run: any) => run.id !== excludeRunId);
   if (!candidates.length) return null;
 
+  // Browserless is a shared local resource. Even different brands compete for
+  // the same Chromium capacity, and PCC dossiers return slow HTTP-200/empty
+  // payloads under that load. Admit only one top-level execution globally.
+  // Child report invocations reuse existing_run_id and never enter this guard.
+  const activeWorkstream = candidates.find((run: any) => run.scope_type === "workstream");
+  if (activeWorkstream) return activeWorkstream;
+  if (scopeType === "workstream") return candidates[0];
+
   let reportId: string | null = null;
   let workstreamId: string | null = null;
   if (scopeType === "scenario") {
@@ -460,6 +468,13 @@ function pickStructured(map: Record<string, any> | null | undefined): { k: strin
     if (isStructuredVal(v)) return { k, v };
   }
   return null;
+}
+
+function pickComparableStructured(map: Record<string, any> | null | undefined): { k: string; v: any } | null {
+  if (!map || typeof map !== "object") return null;
+  return pickStructured(Object.fromEntries(
+    Object.entries(map).filter(([key]) => !/pcc.*verification/i.test(key)),
+  ));
 }
 
 function structuredEqual(a: any, b: any): boolean {
@@ -750,13 +765,13 @@ Deno.serve(async (req) => {
 
     if (!existing_run_id && scope_type === "workstream") {
       const dispatch = async () => {
-        // Spread the configured browser budget across reports. Serial report
-        // execution can exceed the caller JWT lifetime on a full workstream,
-        // after which no child can persist results or finalize the parent.
-        // Parent aggregation is now atomic (RPC or compare-and-swap fallback),
-        // so report children can safely finish concurrently.
-        const reportConcurrency = Math.min(concurrency, Math.max(1, reportIds.length));
-        const childConcurrency = Math.max(1, Math.floor(concurrency / reportConcurrency));
+        // PCC and customer dossiers are stable in isolated case runs but can
+        // return an HTTP-200/empty payload when several Browserless jobs compete
+        // for Chromium resources. Keep a workstream's browser work serial. Long
+        // runs no longer depend on the starting caller JWT, so correctness takes
+        // priority over report-level parallelism here.
+        const reportConcurrency = 1;
+        const childConcurrency = 1;
         await mapPool(reportIds, reportConcurrency, async (rid) => {
           try {
             jsonLog("child_dispatch_started", { run_id: run.id, report_id: rid });
@@ -889,6 +904,10 @@ Deno.serve(async (req) => {
               assertionSpec.kpi_aliases && typeof assertionSpec.kpi_aliases === "object"
                 ? assertionSpec.kpi_aliases
                 : {};
+            const isPccScenario = /\bpcc\b/i.test(String(s.title || ""));
+            const comparisonKpiLabels = isPccScenario
+              ? kpiLabels.filter((label) => !/^(physician|hcp|account)\s+name$/i.test(label.trim()))
+              : kpiLabels;
 
             let matrixQuery = sb.from("scenario_filter_matrix")
               .select("id, label, filters").eq("scenario_id", s.id)
@@ -937,10 +956,31 @@ Deno.serve(async (req) => {
 
             // A long matrix script can carry stale filters, tabs, popups, grids,
             // or chart grain state into the next combination. Give every combo
-            // its own Browserless function call/page and retry once in another
-            // fresh page when extraction is empty or explicitly failed.
+            // its own Browserless function call/page. Every scenario, including
+            // PCC, retries at most once after an extraction/navigation failure.
             // playwright-runtime remains unchanged; its existing override narrows
             // the injected matrix to exactly one combination.
+            const invokeRuntimeWithRetry = async (
+              body: Record<string, any>,
+              target: "main" | "reference",
+              comboLabel: string | null,
+            ) => {
+              let response = await callFn("playwright-runtime", body);
+              const reason = comboExtractionNeedsRetry(response, comboLabel)
+                ? "runtime_or_empty_extraction"
+                : null;
+              if (reason) {
+                jsonLog("combo_extraction_retry", {
+                  run_id: run.id,
+                  scenario_id: s.id,
+                  combo: comboLabel,
+                  target,
+                  reason,
+                });
+                response = await callFn("playwright-runtime", body);
+              }
+              return response;
+            };
             const isolatedRunResponses = new Map<string, any>();
             const isolatedRefResponses = new Map<string, any>();
             let runResp: any;
@@ -953,16 +993,7 @@ Deno.serve(async (req) => {
                   code: executableCode,
                   filter_combinations: [{ label: combo.label, filters: combo.filters || {} }],
                 };
-                let mainResponse = await callFn("playwright-runtime", mainBody);
-                if (comboExtractionNeedsRetry(mainResponse, combo.label)) {
-                  jsonLog("combo_extraction_retry", {
-                    run_id: run.id,
-                    scenario_id: s.id,
-                    combo: combo.label,
-                    target: "main",
-                  });
-                  mainResponse = await callFn("playwright-runtime", mainBody);
-                }
+                const mainResponse = await invokeRuntimeWithRetry(mainBody, "main", combo.label);
                 let referenceResponse: any = null;
                 if (isRef && !refError && refCode) {
                   const referenceBody = {
@@ -972,16 +1003,7 @@ Deno.serve(async (req) => {
                     target: "reference",
                     filter_combinations: [{ label: combo.label, filters: combo.filters || {} }],
                   };
-                  referenceResponse = await callFn("playwright-runtime", referenceBody);
-                  if (comboExtractionNeedsRetry(referenceResponse, combo.label)) {
-                    jsonLog("combo_extraction_retry", {
-                      run_id: run.id,
-                      scenario_id: s.id,
-                      combo: combo.label,
-                      target: "reference",
-                    });
-                    referenceResponse = await callFn("playwright-runtime", referenceBody);
-                  }
+                  referenceResponse = await invokeRuntimeWithRetry(referenceBody, "reference", combo.label);
                 }
                 return { label: String(combo.label || ""), mainResponse, referenceResponse };
               });
@@ -993,13 +1015,13 @@ Deno.serve(async (req) => {
               refRespRaw = null;
             } else {
               [runResp, refRespRaw] = await Promise.all([
-                callFn("playwright-runtime", {
+                invokeRuntimeWithRetry({
                   mode: "headless", scenario_id: s.id, code: executableCode,
-                }),
+                }, "main", null),
                 (isRef && !refError && refCode)
-                  ? callFn("playwright-runtime", {
+                  ? invokeRuntimeWithRetry({
                       mode: "headless", scenario_id: s.id, code: refCode, target: "reference",
-                    })
+                    }, "reference", null)
                   : Promise.resolve(null),
               ]);
             }
@@ -1102,7 +1124,7 @@ Deno.serve(async (req) => {
                   ran_without_filters: !hasCombos,
                 };
                 sqlRow = comboRefError ? null : refScraped;
-                for (const lbl of kpiLabels.length ? kpiLabels : Object.keys(scraped)) {
+                for (const lbl of comparisonKpiLabels.length ? comparisonKpiLabels : Object.keys(scraped)) {
                   const raw = lookupConfiguredKpiValue(refScraped, lbl, kpiAliases);
                   expectedMap[lbl] = (raw != null && typeof raw === "object")
                     ? raw
@@ -1173,7 +1195,23 @@ Deno.serve(async (req) => {
                   const prefix = colNorms.find((x) => x.n.startsWith(n) || n.startsWith(x.n));
                   return prefix ? prefix.c : null;
                 };
-                for (const lbl of kpiLabels.length ? kpiLabels : Object.keys(scraped)) {
+                const warehouseLabels = comparisonKpiLabels.length
+                  ? comparisonKpiLabels
+                  : Object.keys(scraped);
+                const structuredWarehouseLabel = warehouseLabels.length === 1 &&
+                    isStructuredVal(lookupConfiguredKpiValue(scraped, warehouseLabels[0], kpiAliases))
+                  ? warehouseLabels[0]
+                  : null;
+                if (structuredWarehouseLabel && rows.length && cols.length) {
+                  expectedMap[structuredWarehouseLabel] = {
+                    columns: cols,
+                    rows: rows.map((row: Record<string, any>) =>
+                      cols.map((column) => row?.[column] ?? null)
+                    ),
+                  };
+                }
+                for (const lbl of warehouseLabels) {
+                  if (lbl === structuredWarehouseLabel) continue;
                   const col = findCol(lbl);
                   if (col && rows[0]) {
                     const raw = rows[0][col];
@@ -1192,16 +1230,16 @@ Deno.serve(async (req) => {
               const actualMap: Record<string, any> = {};
               const diffMap: Record<string, any> = {};
               let comboPass = true;
-              const labels = (kpiLabels.length ? kpiLabels : Object.keys(scraped));
+              const labels = (comparisonKpiLabels.length ? comparisonKpiLabels : Object.keys(scraped));
               const kpiTol: Record<string, any> = ((script as any)?.assertion_spec || {}).kpi_tolerances || {};
               const structuredLabels = labels.filter((label) =>
                 isStructuredVal(lookupConfiguredKpiValue(scraped, label, kpiAliases))
               );
               const hasMultipleStructuredKpis = structuredLabels.length > 1;
-              const mainGrid = pickStructured(scraped);
-              const expGrid = pickStructured(expectedMap);
+              const mainGrid = pickComparableStructured(scraped);
+              const expGrid = pickComparableStructured(expectedMap);
               const structuredLabel = mainGrid
-                ? configuredStructuredKpiAlias(mainGrid.k, kpiLabels)
+                ? configuredStructuredKpiAlias(mainGrid.k, comparisonKpiLabels)
                 : null;
               const structuredSourceKeys: Record<string, string> = {};
 
@@ -1353,6 +1391,7 @@ Deno.serve(async (req) => {
                   }
                   continue;
                 }
+                const rawExpected = lookupKpiValue(expectedMap, lbl);
                 // Refresh dates stay as text for display, but compare them with
                 // the configured operator (eq/lte/gte/gt/lt), not equality only.
                 if (looksLikeDateValue(rawA)) {

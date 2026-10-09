@@ -63,13 +63,16 @@ export function lookupStoredKpiValue(map: Record<string, any>, name: string): an
 
 export function configuredKpiNames(spec: any): string[] {
   if (!spec || typeof spec !== "object") return [];
+  if (Array.isArray(spec.kpis)) {
+    const configured = spec.kpis
+      .map((k: any) => String(k?.label || k?.name || k || "").trim())
+      .filter((k: string) => k && !isKpiValueNoise(k));
+    if (configured.length) return configured;
+  }
   const tols = spec.kpi_tolerances && typeof spec.kpi_tolerances === "object"
     ? Object.keys(spec.kpi_tolerances).filter((k) => k && !isKpiValueNoise(k))
     : [];
   if (tols.length) return tols;
-  if (Array.isArray(spec.kpis)) {
-    return spec.kpis.map((k: any) => String(k?.label || k?.name || k || "").trim()).filter((k: string) => k && !isKpiValueNoise(k));
-  }
   return [];
 }
 
@@ -312,6 +315,7 @@ export type StoredResultKpiRow = {
   deltaPct: number | null;
   pass: boolean | null;
   error?: string | null;
+  skipped?: boolean;
 };
 
 export function evalStoredKpiValue(
@@ -458,8 +462,10 @@ export function deriveStoredResultRows({
     // persisted row status in Run Detail.
     const pass = error
       ? false
+      : diffEntry?.skipped === true
+      ? true
       : evalStoredKpiValue(a, e, tol);
-    return { k, a, e, diff, deltaPct, pass, error };
+    return { k, a, e, diff, deltaPct, pass, error, skipped: diffEntry?.skipped === true };
   });
   if (!rows.length) return { rows, status: toStoredStatus(fallbackStatus), derived: false };
   const calculatedStatus = overallFromStoredKpiRows(rows);
@@ -481,6 +487,27 @@ export function deriveStoredResultRows({
       return { ...row, pass: false, error };
     });
     return { rows, status: "fail", derived: false };
+  }
+  // A completed row persisted as pass cannot be valid when one comparison
+  // side is absent. Older PCC orchestration incorrectly skipped these values;
+  // surface the extraction failure instead of leaving the detail card pending.
+  if (calculatedStatus === "pending" && persistedStatus === "pass") {
+    let foundMissingSide = false;
+    rows = rows.map((row) => {
+      if (row.pass != null) return row;
+      foundMissingSide = true;
+      return {
+        ...row,
+        pass: false,
+        error:
+          row.a == null && row.e == null
+            ? "no_value"
+            : row.a == null
+              ? "no_value"
+              : "no_expected_value",
+      };
+    });
+    if (foundMissingSide) return { rows, status: "fail", derived: true };
   }
   return { rows, status: calculatedStatus, derived: true };
 }

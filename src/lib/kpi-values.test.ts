@@ -84,6 +84,23 @@ describe("stored KPI tolerances", () => {
     expect(configuredKpiNames(storedKpiSpec({}, spec))).toEqual(["Current KPI"]);
   });
 
+  it("does not resurrect a removed KPI from a stale tolerance snapshot", () => {
+    const actual = {
+      tolerances_snapshot: {
+        "Refresh Date": { value: 0, unit: "pct", op: "eq" },
+        "Sales (NBRx)": { value: 0, unit: "pct", op: "eq" },
+      },
+    };
+    const spec = {
+      kpis: ["Sales (NBRx)"],
+      kpi_tolerances: {
+        "Sales (NBRx)": { value: 0, unit: "pct", op: "eq" },
+      },
+    };
+
+    expect(configuredKpiNames(storedKpiSpec(actual, spec))).toEqual(["Sales (NBRx)"]);
+  });
+
   it("uses each KPI's own comparison operator", () => {
     const tols = {
       A: { value: 0, unit: "pct", op: "lte" },
@@ -304,5 +321,59 @@ describe("deriveStoredResultStatus", () => {
       pass: false,
       error: "no_expected_value",
     });
+  });
+
+  it("rejects a legacy persisted pass when reference values are missing", () => {
+    const result = deriveStoredResultRows({
+      actual: { values: { City: "Travis Afb", BHOID: "BHO3057915" } },
+      expected: { values: { City: null, BHOID: null } },
+      spec: {
+        kpis: ["City", "BHOID"],
+        kpi_tolerances: {
+          City: { value: 0, unit: "pct", op: "eq" },
+          BHOID: { value: 0, unit: "pct", op: "eq" },
+        },
+      },
+      fallbackStatus: "pass",
+    });
+
+    expect(result.status).toBe("fail");
+    expect(result.rows.every((row) =>
+      row.pass === false && row.error === "no_expected_value"
+    )).toBe(true);
+  });
+
+  it("rejects a legacy persisted pass when both KPI values are missing", () => {
+    const result = deriveStoredResultRows({
+      actual: { values: { "Account Name": null } },
+      expected: { values: { "Account Name": null } },
+      spec: {
+        kpis: ["Account Name"],
+        kpi_tolerances: {
+          "Account Name": { value: 0, unit: "pct", op: "eq" },
+        },
+      },
+      fallbackStatus: "pass",
+    });
+
+    expect(result.status).toBe("fail");
+    expect(result.rows[0]).toMatchObject({ pass: false, error: "no_value" });
+  });
+
+  it("treats a deliberately skipped blank MSTR KPI as passing", () => {
+    const result = deriveStoredResultRows({
+      actual: { values: { "Blink TRx": null } },
+      expected: { values: { "Blink TRx": null } },
+      diff: { "Blink TRx": { skipped: true, pass: true, reason: "not_present_in_mstr" } },
+      spec: {
+        kpi_tolerances: {
+          "Blink TRx": { value: 0, unit: "pct", op: "eq" },
+        },
+      },
+      fallbackStatus: "pass",
+    });
+
+    expect(result.status).toBe("pass");
+    expect(result.rows[0]).toMatchObject({ k: "Blink TRx", pass: true, skipped: true });
   });
 });
