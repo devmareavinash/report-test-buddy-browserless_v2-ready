@@ -892,9 +892,12 @@ Deno.serve(async (req) => {
                 typeof assertionSpec.kpi_tolerances === "object"
               ? Object.keys(assertionSpec.kpi_tolerances)
               : [];
-            const preferredKpis = configuredKpis.length
-              ? configuredKpis
-              : (toleranceKpis.length ? toleranceKpis : reportKpiLabels);
+            // Add/Remove KPIs updates kpi_tolerances. Treat that map as the
+            // current case configuration so a stale legacy `kpis` array cannot
+            // reintroduce a KPI that the user removed.
+            const preferredKpis = toleranceKpis.length
+              ? toleranceKpis
+              : (configuredKpis.length ? configuredKpis : reportKpiLabels);
             const kpiLabels: string[] = Array.from(new Set<string>(
               preferredKpis
                 .map((label: any) => String(label || "").trim())
@@ -905,9 +908,10 @@ Deno.serve(async (req) => {
                 ? assertionSpec.kpi_aliases
                 : {};
             const isPccScenario = /\bpcc\b/i.test(String(s.title || ""));
-            const comparisonKpiLabels = isPccScenario
-              ? kpiLabels.filter((label) => !/^(physician|hcp|account)\s+name$/i.test(label.trim()))
-              : kpiLabels;
+            // Names configured as KPIs are business values, not verification
+            // metadata. Include them in both extraction maps and comparison so
+            // a missing physician/HCP/account name is recorded as a failure.
+            const comparisonKpiLabels = kpiLabels;
 
             let matrixQuery = sb.from("scenario_filter_matrix")
               .select("id, label, filters").eq("scenario_id", s.id)
@@ -956,8 +960,9 @@ Deno.serve(async (req) => {
 
             // A long matrix script can carry stale filters, tabs, popups, grids,
             // or chart grain state into the next combination. Give every combo
-            // its own Browserless function call/page. Every scenario, including
-            // PCC, retries at most once after an extraction/navigation failure.
+            // its own Browserless function call/page. Non-PCC scenarios retry
+            // once after an extraction/navigation failure. PCC scenarios use
+            // one attempt to avoid doubling their long Browserless runtime.
             // playwright-runtime remains unchanged; its existing override narrows
             // the injected matrix to exactly one combination.
             const invokeRuntimeWithRetry = async (
@@ -966,7 +971,7 @@ Deno.serve(async (req) => {
               comboLabel: string | null,
             ) => {
               let response = await callFn("playwright-runtime", body);
-              const reason = comboExtractionNeedsRetry(response, comboLabel)
+              const reason = !isPccScenario && comboExtractionNeedsRetry(response, comboLabel)
                 ? "runtime_or_empty_extraction"
                 : null;
               if (reason) {

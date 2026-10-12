@@ -89,11 +89,11 @@ describe("record-count extraction contract", () => {
     expect(orchestrator).toContain("lookupConfiguredKpiValue(scraped, lbl, kpiAliases)");
   });
 
-  it("retries PCC payloads at most once while preserving isolated sessions", () => {
+  it("does not retry PCC payloads while preserving isolated sessions", () => {
     const orchestrator = readFileSync(orchestratorPath, "utf8");
 
     expect(orchestrator).not.toContain("function pccExtractionRetryReason");
-    expect(orchestrator).toContain("const reason = comboExtractionNeedsRetry(response, comboLabel)");
+    expect(orchestrator).toContain("!isPccScenario && comboExtractionNeedsRetry(response, comboLabel)");
     expect(orchestrator).toContain("invokeRuntimeWithRetry");
   });
 
@@ -105,12 +105,13 @@ describe("record-count extraction contract", () => {
     expect(orchestrator).toContain('error: "no_value"');
   });
 
-  it("keeps PCC identity verification metadata out of business-grid comparison", () => {
+  it("compares configured PCC name KPIs while excluding verification metadata", () => {
     const orchestrator = readFileSync(orchestratorPath, "utf8");
 
     expect(orchestrator).toContain("function pickComparableStructured");
     expect(orchestrator).toContain("!/pcc.*verification/i");
-    expect(orchestrator).toContain("/^(physician|hcp|account)\\s+name$/i");
+    expect(orchestrator).toContain("const comparisonKpiLabels = kpiLabels");
+    expect(orchestrator).not.toContain("kpiLabels.filter((label) => !/^(physician|hcp|account)");
   });
 
   it("preserves multi-row warehouse output as the expected structured KPI grid", () => {

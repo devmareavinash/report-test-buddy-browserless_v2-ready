@@ -349,8 +349,16 @@ export function evalStoredKpiValue(
 export function storedResultKpiNames(actual: any, expected: any, spec: any): string[] {
   const actualMap = unwrapStoredValues(actual);
   const expectedMap = unwrapStoredValues(expected);
-  const effectiveSpec = storedKpiSpec(actual, spec);
-  const configured = configuredKpiNames(effectiveSpec);
+  // Use the live case configuration to decide which KPI rows are visible.
+  // The run snapshot still supplies historical tolerance values, but it must
+  // not resurrect KPIs that have since been removed from the case.
+  const currentToleranceKpis =
+    spec?.kpi_tolerances && typeof spec.kpi_tolerances === "object"
+      ? Object.keys(spec.kpi_tolerances).filter((k) => k && !isKpiValueNoise(k))
+      : [];
+  const configured = currentToleranceKpis.length
+    ? currentToleranceKpis
+    : configuredKpiNames(spec);
   const available = [...Object.keys(actualMap), ...Object.keys(expectedMap)].filter((k) => !isKpiValueNoise(k));
   const configuredHasStoredValue = configured.some((k) =>
     lookupStoredKpiValue(actualMap, k) !== undefined || lookupStoredKpiValue(expectedMap, k) !== undefined
@@ -468,48 +476,32 @@ export function deriveStoredResultRows({
     return { k, a, e, diff, deltaPct, pass, error, skipped: diffEntry?.skipped === true };
   });
   if (!rows.length) return { rows, status: toStoredStatus(fallbackStatus), derived: false };
-  const calculatedStatus = overallFromStoredKpiRows(rows);
   const persistedStatus = toStoredStatus(fallbackStatus);
-  // Older stored results may contain only the authoritative result status,
-  // without a KPI-level diff error. Do not turn such a recorded failure back
-  // into pending merely because the missing values cannot be re-compared.
-  // Mark every unresolved row with the missing extraction side so the KPI
-  // table explains the persisted failure instead of contradicting it.
-  if (calculatedStatus === "pending" && persistedStatus === "fail") {
+  const hadUnresolvedRows = rows.some((row) => row.pass == null);
+  // Once a result has completed, no configured KPI may remain pending. This
+  // must be applied per KPI (not only when the whole result is pending), since
+  // another failed KPI can already make the aggregate status "fail".
+  if (persistedStatus !== "pending") {
     rows = rows.map((row) => {
       if (row.pass != null) return row;
-      const error =
-        row.a == null && row.e != null
-          ? "no_value"
-          : row.e == null && row.a != null
-          ? "no_expected_value"
-          : row.error;
-      return { ...row, pass: false, error };
-    });
-    return { rows, status: "fail", derived: false };
-  }
-  // A completed row persisted as pass cannot be valid when one comparison
-  // side is absent. Older PCC orchestration incorrectly skipped these values;
-  // surface the extraction failure instead of leaving the detail card pending.
-  if (calculatedStatus === "pending" && persistedStatus === "pass") {
-    let foundMissingSide = false;
-    rows = rows.map((row) => {
-      if (row.pass != null) return row;
-      foundMissingSide = true;
       return {
         ...row,
         pass: false,
         error:
-          row.a == null && row.e == null
+          row.a == null
             ? "no_value"
-            : row.a == null
-              ? "no_value"
-              : "no_expected_value",
+            : row.e == null
+              ? "no_expected_value"
+              : row.error,
       };
     });
-    if (foundMissingSide) return { rows, status: "fail", derived: true };
   }
-  return { rows, status: calculatedStatus, derived: true };
+  const calculatedStatus = overallFromStoredKpiRows(rows);
+  return {
+    rows,
+    status: calculatedStatus,
+    derived: !(persistedStatus === "fail" && hadUnresolvedRows),
+  };
 }
 
 export function deriveStoredResultStatus(args: Parameters<typeof deriveStoredResultRows>[0]): StoredResultStatus {

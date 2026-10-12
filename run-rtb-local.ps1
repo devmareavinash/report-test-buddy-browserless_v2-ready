@@ -206,7 +206,7 @@ if (-not $SkipBrowserless) {
   }
   elseif ($script:DockerDown) {
     Write-Warn2 "skipping Browserless - Docker engine is not running. Start Docker Desktop, then:"
-    Write-Host  "        docker run --rm -p 3000:3000 --shm-size=2g -e TOKEN=local-dev-token -e TIMEOUT=840000 ghcr.io/browserless/chromium:v2.55.4"
+    Write-Host  "        docker run --rm -p 3000:3000 --shm-size=2g -e TOKEN=local-dev-token -e TIMEOUT=600000 ghcr.io/browserless/chromium:v2.55.4"
   }
   elseif (Test-Path (Join-Path $root "scripts\dev-browserless.ps1")) {
     Start-Child (Join-Path $root "scripts\dev-browserless.ps1")
@@ -214,9 +214,8 @@ if (-not $SkipBrowserless) {
   }
   else {
     $token = if ($env:BROWSERLESS_TOKEN) { $env:BROWSERLESS_TOKEN } else { "local-dev-token" }
-    # 840000 = 14 min. The old 7-min default expired before heavy trend / Show Data
-    # scripts finished, surfacing as a 504 from the proxy.
-    $timeoutMs = if ($env:BROWSERLESS_TIMEOUT_MS) { $env:BROWSERLESS_TIMEOUT_MS } else { "840000" }
+    # 600000 = 10 min, allowing slow PCC scripts to finish without an unbounded wait.
+    $timeoutMs = if ($env:BROWSERLESS_TIMEOUT_MS) { $env:BROWSERLESS_TIMEOUT_MS } else { "600000" }
     $args = '["--ignore-certificate-errors","--ignore-certificate-errors-spki-list","--window-size=1920,1080","--force-device-scale-factor=1"]'
     # Starting many Chromium processes simultaneously can exhaust a 4 GB Docker
     # Desktop VM before any process exposes its DevTools endpoint. Keep a small

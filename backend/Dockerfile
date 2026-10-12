@@ -1,5 +1,18 @@
 # Deno-based backend container hosting all edge functions in one process.
-FROM denoland/deno:alpine-1.46.3
+# Use AWS Public ECR for the OS because Docker Hub's CloudFront blob endpoint
+# is blocked or unreliable on the corporate network.
+FROM public.ecr.aws/docker/library/debian:bookworm-slim
+
+ARG DENO_VERSION=1.46.3
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl unzip wget \
+    && curl -fsSL \
+      "https://github.com/denoland/deno/releases/download/v${DENO_VERSION}/deno-x86_64-unknown-linux-gnu.zip" \
+      -o /tmp/deno.zip \
+    && unzip /tmp/deno.zip -d /usr/local/bin \
+    && chmod +x /usr/local/bin/deno \
+    && rm -rf /var/lib/apt/lists/* /tmp/deno.zip \
+    && deno --version
 
 WORKDIR /app
 

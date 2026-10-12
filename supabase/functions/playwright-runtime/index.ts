@@ -10,7 +10,7 @@ type Mode = "headed" | "headless";
 
 const DEFAULT_OSS_HOST = "http://127.0.0.1:3000";
 const DEFAULT_CLOUD_HOST = "production-sfo.browserless.io";
-const DEFAULT_BROWSERLESS_TIMEOUT_MS = 420000;
+const DEFAULT_BROWSERLESS_TIMEOUT_MS = 600000;
 
 function browserlessTimeoutMs(): number {
   const n = Number(Deno.env.get("BROWSERLESS_TIMEOUT_MS") || DEFAULT_BROWSERLESS_TIMEOUT_MS);

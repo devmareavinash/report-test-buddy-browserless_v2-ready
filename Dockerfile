@@ -1,5 +1,5 @@
 # ---------- Build stage ----------
-  FROM node:22-alpine AS build
+  FROM public.ecr.aws/docker/library/node:22-alpine AS build
   WORKDIR /app
   
   # Corporate proxies (optional build-args)
@@ -40,7 +40,7 @@
   RUN npm run build
   
   # ---------- Runtime stage ----------
-FROM nginx:1.27-alpine
+FROM public.ecr.aws/docker/library/nginx:1.27-alpine
 
 ENV BACKEND_UPSTREAM=backend:8000
 

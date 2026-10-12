@@ -95,7 +95,7 @@ services:
       # launches can miss Puppeteer's 30-second startup deadline; queue instead.
       CONCURRENT: ${BROWSERLESS_CONCURRENT:-3}
       QUEUED: ${BROWSERLESS_QUEUED:-20}
-      TIMEOUT: ${BROWSERLESS_TIMEOUT_MS:-420000}
+      TIMEOUT: ${BROWSERLESS_TIMEOUT_MS:-600000}
       CORS: "true"
       # Do not pass the VDI Skyhigh proxy into Chromium (ERR_PROXY_CONNECTION_FAILED
       # inside Docker). Ignore MITM TLS certs for MSTR; keep a 1x 1920x1080 viewport.

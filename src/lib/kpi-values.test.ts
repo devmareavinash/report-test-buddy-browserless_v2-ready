@@ -360,6 +360,27 @@ describe("deriveStoredResultStatus", () => {
     expect(result.rows[0]).toMatchObject({ pass: false, error: "no_value" });
   });
 
+  it("fails a blank KPI even when another KPI already makes the result fail", () => {
+    const result = deriveStoredResultRows({
+      actual: { values: { "Physician Name": null, "NBRx Total": 7 } },
+      expected: { values: { "Physician Name": null, "NBRx Total": 5 } },
+      spec: {
+        kpis: ["Physician Name", "NBRx Total"],
+        kpi_tolerances: {
+          "Physician Name": { value: 0, unit: "pct", op: "eq" },
+          "NBRx Total": { value: 0, unit: "pct", op: "eq" },
+        },
+      },
+      fallbackStatus: "fail",
+    });
+
+    expect(result.status).toBe("fail");
+    expect(result.rows.find((row) => row.k === "Physician Name")).toMatchObject({
+      pass: false,
+      error: "no_value",
+    });
+  });
+
   it("treats a deliberately skipped blank MSTR KPI as passing", () => {
     const result = deriveStoredResultRows({
       actual: { values: { "Blink TRx": null } },

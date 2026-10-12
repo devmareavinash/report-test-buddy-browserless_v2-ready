@@ -11,7 +11,7 @@ import { ChevronDown, ChevronRight, Wrench, Pencil, Clock, Save, History } from 
 import { toast } from "sonner";
 import { StoredResultTable } from "@/components/StoredResultTable";
 import { fetchCanonicalScript } from "@/lib/canonicalScript";
-import { deriveStoredResultStatus } from "@/lib/kpi-values";
+import { configuredKpiNames, deriveStoredResultStatus } from "@/lib/kpi-values";
 
 type TR = {
   id: string;
@@ -76,6 +76,8 @@ export function RunScenarioCard({
     queryKey: ["scenario-tolerances", scenarioId],
     queryFn: async () =>
       (await fetchCanonicalScript(scenarioId, "assertion_spec")).data,
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   const spec = (script as any)?.assertion_spec;
   const resultsWithDerived = useMemo(() =>
@@ -426,8 +428,9 @@ function ScenarioKpiTolerancesReadOnly({ scenarioId, scenarioType, results }: { 
     queryFn: async () =>
       (await fetchCanonicalScript(scenarioId, "assertion_spec")).data,
   });
-  // Prefer the per-run tolerances_snapshot stored on the latest result for this run,
-  // so the panel reflects what was applied at evaluation time (not the live script).
+  // Preserve the run-time tolerance values, but only for KPIs that remain in
+  // the current case configuration. Removed KPIs must not reappear from an old
+  // run snapshot or a stale React Query cache entry.
   const snapshot = (() => {
     if (!results || !results.length) return null;
     for (const r of results) {
@@ -436,7 +439,18 @@ function ScenarioKpiTolerancesReadOnly({ scenarioId, scenarioType, results }: { 
     }
     return null;
   })();
-  const tol = snapshot || (((script as any)?.assertion_spec || {}).kpi_tolerances || {});
+  const liveSpec = (script as any)?.assertion_spec || {};
+  const liveToleranceKpis =
+    liveSpec.kpi_tolerances && typeof liveSpec.kpi_tolerances === "object"
+      ? Object.keys(liveSpec.kpi_tolerances)
+      : [];
+  const liveKpis = liveToleranceKpis.length
+    ? liveToleranceKpis
+    : configuredKpiNames(liveSpec);
+  const rawTol = snapshot || (liveSpec.kpi_tolerances || {});
+  const tol = liveKpis.length
+    ? Object.fromEntries(Object.entries(rawTol).filter(([label]) => liveKpis.includes(label)))
+    : rawTol;
   const entries = Object.entries(tol);
   const opLabel = (op?: string) =>
     op === "lte" ? "actual ≤ reference"
