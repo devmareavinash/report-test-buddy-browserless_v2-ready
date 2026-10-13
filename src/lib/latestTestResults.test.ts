@@ -42,4 +42,26 @@ describe("pairCombosWithResults", () => {
 
     expect(paired[0].result?.id).toBe("result-a");
   });
+
+  it("pairs an unlabeled combination with combo_1 instead of an older unlabeled result", () => {
+    const paired = pairCombosWithResults(
+      [{ id: "c1", label: null }],
+      [
+        {
+          id: "today",
+          created_at: "2026-10-13T08:31:23.000Z",
+          status: "fail",
+          actual: { filter: "combo_1", values: { BHID: null, "Physician Name": null } },
+        },
+        {
+          id: "old",
+          created_at: "2026-09-25T13:11:52.000Z",
+          status: "fail",
+          actual: { values: { BHID: "BH10854690", "Physician Name": "Waqar H Ahmed" } },
+        },
+      ],
+    );
+
+    expect(paired[0].result?.id).toBe("today");
+  });
 });

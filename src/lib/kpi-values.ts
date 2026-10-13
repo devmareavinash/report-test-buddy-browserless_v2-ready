@@ -17,6 +17,7 @@ export const KPI_VALUE_NOISE = new Set([
   "timebucket", "area", "region", "territory", "charttitle", "mstrerrordismissed",
   "dossierready", "timegrainretry", "via", "role", "nth", "selector", "locator",
   "snapshot", "clicked", "opened", "option", "clickedtext", "jobid",
+  "provider", "screenshotb64", "liveurl", "requestedmode", "fallbackreason",
 ]);
 
 export function normKpiKey(k: string) {

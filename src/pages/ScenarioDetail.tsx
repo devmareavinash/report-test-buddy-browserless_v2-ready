@@ -29,6 +29,7 @@ import {
 import { compareTables, summarizeTableCompare } from "@/lib/tableCompare";
 import { attachTrendFields, trendStatusFromValues } from "@/lib/trend-payload";
 import { fetchCanonicalScript, persistCanonicalScript } from "@/lib/canonicalScript";
+import { pairCombosWithResults } from "@/lib/latestTestResults";
 
 const canonFilters = (f: Record<string, string>) => {
   const keys = Object.keys(f || {}).map((k) => k.trim()).filter(Boolean).sort();
@@ -1031,35 +1032,36 @@ export default function ScenarioDetail() {
       );
   const displayDiff = hasManual ? null : latest?.diff;
 
-  // Hydrate FilterComparisonTable from stored test_results (and the last playwright job
-  // if the stored row has an empty values map).
+  // Hydrate FilterComparisonTable from the stored row for each combination.
+  // An unlabeled combination is persisted as combo_N. Matching only on the blank
+  // label used to attach an older unlabeled result (and its KPI values) to today's
+  // run, so Latest result showed data the Runs page did not have.
   const suiteRunData = (() => {
     if (!combos?.length) return null;
     const rows = latestPerComboResults;
+    const paired = pairCombosWithResults(combos, rows);
     const pwResult: Record<string, any> = {};
     const refResult: Record<string, any> = {};
     const comboMap: Record<string, any> = {};
-    const jobRoot = lastPwJob?.last_event ? pickResultRoot(lastPwJob.last_event) : null;
+    const hasStoredRow = paired.some((pair) => pair.result);
+    const jobRoot = !hasStoredRow && lastPwJob?.last_event ? pickResultRoot(lastPwJob.last_event) : null;
     for (const c of combos as any[]) {
       const idx = (combos as any[]).indexOf(c);
-      const row = rows.find((r: any) =>
-        normComboLabel(r.actual?.filter || r.expected?.filter || "") === normComboLabel(c.label || "")
-      ) || rows[idx];
-      const label = c.label || row?.actual?.filter || `combo_${idx + 1}`;
-      const fromStored = row ? kpiMapFromStored(row.actual) : null;
+      const row = paired[idx]?.result || null;
+      const label = comboPersistLabel(c, idx);
+      const storedActual = row?.actual?.values;
+      const hasStoredActual = !!(storedActual && typeof storedActual === "object" && !Array.isArray(storedActual));
       const fromJob = jobRoot ? extractKpisFromBlock(pickComboBlock(jobRoot, label, idx, c.id)) : null;
-      const actualValues = aliasConfiguredKpis(
-        (fromStored && Object.keys(fromStored).length)
-          ? fromStored
-          : (fromJob && Object.keys(fromJob).length ? fromJob : {}),
-        kpiTolerances,
-      );
-      const hasActual = Object.keys(actualValues).length > 0;
+      const actualValues = hasStoredActual
+        ? configuredStoredValues(storedActual, kpiTolerances)
+        : aliasConfiguredKpis(fromJob && Object.keys(fromJob).length ? fromJob : {}, kpiTolerances);
       const expectedValues = row
         ? aliasConfiguredKpis(kpiMapFromStored(row.expected) || {}, kpiTolerances)
         : null;
       const filtersApplied = row?.actual?.filters_applied || null;
-      if (hasActual) pwResult[label] = { ...actualValues, filters_applied: filtersApplied };
+      if (hasStoredActual || Object.keys(actualValues).length) {
+        pwResult[label] = { ...actualValues, filters_applied: filtersApplied };
+      }
       if (expectedValues && Object.keys(expectedValues).length) {
         if (isReferenceMatch) {
           refResult[label] = { ...expectedValues };
@@ -1070,14 +1072,15 @@ export default function ScenarioDetail() {
       }
     }
     return {
-      runResult: Object.keys(pwResult).length ? { result: pwResult } : (jobRoot ? lastPwJob?.last_event : null),
+      hasStoredRow,
+      runResult: Object.keys(pwResult).length ? { result: pwResult } : null,
       refRunResult: Object.keys(refResult).length ? { result: refResult } : null,
       comboResults: comboMap,
     };
   })();
   const effectiveRunResult = (runResult && (liveComboHasKpis || manualActual))
     ? runResult
-    : (suiteRunData?.runResult || runResult || lastPwJob?.last_event || null);
+    : (suiteRunData?.runResult || runResult || (suiteRunData?.hasStoredRow ? null : lastPwJob?.last_event) || null);
   const effectiveRefRunResult = refRunResult || suiteRunData?.refRunResult || null;
   const effectiveComboResults = (Object.keys(comboResults).length ? comboResults : (suiteRunData?.comboResults || {}));
 
@@ -2493,6 +2496,7 @@ const KPI_SKIP_KEYS = new Set([
   "filters_applied", "nbrx_elements_found", "extraction_error", "raw_value", "raw_extraction",
   "screenshot", "screenshot_b64", "screenshot_url", "error", "ok", "note",
   "title", "url", "result", "extracted", "report_url", "debug", "page_snapshot",
+  "provider", "screenshot_b64", "live_url", "requested_mode", "fallback_reason",
 ]);
 
 /** Playwright / a11y locator fields — not KPI numbers. */
@@ -2878,6 +2882,22 @@ function aliasConfiguredKpis(values: Record<string, any>, tolerances?: Record<st
   );
 }
 
+/** Keep explicit nulls from a stored values map. Dropping them made Latest result
+ *  fall through to a different execution that still had physician data. */
+function configuredStoredValues(values: Record<string, any>, tolerances?: Record<string, Tolerance>): Record<string, any> {
+  const configured = Object.keys(tolerances || {}).filter((k) => !isKpiNoiseKey(k));
+  const names = configured.length
+    ? configured
+    : Object.keys(values || {}).filter((k) => k && !isKpiNoiseKey(k));
+  const out: Record<string, any> = {};
+  for (const name of names) {
+    const resolved = resolveKpiValue(name, values || {});
+    if (resolved !== undefined) out[name] = resolved;
+    else out[name] = null;
+  }
+  return out;
+}
+
 /** KPI_LABELS from a generated Playwright script (source of truth for what was scraped). */
 function parseKpiLabelsFromPlaywright(code?: string | null): string[] {
   if (!code) return [];
@@ -3241,10 +3261,10 @@ async function persistManualHeadlessRun(opts: {
       if (!Object.keys(values).length) values = extractKpisFromRun(payload) || {};
       values = attachTrendFields(values, block, payload, payload?.extracted, payload?.extracted?.result);
       values = aliasConfiguredKpis(values, tolerances);
-      const expectedValues = resolveExpectedValues({
+      const expectedValues = aliasConfiguredKpis(resolveExpectedValues({
         label, idx: i, comboId: c.id, actualKeys: Object.keys(values),
         isReferenceMatch, referencePayload, storedRows, sqlByCombo, sqlResult,
-      });
+      }), tolerances);
       const status = statusFromKpis(values, expectedValues, tolerances, scrapeFailed);
       rows.push({
         run_id: run.id,
@@ -3273,10 +3293,10 @@ async function persistManualHeadlessRun(opts: {
       attachTrendFields(extractKpisFromRun(payload) || {}, payload, payload?.extracted, payload?.extracted?.result),
       tolerances,
     );
-    const expectedValues = resolveExpectedValues({
+    const expectedValues = aliasConfiguredKpis(resolveExpectedValues({
       label: "", idx: 0, actualKeys: Object.keys(values),
       isReferenceMatch, referencePayload, storedRows, sqlByCombo, sqlResult,
-    });
+    }), tolerances);
     const status = statusFromKpis(values, expectedValues, tolerances, scrapeFailed);
     rows.push({
       run_id: run.id,
