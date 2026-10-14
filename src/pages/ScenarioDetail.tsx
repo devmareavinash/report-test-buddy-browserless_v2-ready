@@ -36,15 +36,18 @@ const canonFilters = (f: Record<string, string>) => {
   return JSON.stringify(keys.map((k) => [k, String((f as any)[k] ?? "").trim()]));
 };
 
-function invalidateLatestStatusViews(qc: QueryClient, scenarioId: string, reportId?: string) {
-  qc.invalidateQueries({ queryKey: ["scenario-results", scenarioId] });
-  qc.invalidateQueries({ queryKey: ["scenario-latest-state", scenarioId] });
-  qc.invalidateQueries({ queryKey: ["tests-overview"] });
-  qc.invalidateQueries({ queryKey: ["dashboard-scenarios"] });
-  qc.invalidateQueries({ queryKey: ["scenarios-pivot"] });
-  qc.invalidateQueries({ queryKey: ["report-status-map"] });
-  qc.invalidateQueries({ queryKey: ["runs"] });
-  if (reportId) qc.invalidateQueries({ queryKey: ["runs-report", reportId] });
+async function invalidateLatestStatusViews(qc: QueryClient, scenarioId: string, reportId?: string) {
+  const invalidations = [
+    qc.invalidateQueries({ queryKey: ["scenario-results", scenarioId], refetchType: "active" }),
+    qc.invalidateQueries({ queryKey: ["scenario-latest-state", scenarioId], refetchType: "active" }),
+    qc.invalidateQueries({ queryKey: ["tests-overview"] }),
+    qc.invalidateQueries({ queryKey: ["dashboard-scenarios"] }),
+    qc.invalidateQueries({ queryKey: ["scenarios-pivot"] }),
+    qc.invalidateQueries({ queryKey: ["report-status-map"] }),
+    qc.invalidateQueries({ queryKey: ["runs"] }),
+  ];
+  if (reportId) invalidations.push(qc.invalidateQueries({ queryKey: ["runs-report", reportId] }));
+  await Promise.all(invalidations);
 }
 
 export default function ScenarioDetail() {
@@ -750,16 +753,17 @@ export default function ScenarioDetail() {
       setSqlResult(data);
       if (data?.ok) {
         toast.success(`${data.source === "snowflake" ? "Snowflake" : "Mock"}: ${data.row_count} row(s)`);
-        void persistWarehouseExpected({
+        const persisted = await persistWarehouseExpected({
           scenarioId: id!,
           reportId: (scenario as any)?.reports?.id,
           combos: combos || [],
           sqlByCombo: comboResults,
           sqlResult: data,
           tolerances: kpiTolerances,
-        }).then((ok) => {
-          if (ok) invalidateLatestStatusViews(qc, id!, (scenario as any)?.reports?.id);
         });
+        if (persisted) {
+          await invalidateLatestStatusViews(qc, id!, (scenario as any)?.reports?.id);
+        }
       } else toast.error(data?.error || "SQL failed");
     } catch (e: any) {
       setSqlResult({ ok: false, error: e?.message || "SQL run failed" });
@@ -839,16 +843,17 @@ export default function ScenarioDetail() {
       setComboResults(nextCombo);
       if (data?.ok) {
         toast.success(`${combo.label || "Combination"}: ${data.row_count} row(s)`);
-        void persistWarehouseExpected({
+        const persisted = await persistWarehouseExpected({
           scenarioId: id!,
           reportId: (scenario as any)?.reports?.id,
           combos: combos || [],
           sqlByCombo: nextCombo,
           sqlResult: data,
           tolerances: kpiTolerances,
-        }).then((ok) => {
-          if (ok) invalidateLatestStatusViews(qc, id!, (scenario as any)?.reports?.id);
         });
+        if (persisted) {
+          await invalidateLatestStatusViews(qc, id!, (scenario as any)?.reports?.id);
+        }
       } else toast.error(data?.error || "SQL failed");
     } catch (e: any) {
       setComboResults((prev) => ({ ...prev, [combo.id]: { ok: false, error: e?.message || "SQL failed", where_clause: where } }));

@@ -34,7 +34,8 @@ ENV HTTP_PROXY=$HTTP_PROXY \
 COPY supabase/functions ./functions
 COPY backend/server.ts  ./server.ts
 COPY backend/docker-entrypoint.sh ./docker-entrypoint.sh
-RUN chmod +x ./docker-entrypoint.sh
+# Strip Windows CRLF line endings (prevents "exec ./docker-entrypoint.sh: no such file or directory")
+RUN sed -i 's/\r$//' ./docker-entrypoint.sh && chmod +x ./docker-entrypoint.sh
 
 # Pre-cache all function deps at build time.
 # --unsafely-ignore-certificate-errors: Bayer SSL inspection breaks Deno's Mozilla CA store.
@@ -54,4 +55,3 @@ ENV HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy=
 HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://localhost:8000/healthz || exit 1
 
 ENTRYPOINT ["./docker-entrypoint.sh"]
-
