@@ -31,20 +31,22 @@ function jwtExpMs(token: string): number | null {
   }
 }
 
-async function authHeaders(forceRefresh = false) {
+async function authHeaders(forLongRun = false) {
   let { data } = await supabase.auth.getSession();
   let token = data.session?.access_token || "";
   const expMs = token ? jwtExpMs(token) : null;
-  if (token && (forceRefresh || (expMs != null && expMs < Date.now() + 60_000))) {
+  const tokenNeedsRefresh = !!token && expMs != null && expMs < Date.now() + 60_000;
+  if (tokenNeedsRefresh) {
     try {
       const refreshed = await supabase.auth.refreshSession();
       if (refreshed.data.session?.access_token) {
         token = refreshed.data.session.access_token;
-      } else if (forceRefresh) {
+        data = refreshed.data;
+      } else if (!token || (expMs != null && expMs <= Date.now())) {
         throw new Error("Session refresh returned no access token");
       }
     } catch (error) {
-      if (forceRefresh) {
+      if (!token || (expMs != null && expMs <= Date.now())) {
         throw new Error(
           `Could not refresh the login session before starting the run: ${
             error instanceof Error ? error.message : String(error)
@@ -56,7 +58,9 @@ async function authHeaders(forceRefresh = false) {
     }
   }
   // Long runs on our own server refresh the sign-in with this token (kept in memory only).
-  const refreshToken = forceRefresh && import.meta.env.VITE_RUN_SESSION_REFRESH === "true" ? (await supabase.auth.getSession()).data.session?.refresh_token : undefined;
+  const refreshToken = forLongRun && import.meta.env.VITE_RUN_SESSION_REFRESH === "true"
+    ? (data.session?.refresh_token || (await supabase.auth.getSession()).data.session?.refresh_token)
+    : undefined;
   token = token || publishableKey || "";
   return {
     ...(refreshToken ? { "X-Refresh-Token": refreshToken } : {}),

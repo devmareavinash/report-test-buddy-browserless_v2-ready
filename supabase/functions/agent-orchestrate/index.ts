@@ -188,14 +188,6 @@ async function findActiveRunConflict(
   const candidates = (active || []).filter((run: any) => run.id !== excludeRunId);
   if (!candidates.length) return null;
 
-  // Browserless is a shared local resource. Even different brands compete for
-  // the same Chromium capacity, and PCC dossiers return slow HTTP-200/empty
-  // payloads under that load. Admit only one top-level execution globally.
-  // Child report invocations reuse existing_run_id and never enter this guard.
-  const activeWorkstream = candidates.find((run: any) => run.scope_type === "workstream");
-  if (activeWorkstream) return activeWorkstream;
-  if (scopeType === "workstream") return candidates[0];
-
   let reportId: string | null = null;
   let workstreamId: string | null = null;
   if (scopeType === "scenario") {

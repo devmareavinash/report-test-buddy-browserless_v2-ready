@@ -129,12 +129,12 @@ describe("record-count extraction contract", () => {
     expect(orchestrator).toContain("const childConcurrency = 1;");
   });
 
-  it("prevents separate brand runs from competing for Browserless", () => {
+  it("allows different brand runs while rejecting overlapping work in the same brand", () => {
     const orchestrator = readFileSync(orchestratorPath, "utf8");
 
-    expect(orchestrator).toContain("const activeWorkstream = candidates.find");
-    expect(orchestrator).toContain("if (activeWorkstream) return activeWorkstream;");
-    expect(orchestrator).toContain('if (scopeType === "workstream") return candidates[0];');
+    expect(orchestrator).not.toContain("const activeWorkstream = candidates.find");
+    expect(orchestrator).toContain("run.scope_id === workstreamId");
+    expect(orchestrator).toContain("reportWorkstream.get(activeReportId) === workstreamId");
   });
 
   it("persists a warehouse grid under its configured KPI instead of extractor metadata", () => {
