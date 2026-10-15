@@ -12,6 +12,7 @@ import { deriveStoredResultStatus } from "@/lib/kpi-values";
 import { Button } from "@/components/ui/button";
 import { XCircle, Trash2 } from "lucide-react";
 import { toast } from "@/hooks/use-toast";
+import { pickCanonicalScript } from "@/lib/canonicalScript";
 
 
 export default function RunDetail() {
@@ -104,6 +105,36 @@ export default function RunDetail() {
     return [...(results || []), ...stubs];
   }, [results, scopeScenarios, id, run, isRunning]);
 
+  const scenarioIds = useMemo(
+    () => Array.from(new Set((merged || []).map((result: any) => result.scenario_id).filter(Boolean))),
+    [merged],
+  );
+  const { data: assertionSpecs } = useQuery({
+    queryKey: ["run-assertion-specs", id, scenarioIds.join(",")],
+    enabled: scenarioIds.length > 0,
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from("scripts")
+        .select("scenario_id, assertion_spec, playwright_code, created_at")
+        .in("scenario_id", scenarioIds);
+      if (error) throw error;
+      const rowsByScenario = new Map<string, any[]>();
+      for (const row of data || []) {
+        const rows = rowsByScenario.get((row as any).scenario_id) || [];
+        rows.push(row);
+        rowsByScenario.set((row as any).scenario_id, rows);
+      }
+      return Object.fromEntries(
+        Array.from(rowsByScenario, ([scenarioId, rows]) => [
+          scenarioId,
+          (pickCanonicalScript(rows) as any)?.assertion_spec,
+        ]),
+      ) as Record<string, any>;
+    },
+    staleTime: 0,
+    refetchOnMount: "always",
+  });
+
   const workstreams = useMemo(() => {
     const m = new Map<string, string>();
     for (const r of merged || []) {
@@ -130,13 +161,14 @@ export default function RunDetail() {
       const derivedStatus = deriveStoredResultStatus({
         actual: r.actual,
         expected: r.expected,
+        spec: assertionSpecs?.[r.scenario_id],
         scenarioType: r.scenarios?.type,
         diff: r.diff,
         fallbackStatus: r.status,
       });
       return { ...r, derivedStatus };
     });
-  }, [merged]);
+  }, [merged, assertionSpecs]);
 
   const filtered = useMemo(() => {
     const q = search.toLowerCase().trim();

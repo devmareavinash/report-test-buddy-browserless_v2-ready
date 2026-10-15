@@ -122,10 +122,10 @@ describe("record-count extraction contract", () => {
     expect(orchestrator).toContain("cols.map((column) => row?.[column] ?? null)");
   });
 
-  it("serializes Browserless work across a full brand run", () => {
+  it("uses requested concurrency for screens while serializing each screen's scenarios", () => {
     const orchestrator = readFileSync(orchestratorPath, "utf8");
 
-    expect(orchestrator).toContain("const reportConcurrency = 1;");
+    expect(orchestrator).toContain("const reportConcurrency = concurrency;");
     expect(orchestrator).toContain("const childConcurrency = 1;");
   });
 

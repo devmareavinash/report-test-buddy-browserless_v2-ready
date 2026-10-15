@@ -757,12 +757,10 @@ Deno.serve(async (req) => {
 
     if (!existing_run_id && scope_type === "workstream") {
       const dispatch = async () => {
-        // PCC and customer dossiers are stable in isolated case runs but can
-        // return an HTTP-200/empty payload when several Browserless jobs compete
-        // for Chromium resources. Keep a workstream's browser work serial. Long
-        // runs no longer depend on the starting caller JWT, so correctness takes
-        // priority over report-level parallelism here.
-        const reportConcurrency = 1;
+        // For workstream runs, the requested concurrency controls how many
+        // reports/screens run at once. Keep each child report serial so the
+        // total Browserless pressure remains bounded by that setting.
+        const reportConcurrency = concurrency;
         const childConcurrency = 1;
         await mapPool(reportIds, reportConcurrency, async (rid) => {
           try {

@@ -32,6 +32,8 @@ export default function Runs() {
     queryKey: ["all-runs"],
     queryFn: async () =>
       (await supabase.from("runs").select("*").order("started_at", { ascending: false }).limit(200)).data ?? [],
+    refetchInterval: (query) =>
+      ((query.state.data as any[]) || []).some((run: any) => run.status === "running") ? 3000 : false,
     staleTime: 0,
     refetchOnMount: "always",
   });
