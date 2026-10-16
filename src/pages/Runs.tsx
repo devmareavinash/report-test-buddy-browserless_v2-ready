@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { AppLayout } from "@/components/AppLayout";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Link, useSearchParams } from "react-router-dom";
 import { StatusChip } from "@/components/StatusChip";
 import { Input } from "@/components/ui/input";
@@ -172,6 +172,9 @@ export default function Runs() {
         </div>
 
         <div className="flex gap-2 flex-wrap items-center mb-4">
+          <div className="rounded-md border bg-muted/40 px-3 py-2 text-xs font-semibold text-foreground mono">
+            {filtered.length} runs
+          </div>
           <Input
             placeholder="Search id, workstream, report, trigger…"
             value={search}
@@ -206,11 +209,9 @@ export default function Runs() {
               <SelectItem value="cancelled">Cancelled</SelectItem>
             </SelectContent>
           </Select>
-          <div className="text-xs text-muted-foreground mono ml-auto">{filtered.length} runs</div>
         </div>
 
         <Card>
-          <CardHeader><CardTitle>{filtered.length} runs</CardTitle></CardHeader>
           <CardContent className="space-y-1">
             {filtered.map((r: any) => {
               const m = runMeta?.[r.id];

@@ -254,7 +254,7 @@ export default function Scenarios() {
         </div>
 
         <div className="flex gap-2 flex-wrap items-center">
-          <div className="rounded-md border bg-muted/40 px-3 py-2 text-xs font-medium text-muted-foreground mono">
+          <div className="rounded-md border bg-muted/40 px-3 py-2 text-xs font-semibold text-foreground mono">
             {filtered.length} scenarios
           </div>
           <Input
