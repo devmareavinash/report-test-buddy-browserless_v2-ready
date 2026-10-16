@@ -129,16 +129,19 @@ export default function Dashboard() {
     <AppLayout>
       <div className="p-8 space-y-6">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Dashboard</h1>
+          <h1 className="text-2xl font-bold italic tracking-tight">Dashboard</h1>
           <p className="text-sm text-muted-foreground">Latest status across all test scenarios.</p>
         </div>
 
         <div className="flex gap-2 flex-wrap items-center">
+          <div className="rounded-md border bg-muted/40 px-3 py-2 text-xs font-semibold text-foreground mono">
+            {all.length} scenarios
+          </div>
           <Input
             placeholder="Search scenario, report, workstream, analysis…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            className="max-w-sm"
+            className="max-w-sm font-semibold placeholder:font-semibold"
           />
           <Select value={wsId} onValueChange={(v) => { setWsId(v); setReportId("all"); }}>
             <SelectTrigger className="w-48"><SelectValue /></SelectTrigger>
@@ -163,12 +166,10 @@ export default function Dashboard() {
               <SelectItem value="low">Low</SelectItem>
             </SelectContent>
           </Select>
-          <div className="text-xs text-muted-foreground mono ml-auto">{all.length} scenarios</div>
         </div>
 
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <Stat label="Total scenarios" value={all.length} linkTo="/scenarios" />
-          <Stat label="Cases ran" value={ran.length} linkTo="/scenarios?status=ran" />
+          <Stat label="Total scenarios" value={all.length} tone="info" linkTo="/scenarios" />
           <Stat
             label="Passed"
             value={passed.length}
@@ -181,6 +182,7 @@ export default function Dashboard() {
             tone="destructive"
             linkTo="/scenarios?status=fail"
           />
+          <Stat label="Cases ran" value={ran.length} tone="neutral" linkTo="/scenarios?status=ran" />
         </div>
 
         <Card>
@@ -235,10 +237,10 @@ function WorkstreamRow({ ws, rows, lastRunByReport }: { ws: any; rows: Row[]; la
           <div className="text-xs text-muted-foreground mono">{reports.length} reports · {ws.total} scenarios</div>
         </div>
         <div className="flex gap-3 text-sm">
-          <Link to={`/scenarios?status=pass&workstream_id=${ws.id}`} className="text-success hover:underline">
+          <Link to={`/scenarios?status=pass&workstream_id=${ws.id}`} className="font-bold text-success hover:underline">
             {ws.pass} passed
           </Link>
-          <Link to={`/scenarios?status=fail&workstream_id=${ws.id}`} className="text-destructive hover:underline">
+          <Link to={`/scenarios?status=fail&workstream_id=${ws.id}`} className="font-bold text-destructive hover:underline">
             {ws.fail} failed
           </Link>
         </div>
@@ -287,15 +289,18 @@ function Stat({
   linkTo?: string;
 }) {
   const c: Record<string, string> = {
-    success: "text-success",
-    destructive: "text-destructive",
+    success: "text-green-700",
+    destructive: "text-red-700",
     warning: "text-warning",
+    info: "text-blue-700",
+    neutral: "text-foreground",
   };
+  const toneClass = c[tone || ""] || "text-foreground";
   const inner = (
-    <Card className={linkTo ? "hover:border-accent/50 transition-colors cursor-pointer" : ""}>
+    <Card className={`border-2 ${linkTo ? "hover:border-accent/50 transition-colors cursor-pointer" : ""}`}>
       <CardContent className="pt-6">
-        <div className="text-xs text-muted-foreground uppercase tracking-wide mono">{label}</div>
-        <div className={`text-3xl font-semibold mt-1 ${c[tone || ""] || ""}`}>{value}</div>
+        <div className={`text-xs font-bold uppercase tracking-wide mono ${toneClass}`}>{label}</div>
+        <div className={`text-3xl font-bold mt-1 ${toneClass}`}>{value}</div>
       </CardContent>
     </Card>
   );

@@ -168,7 +168,7 @@ export default function Runs() {
     <AppLayout>
       <div className="p-8">
         <div className="flex items-center justify-between mb-4">
-          <h1 className="text-2xl font-semibold">Runs</h1>
+          <h1 className="text-2xl font-bold italic">Runs</h1>
         </div>
 
         <div className="flex gap-2 flex-wrap items-center mb-4">
@@ -179,7 +179,7 @@ export default function Runs() {
             placeholder="Search id, workstream, report, trigger…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            className="max-w-sm"
+            className="max-w-sm font-semibold placeholder:font-semibold"
           />
           <Select value={wsId} onValueChange={(v) => { setWsId(v); setReportId("all"); }}>
             <SelectTrigger className="w-48"><SelectValue /></SelectTrigger>
@@ -212,7 +212,16 @@ export default function Runs() {
         </div>
 
         <Card>
-          <CardContent className="space-y-1">
+          <CardContent className="space-y-1 overflow-x-auto p-0">
+            <div className="grid min-w-[850px] grid-cols-[90px_minmax(180px,1fr)_90px_140px_190px_110px_28px] items-center gap-3 rounded-t-xl border-b bg-slate-100 px-3 py-3 text-xs font-bold text-slate-600 dark:bg-slate-800 dark:text-slate-200">
+              <span>Run ID</span>
+              <span>Description</span>
+              <span>Checks</span>
+              <span>Run Type</span>
+              <span>Date &amp; Time</span>
+              <span>Status</span>
+              <span aria-hidden="true" />
+            </div>
             {filtered.map((r: any) => {
               const m = runMeta?.[r.id];
               const counts = caseCounts(r);
@@ -233,10 +242,10 @@ export default function Runs() {
                 <Link
                   key={r.id}
                   to={`/runs/${r.id}`}
-                  className="flex items-center justify-between hover:bg-secondary/40 rounded px-2 py-2 text-sm gap-3"
+                  className="grid min-w-[850px] grid-cols-[90px_minmax(180px,1fr)_90px_140px_190px_110px_28px] items-center gap-3 hover:bg-secondary/40 rounded px-2 py-2 text-sm"
                 >
                   <span className="mono text-xs">{r.id.slice(0, 8)}</span>
-                  <span className="text-xs text-muted-foreground flex-1 min-w-0 truncate">
+                  <span className="text-xs text-muted-foreground min-w-0 truncate">
                     {labels || r.scope_type}
                   </span>
                   <span className="text-xs whitespace-nowrap flex items-center gap-1">
@@ -291,7 +300,7 @@ export default function Runs() {
                 </Link>
               );
             })}
-            {!filtered.length && <div className="text-sm text-muted-foreground">No runs match.</div>}
+            {!filtered.length && <div className="p-4 text-sm text-muted-foreground">No runs match.</div>}
           </CardContent>
         </Card>
       </div>

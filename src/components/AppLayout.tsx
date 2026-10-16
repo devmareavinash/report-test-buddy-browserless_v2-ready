@@ -16,11 +16,11 @@ export const AppLayout = ({ children }: { children: ReactNode }) => {
             <div className="text-sm font-semibold tracking-tight leading-tight">Agentic Frontend<br/>Validations</div>
           </div>
         </div>
-        <NavLink to="/" icon={<Activity className="h-4 w-4" />}>Dashboard</NavLink>
-        <NavLink to="/reports" icon={<FileText className="h-4 w-4" />}>Screens</NavLink>
-        <NavLink to="/scenarios" icon={<FlaskConical className="h-4 w-4" />}>Tests execution status</NavLink>
-        <NavLink to="/runs" icon={<Bug className="h-4 w-4" />}>Runs</NavLink>
-        <NavLink to="/sql-templates" icon={<Database className="h-4 w-4" />}>SQL templates</NavLink>
+        <NavLink to="/" icon={<Activity className="h-4 w-4" />}><span className="font-semibold">Dashboard</span></NavLink>
+        <NavLink to="/reports" icon={<FileText className="h-4 w-4" />}><span className="font-semibold">Screens</span></NavLink>
+        <NavLink to="/scenarios" icon={<FlaskConical className="h-4 w-4" />}><span className="font-semibold">Tests execution status</span></NavLink>
+        <NavLink to="/runs" icon={<Bug className="h-4 w-4" />}><span className="font-semibold">Runs</span></NavLink>
+        <NavLink to="/sql-templates" icon={<Database className="h-4 w-4" />}><span className="font-semibold">SQL templates</span></NavLink>
         <div className="mt-auto space-y-1">
           {user && (
             <div className="px-3 py-2 text-xs text-muted-foreground truncate" title={user.email || ""}>

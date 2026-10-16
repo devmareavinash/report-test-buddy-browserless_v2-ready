@@ -102,7 +102,7 @@ export default function Reports() {
       <div className="p-8 space-y-6">
         <div className="flex items-start justify-between">
           <div>
-            <h1 className="text-2xl font-semibold">Screens</h1>
+            <h1 className="text-2xl font-bold italic">Screens</h1>
             <p className="text-sm text-muted-foreground">Report → Screen. Run a full suite at any level.</p>
           </div>
           <NewReportDialog tree={tree} />
@@ -116,7 +116,7 @@ export default function Reports() {
             placeholder="Search screens by name or URL…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            className="max-w-sm"
+            className="max-w-sm font-semibold placeholder:font-semibold"
           />
           <Select value={wsId} onValueChange={setWsId}>
             <SelectTrigger className="w-56"><SelectValue /></SelectTrigger>
@@ -131,6 +131,7 @@ export default function Reports() {
           <Button
             size="sm"
             variant="outline"
+            className="border-green-300 bg-green-100 text-green-800 hover:bg-green-200"
             disabled={exporting}
             onClick={async () => {
               setExporting(true);

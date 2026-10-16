@@ -48,7 +48,7 @@ export function ConcurrencySelect({
 }) {
   return (
     <Select value={String(value)} onValueChange={(v) => onChange(Number(v))} disabled={disabled}>
-      <SelectTrigger className={unit === "scenarios" ? "w-[11rem] h-9" : "w-[8.5rem] h-9"} title={unitTitle(unit)}>
+      <SelectTrigger className="w-[12.5rem] h-9 whitespace-nowrap" title={unitTitle(unit)}>
         <SelectValue />
       </SelectTrigger>
       <SelectContent>

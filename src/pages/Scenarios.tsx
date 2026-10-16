@@ -244,7 +244,7 @@ export default function Scenarios() {
       <div className="p-8 space-y-4">
         <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-2xl font-semibold tracking-tight">
+            <h1 className="text-2xl font-bold italic tracking-tight">
               {deferred ? "Deferred scenarios" : "Tests execution status"}
             </h1>
             <p className="text-sm text-muted-foreground">
@@ -261,7 +261,7 @@ export default function Scenarios() {
             placeholder="Search title, report, workstream, analysis…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            className="max-w-sm"
+            className="max-w-sm font-semibold placeholder:font-semibold"
           />
           <Select value={wsId} onValueChange={setWsId}>
             <SelectTrigger className="w-48"><SelectValue /></SelectTrigger>

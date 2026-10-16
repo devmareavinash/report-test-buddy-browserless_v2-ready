@@ -38,13 +38,13 @@ export default function Profile() {
 
   return (
     <AppLayout>
-      <div className="p-8 max-w-2xl space-y-6">
-        <div>
+      <div className="w-full max-w-2xl mx-auto p-8 space-y-6">
+        <div className="text-center">
           <h1 className="text-2xl font-semibold">Profile</h1>
           <p className="text-sm text-muted-foreground">Your account and password.</p>
         </div>
 
-        <Card>
+        <Card className="shadow-sm">
           <CardHeader><CardTitle className="text-base">Account</CardTitle></CardHeader>
           <CardContent className="space-y-2 text-sm">
             <div><span className="text-muted-foreground">Email:</span> {user?.email}</div>
@@ -54,7 +54,7 @@ export default function Profile() {
           </CardContent>
         </Card>
 
-        <Card>
+        <Card className="shadow-sm">
           <CardHeader><CardTitle className="text-base">Appearance</CardTitle></CardHeader>
           <CardContent>
             <div className="flex items-center justify-between">
@@ -74,7 +74,7 @@ export default function Profile() {
           </CardContent>
         </Card>
 
-        <Card>
+        <Card className="shadow-sm">
           <CardHeader><CardTitle className="text-base">Change password</CardTitle></CardHeader>
           <CardContent>
             <form onSubmit={updatePassword} className="space-y-3">

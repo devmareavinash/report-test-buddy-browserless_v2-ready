@@ -155,7 +155,7 @@ export default function SqlTemplates() {
   return (
     <AppLayout>
       <div className="p-8 space-y-6">
-        <h1 className="text-2xl font-semibold">SQL Templates</h1>
+        <h1 className="text-2xl font-bold italic">SQL Templates</h1>
         <SqlTemplatesContent />
       </div>
     </AppLayout>

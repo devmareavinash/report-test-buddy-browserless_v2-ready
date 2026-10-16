@@ -42,7 +42,6 @@ export function ScenarioResultCard({
   results,
   comboPairs,
   defaultOpen = false,
-  showRunLink = true,
   rightSlot,
   onChanged,
 }: Props) {
@@ -201,13 +200,10 @@ export function ScenarioResultCard({
             {runLogIsRca ? "RCA: " : "Log: "}{runLog}
           </div>
         )}
-        <div className="text-xs text-muted-foreground mono whitespace-nowrap">
-          {l?.created_at ? new Date(l.created_at).toLocaleString() : "never run"}
-        </div>
-        {showRunLink && l?.run_id && (
-          <Link to={`/runs/${l.run_id}`} className="text-xs text-accent hover:underline">
-            run →
-          </Link>
+        {l?.created_at && (
+          <div className="text-xs text-muted-foreground mono whitespace-nowrap">
+            {new Date(l.created_at).toLocaleString()}
+          </div>
         )}
         <Button
           size="sm"
