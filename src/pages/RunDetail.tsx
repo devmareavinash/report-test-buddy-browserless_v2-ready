@@ -14,6 +14,21 @@ import { XCircle, Trash2 } from "lucide-react";
 import { toast } from "@/hooks/use-toast";
 import { pickCanonicalScript } from "@/lib/canonicalScript";
 
+function formatRunDuration(startedAt?: string | null, finishedAt?: string | null) {
+  if (!startedAt) return "—";
+  const start = new Date(startedAt).getTime();
+  const end = finishedAt ? new Date(finishedAt).getTime() : Date.now();
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return "—";
+  const totalSeconds = Math.max(0, Math.floor((end - start) / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return [
+    hours ? `${hours}h` : "",
+    minutes || hours ? `${minutes}m` : "",
+    `${seconds}s`,
+  ].filter(Boolean).join(" ");
+}
 
 export default function RunDetail() {
   const { id } = useParams();
@@ -192,36 +207,26 @@ export default function RunDetail() {
   }, [withDerivedStatus, search, status, wsId, reportId, criticality]);
 
   const counts = useMemo(() => {
-    let pass = 0, fail = 0, pending = 0;
+    const byScenario = new Map<string, "pass" | "fail" | "pending">();
     for (const r of withDerivedStatus || []) {
-      if (r.derivedStatus === "pass") pass++;
-      else if (r.derivedStatus === "fail") fail++;
+      const previous = byScenario.get(r.scenario_id);
+      const next = r.derivedStatus as "pass" | "fail" | "pending";
+      if (previous === "fail" || next === "fail") byScenario.set(r.scenario_id, "fail");
+      else if (previous === "pending" || next === "pending") byScenario.set(r.scenario_id, "pending");
+      else byScenario.set(r.scenario_id, "pass");
+    }
+    let pass = 0, fail = 0, pending = 0;
+    for (const result of byScenario.values()) {
+      if (result === "pass") pass++;
+      else if (result === "fail") fail++;
       else pending++;
     }
     return { pass, fail, pending };
   }, [withDerivedStatus]);
   const storedSummary = (run as any)?.summary || {};
-  const hasFinalSummary =
-    !isRunning &&
-    Number.isFinite(Number(storedSummary.pass)) &&
-    Number.isFinite(Number(storedSummary.fail)) &&
-    Number(storedSummary.total) > 0;
-  // While executing, derived rows provide live progress. Once finalized, the
-  // persisted run status/summary are authoritative and must match the Runs
-  // list. A historical KPI that currently derives as pending must never turn a
-  // completed run back into "running".
-  const displayedCounts = hasFinalSummary
-    ? {
-        pass: Number(storedSummary.pass),
-        fail: Number(storedSummary.fail),
-        pending: Math.max(
-          0,
-          Number(storedSummary.total) -
-            Number(storedSummary.pass) -
-            Number(storedSummary.fail),
-        ),
-      }
-    : counts;
+  // Header totals are case/scenario totals. Filter combinations remain visible
+  // inside each case card but do not inflate the run counters.
+  const displayedCounts = counts;
   const displayedRunStatus = run?.status;
   const reportOutcomes: Record<string, any> = storedSummary.reports || {};
   const failedReportIds = Object.keys(reportOutcomes).filter((rid) => reportOutcomes[rid]?.status === "error");
@@ -243,14 +248,24 @@ export default function RunDetail() {
               Run <span className="mono text-base text-muted-foreground">{id?.slice(0, 8)}</span>
               {displayedRunStatus && <StatusChip status={displayedRunStatus} />}
             </h1>
-            <div className="text-sm mt-1 flex flex-wrap items-center gap-1">
-              <span className="text-emerald-600 dark:text-emerald-400 font-medium">
+            <div className="text-sm mt-1 flex flex-wrap items-center gap-1.5">
+              <span className="rounded border border-border bg-secondary/40 px-2 py-0.5 text-foreground font-medium">
+                Total cases: {displayedCounts.pass + displayedCounts.fail + displayedCounts.pending}
+              </span>
+              <span className="rounded border border-emerald-500/30 bg-emerald-500/15 px-2 py-0.5 text-emerald-600 dark:text-emerald-400 font-medium">
                 {displayedCounts.pass} passed
               </span>
-              <span className="text-muted-foreground">·</span>
-              <span className="text-destructive font-medium">{displayedCounts.fail} failed</span>
-              <span className="text-muted-foreground">
-                · {displayedCounts.pending} pending · trigger {run?.trigger_source}
+              <span className="rounded border border-destructive/30 bg-destructive/15 px-2 py-0.5 text-destructive font-medium">
+                {displayedCounts.fail} failed
+              </span>
+              <span className="rounded border border-slate-300 bg-slate-100 px-2 py-0.5 text-slate-600 dark:border-slate-600 dark:bg-slate-700/30 dark:text-slate-300 font-medium">
+                {displayedCounts.pending} pending
+              </span>
+              <span className="rounded border border-amber-400/50 bg-amber-100 px-2 py-0.5 text-amber-800 dark:bg-amber-400/15 dark:text-amber-200 font-medium">
+                {isRunning ? "Elapsed" : "Duration"}: {formatRunDuration(
+                  (run as any)?.started_at,
+                  (run as any)?.finished_at,
+                )}
               </span>
             </div>
           </div>
@@ -384,7 +399,6 @@ export default function RunDetail() {
               <SelectItem value="low">Low</SelectItem>
             </SelectContent>
           </Select>
-          <div className="text-xs text-muted-foreground mono ml-auto">{filtered.length} results</div>
         </div>
 
         <Card>

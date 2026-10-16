@@ -109,6 +109,9 @@ export default function Reports() {
         </div>
 
         <div className="flex gap-2 flex-wrap items-center">
+          <div className="rounded-md border bg-muted/40 px-3 py-2 text-xs font-medium text-muted-foreground mono">
+            {filteredReports.length} screens
+          </div>
           <Input
             placeholder="Search screens by name or URL…"
             value={search}
@@ -145,7 +148,6 @@ export default function Reports() {
             {exporting ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Download className="h-3 w-3 mr-1" />}
             Export Excel
           </Button>
-          <div className="text-xs text-muted-foreground mono ml-auto">{filteredReports.length} screens</div>
         </div>
 
         <div className="space-y-4">

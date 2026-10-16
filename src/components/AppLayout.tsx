@@ -14,7 +14,6 @@ export const AppLayout = ({ children }: { children: ReactNode }) => {
           <img src={logo} alt="Agentic Frontend Validations logo" width={32} height={32} className="h-8 w-8" />
           <div>
             <div className="text-sm font-semibold tracking-tight leading-tight">Agentic Frontend<br/>Validations</div>
-            <div className="text-[10px] text-muted-foreground mono">agentic report QA</div>
           </div>
         </div>
         <NavLink to="/" icon={<Activity className="h-4 w-4" />}>Dashboard</NavLink>

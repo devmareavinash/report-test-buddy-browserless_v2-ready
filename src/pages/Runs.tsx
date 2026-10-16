@@ -27,6 +27,11 @@ export default function Runs() {
     queryFn: async () =>
       (await supabase.from("reports").select("id, name, workstream_id")).data ?? [],
   });
+  const { data: scenarios } = useQuery({
+    queryKey: ["run-count-scenarios"],
+    queryFn: async () =>
+      (await supabase.from("scenarios").select("id, report_id, deferred")).data ?? [],
+  });
 
   const { data: runs } = useQuery({
     queryKey: ["all-runs"],
@@ -44,38 +49,85 @@ export default function Runs() {
     enabled: !!runs?.length,
     staleTime: 0,
     refetchOnMount: "always",
+    refetchInterval: (runs || []).some((run: any) => run.status === "running") ? 3000 : false,
     queryFn: async () => {
       const ids = (runs || []).map((r: any) => r.id);
       const { data } = await supabase
         .from("test_results")
-        .select("run_id, scenarios(reports(id, name, workstream_id, workstreams(id, name)))")
+        .select("run_id, scenario_id, status, scenarios(reports(id, name, workstream_id, workstreams(id, name)))")
         .in("run_id", ids)
         .limit(10000);
-      const map: Record<string, { ws: Set<string>; reports: Set<string>; labels: Set<string> }> = {};
+      const map: Record<string, {
+        ws: Set<string>;
+        reports: Set<string>;
+        labels: Set<string>;
+        cases: Map<string, Array<"pass" | "fail" | "pending">>;
+      }> = {};
       for (const row of data || []) {
         const rep: any = (row as any).scenarios?.reports;
         if (!rep) continue;
-        const m = (map[(row as any).run_id] ||= { ws: new Set(), reports: new Set(), labels: new Set() });
+        const m = (map[(row as any).run_id] ||= {
+          ws: new Set(), reports: new Set(), labels: new Set(), cases: new Map(),
+        });
         if (rep.workstream_id) m.ws.add(rep.workstream_id);
         m.reports.add(rep.id);
         m.labels.add(`${rep.workstreams?.name || ""} / ${rep.name}`.toLowerCase());
+        const scenarioId = String((row as any).scenario_id || "");
+        if (scenarioId) {
+          const statuses = m.cases.get(scenarioId) || [];
+          statuses.push(
+            (row as any).status === "pass" || (row as any).status === "fail"
+              ? (row as any).status
+              : "pending",
+          );
+          m.cases.set(scenarioId, statuses);
+        }
       }
       return map;
     },
   });
 
+  const caseCounts = (run: any) => {
+    const m = runMeta?.[run.id];
+    const caseStatus = new Map<string, "pass" | "fail" | "pending">();
+    for (const [scenarioId, statuses] of m?.cases || []) {
+      caseStatus.set(
+        scenarioId,
+        statuses.includes("fail") ? "fail" : statuses.includes("pending") ? "pending" : "pass",
+      );
+    }
+    const reportIds = run.scope_type === "workstream"
+      ? new Set((reports || []).filter((r: any) => r.workstream_id === run.scope_id).map((r: any) => r.id))
+      : new Set(run.scope_type === "report" ? [run.scope_id] : []);
+    const scopedScenarioIds = run.scope_type === "scenario"
+      ? [run.scope_id]
+      : (scenarios || [])
+          .filter((s: any) => !s.deferred && reportIds.has(s.report_id))
+          .map((s: any) => s.id);
+    for (const scenarioId of scopedScenarioIds) {
+      if (!caseStatus.has(scenarioId)) caseStatus.set(scenarioId, "pending");
+    }
+    let pass = 0, fail = 0, pending = 0;
+    for (const value of caseStatus.values()) {
+      if (value === "pass") pass++;
+      else if (value === "fail") fail++;
+      else pending++;
+    }
+    return { pass, fail, pending, total: caseStatus.size };
+  };
+
   const filtered = useMemo(() => {
     const q = search.toLowerCase().trim();
     return (runs || []).filter((r: any) => {
-      if (status === "fail" && !((r.summary as any)?.fail > 0)) return false;
+      const counts = caseCounts(r);
+      if (status === "fail" && (r.status !== "completed" || counts.fail <= 0)) return false;
       if (status === "pass") {
-        const summary: any = r.summary || {};
-        const total = Number(summary.total || 0);
-        const pending = Number(summary.pending || 0);
-        if (r.status !== "completed" || Number(summary.fail || 0) !== 0 || pending !== 0 || total <= 0) {
+        if (r.status !== "completed" || counts.fail !== 0 || counts.pending !== 0 || counts.total <= 0) {
           return false;
         }
       }
+      if (status === "running" && r.status !== "running") return false;
+      if (status === "cancelled" && r.status !== "cancelled") return false;
       const m = runMeta?.[r.id];
       if (wsId !== "all" && !m?.ws.has(wsId)) return false;
       if (reportId !== "all" && !m?.reports.has(reportId)) return false;
@@ -86,7 +138,7 @@ export default function Runs() {
       for (const lbl of m?.labels || []) if (lbl.includes(q)) return true;
       return false;
     });
-  }, [runs, runMeta, status, wsId, reportId, search]);
+  }, [runs, runMeta, reports, scenarios, status, wsId, reportId, search]);
 
   const setStatus = (s: string | null) => {
     const next = new URLSearchParams(params);
@@ -117,17 +169,6 @@ export default function Runs() {
       <div className="p-8">
         <div className="flex items-center justify-between mb-4">
           <h1 className="text-2xl font-semibold">Runs</h1>
-          <div className="flex gap-1 text-xs">
-            {[["All", null], ["Passing", "pass"], ["Failing", "fail"]].map(([l, v]) => (
-              <button
-                key={l as string}
-                onClick={() => setStatus(v as any)}
-                className={`px-3 py-1.5 rounded border ${status === v ? "border-accent text-accent" : "border-border text-muted-foreground"}`}
-              >
-                {l}
-              </button>
-            ))}
-          </div>
         </div>
 
         <div className="flex gap-2 flex-wrap items-center mb-4">
@@ -155,6 +196,16 @@ export default function Runs() {
               ))}
             </SelectContent>
           </Select>
+          <Select value={status || "all"} onValueChange={(value) => setStatus(value === "all" ? null : value)}>
+            <SelectTrigger className="w-40"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All statuses</SelectItem>
+              <SelectItem value="pass">Passing</SelectItem>
+              <SelectItem value="fail">Failing</SelectItem>
+              <SelectItem value="running">Running</SelectItem>
+              <SelectItem value="cancelled">Cancelled</SelectItem>
+            </SelectContent>
+          </Select>
           <div className="text-xs text-muted-foreground mono ml-auto">{filtered.length} runs</div>
         </div>
 
@@ -163,6 +214,7 @@ export default function Runs() {
           <CardContent className="space-y-1">
             {filtered.map((r: any) => {
               const m = runMeta?.[r.id];
+              const counts = caseCounts(r);
               const reportsById = new Map((reports || []).map((x: any) => [x.id, x]));
               const wsById = new Map((workstreams || []).map((x: any) => [x.id, x]));
               let labels = Array.from(m?.labels || []).slice(0, 2).join(", ");
@@ -188,18 +240,18 @@ export default function Runs() {
                   </span>
                   <span className="text-xs whitespace-nowrap flex items-center gap-1">
                     <span className="text-emerald-600 dark:text-emerald-400 font-medium">
-                      {(r.summary as any)?.pass ?? 0}✓
+                      {counts.pass}✓
                     </span>
                     <span className="text-muted-foreground">/</span>
                     <span className="text-destructive font-medium">
-                      {(r.summary as any)?.fail ?? 0}✗
+                      {counts.fail}✗
                     </span>
                   </span>
                   <span className="text-xs text-muted-foreground whitespace-nowrap">{r.trigger_source}</span>
                   <span className="text-xs text-muted-foreground whitespace-nowrap">
                     {new Date(r.started_at!).toLocaleString()}
                   </span>
-                  <StatusChip status={r.status} />
+                  <StatusChip status={counts.fail > 0 && r.status !== "cancelled" ? "failed" : r.status} />
                   {r.status === "running" ? (
                     <button
                       onClick={async (e) => {

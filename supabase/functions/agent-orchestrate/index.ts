@@ -288,6 +288,16 @@ function preserveScalar(v: any): any {
   return toNum(v);
 }
 
+function isIdentifierKpi(label: string): boolean {
+  return /\b(phone|telephone|mobile|zip|zipcode|zip code|postal|postal code)\b/i.test(label);
+}
+
+function preserveConfiguredScalar(v: any, label: string): any {
+  if (v == null || typeof v === "object") return v;
+  if (isIdentifierKpi(label)) return String(v).trim();
+  return preserveScalar(v);
+}
+
 function normalizeTextScalar(v: any): string {
   return String(v ?? "").replace(/\s+/g, " ").trim().toLowerCase();
 }
@@ -1123,7 +1133,7 @@ Deno.serve(async (req) => {
                   const raw = lookupConfiguredKpiValue(refScraped, lbl, kpiAliases);
                   expectedMap[lbl] = (raw != null && typeof raw === "object")
                     ? raw
-                    : (looksLikeDateValue(raw) ? String(raw).trim() : preserveScalar(raw));
+                    : (looksLikeDateValue(raw) ? String(raw).trim() : preserveConfiguredScalar(raw, lbl));
                 }
                 const refGrid = pickStructured(refScraped);
                 if (refGrid && expectedMap[refGrid.k] == null) expectedMap[refGrid.k] = refGrid.v;
@@ -1212,11 +1222,11 @@ Deno.serve(async (req) => {
                     const raw = rows[0][col];
                     expectedMap[lbl] = looksLikeDateValue(raw)
                       ? String(raw).trim()
-                      : preserveScalar(raw);
+                      : preserveConfiguredScalar(raw, lbl);
                   } else if (sqlResp?.scalar != null) {
                     expectedMap[lbl] = looksLikeDateValue(sqlResp.scalar)
                       ? String(sqlResp.scalar).trim()
-                      : preserveScalar(sqlResp.scalar);
+                      : preserveConfiguredScalar(sqlResp.scalar, lbl);
                   }
                   else expectedMap[lbl] = null;
                 }
@@ -1387,6 +1397,25 @@ Deno.serve(async (req) => {
                   continue;
                 }
                 const rawExpected = lookupKpiValue(expectedMap, lbl);
+                if (isIdentifierKpi(lbl) && rawA != null) {
+                  const aText = String(rawA).trim();
+                  const eRaw = rawExpected;
+                  const eText = eRaw == null ? null : String(eRaw).trim();
+                  actualMap[lbl] = aText;
+                  if (!sqlTplId && !isRef) {
+                    diffMap[lbl] = { value: aText, kind: "text" };
+                  } else {
+                    const textPass = eText != null && aText === eText;
+                    diffMap[lbl] = {
+                      kind: "text",
+                      actual: aText,
+                      expected: eText,
+                      pass: textPass,
+                    };
+                    if (!textPass) comboPass = false;
+                  }
+                  continue;
+                }
                 // Refresh dates stay as text for display, but compare them with
                 // the configured operator (eq/lte/gte/gt/lt), not equality only.
                 if (looksLikeDateValue(rawA)) {

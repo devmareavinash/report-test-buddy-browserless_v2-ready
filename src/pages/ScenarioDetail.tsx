@@ -2245,8 +2245,11 @@ function pickPrimary(obj: any): { key: string | null; value: any } {
   return { key: null, value: null };
 }
 
-function fmt(v: any): string {
+function fmt(v: any, label?: string): string {
   if (v === null || v === undefined) return "—";
+  if (label && /\b(phone|telephone|mobile|zip|zipcode|zip code|postal|postal code)\b/i.test(label)) {
+    return String(v);
+  }
   if (typeof v === "number") return v.toLocaleString();
   if (typeof v === "string") return v;
   if (Array.isArray(v) || (v && typeof v === "object")) {
@@ -2383,7 +2386,7 @@ function GridComparePanels({ actual, expected, leftLabel, rightLabel }: {
   );
 }
 
-function KpiValue({ value, large }: { value: any; large?: boolean }) {
+function KpiValue({ value, large, label }: { value: any; large?: boolean; label?: string }) {
   if (value === null || value === undefined) {
     return <span className="text-muted-foreground">—</span>;
   }
@@ -2394,7 +2397,7 @@ function KpiValue({ value, large }: { value: any; large?: boolean }) {
   if (value && typeof value === "object") {
     return <span className="text-muted-foreground">—</span>;
   }
-  return <span className="mono font-semibold">{fmt(value)}</span>;
+  return <span className="mono font-semibold">{fmt(value, label)}</span>;
 }
 
 function ComparisonTable({ expected, actual, diff, leftLabel, rightLabel, scenarioTitle }: { expected: any; actual: any; diff: any; leftLabel: string; rightLabel: string; scenarioTitle?: string }) {
@@ -4114,8 +4117,8 @@ function FilterComparisonTable({
                     </td>
                   ) : (
                     <>
-                      <td className="p-2 align-top"><KpiValue value={r.actual} /></td>
-                      <td className="p-2 align-top"><KpiValue value={r.expected} /></td>
+                      <td className="p-2 align-top"><KpiValue value={r.actual} label={r.kpi} /></td>
+                      <td className="p-2 align-top"><KpiValue value={r.expected} label={r.kpi} /></td>
                     </>
                   )}
                   <td className="p-2 mono">
@@ -4280,8 +4283,8 @@ function KpiRowsTable({
             {rows.map((r) => (
               <tr key={r.k} className={`border-t border-border ${r.pass === false ? "bg-destructive/5" : ""}`}>
                 <td className="p-2 mono align-top">{r.k}</td>
-                <td className="p-2 align-top"><KpiValue value={r.a} /></td>
-                <td className="p-2 align-top"><KpiValue value={r.exp} /></td>
+                <td className="p-2 align-top"><KpiValue value={r.a} label={r.k} /></td>
+                <td className="p-2 align-top"><KpiValue value={r.exp} label={r.k} /></td>
                 <td className="p-2 mono">
                   {r.diff !== null ? (
                     <span className={r.pass === false ? "text-destructive" : "text-muted-foreground"}>

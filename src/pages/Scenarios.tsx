@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Link, useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
 import { AppLayout } from "@/components/AppLayout";
 import { Card, CardContent } from "@/components/ui/card";
@@ -8,9 +8,73 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
 import { ScenarioResultCard } from "@/components/ScenarioResultCard";
+import { Download } from "lucide-react";
+import * as XLSX from "xlsx";
+import { deriveStoredResultStatus, toStoredTableModel, unwrapStoredValues } from "@/lib/kpi-values";
+import { pickCanonicalScript } from "@/lib/canonicalScript";
 import { toast } from "sonner";
 import { fetchLatestRunResultsByScenarioIds, fetchFilterMatrixByScenarioIds, overallStatusFromComboPairs, pairCombosWithResults } from "@/lib/latestTestResults";
 import { useExecutionLocks } from "@/hooks/useExecutionLocks";
+
+function excelValue(value: any): string | number | boolean {
+  if (value == null) return "";
+  if (["string", "number", "boolean"].includes(typeof value)) return value;
+  return JSON.stringify(value);
+}
+
+function uniqueSheetName(title: string, used: Set<string>) {
+  const base = String(title || "Case").replace(/[:\\/?*\[\]]/g, " ").replace(/\s+/g, " ").trim() || "Case";
+  let name = base.slice(0, 31);
+  let suffix = 2;
+  while (used.has(name.toLowerCase()) || name.toLowerCase() === "summary") {
+    const ending = ` (${suffix++})`;
+    name = `${base.slice(0, 31 - ending.length)}${ending}`;
+  }
+  used.add(name.toLowerCase());
+  return name;
+}
+
+function resultDetailRows(row: any): any[][] {
+  const s = row.scenario;
+  const rows: any[][] = [
+    ["Case Name", s.title],
+    ["Overall Status", row.overallStatus || "pending"],
+    ["Report", s.reports?.workstreams?.name || ""],
+    ["Screen", s.reports?.name || ""],
+    ["Type", s.type || ""],
+    [],
+  ];
+  for (const pair of row.comboPairs || []) {
+    const result = pair.result;
+    rows.push(["Filter Combination", pair.label || "Default"], ["Result", result?.status || "pending"]);
+    if (!result) {
+      rows.push(["Details", "No execution result"], []);
+      continue;
+    }
+    const actual = unwrapStoredValues(result.actual);
+    const expected = unwrapStoredValues(result.expected);
+    const keys = Array.from(new Set([...Object.keys(actual), ...Object.keys(expected)]))
+      .filter((key) => key && !key.startsWith("__") && !/^(filter|source|filters_applied)$/i.test(key));
+    rows.push(["KPI", "Actual", "Expected", "Diff", "Status"]);
+    for (const key of keys) {
+      const actualGrid = toStoredTableModel(actual[key]);
+      const expectedGrid = toStoredTableModel(expected[key]);
+      if (actualGrid || expectedGrid) {
+        rows.push([key, "", "", "", result.status || "pending"]);
+        for (const [heading, table] of [["Actual Grid", actualGrid], ["Expected Grid", expectedGrid]] as const) {
+          if (!table) continue;
+          rows.push([heading], table.columns);
+          table.rows.forEach((gridRow) => rows.push(gridRow.map(excelValue)));
+        }
+      } else {
+        const diff = result.diff && typeof result.diff === "object" ? result.diff[key] : null;
+        rows.push([key, excelValue(actual[key]), excelValue(expected[key]), excelValue(diff), result.status || "pending"]);
+      }
+    }
+    rows.push([]);
+  }
+  return rows;
+}
 
 export default function Scenarios() {
   const [params] = useSearchParams();
@@ -49,14 +113,38 @@ export default function Scenarios() {
       // otherwise a scenario with 4 combinations shows only the ones that have
       // a stored test_results row.
       const matrix = await fetchFilterMatrixByScenarioIds(scenarios.map((s: any) => s.id));
+      const { data: scriptRows } = await supabase
+        .from("scripts")
+        .select("scenario_id, assertion_spec, playwright_code, created_at")
+        .in("scenario_id", scenarios.map((s: any) => s.id))
+        .order("created_at", { ascending: false })
+        .limit(5000);
+      const scriptsByScenario = new Map<string, any[]>();
+      for (const script of scriptRows || []) {
+        const list = scriptsByScenario.get(script.scenario_id) || [];
+        list.push(script);
+        scriptsByScenario.set(script.scenario_id, list);
+      }
       const mapped = scenarios.map((s: any) => {
         const rows = latestRuns.get(s.id) || [];
         const combos = matrix.get(s.id) || [];
         const comboPairs = pairCombosWithResults(combos, rows);
-        const overallStatus = overallStatusFromComboPairs(
-          comboPairs,
-          rows[0]?.status || "pending",
-        );
+        const assertionSpec = pickCanonicalScript(scriptsByScenario.get(s.id))?.assertion_spec;
+        const statusPairs = comboPairs.map((pair: any) => ({
+          result: pair.result
+            ? {
+                status: deriveStoredResultStatus({
+                  actual: pair.result.actual,
+                  expected: pair.result.expected,
+                  spec: assertionSpec,
+                  scenarioType: s.type,
+                  diff: pair.result.diff,
+                  fallbackStatus: pair.result.status,
+                }),
+              }
+            : null,
+        }));
+        const overallStatus = overallStatusFromComboPairs(statusPairs, rows[0]?.status || "pending");
         return {
           scenario: s,
           latest: rows[0] || null,
@@ -128,6 +216,29 @@ export default function Scenarios() {
     refetch();
   };
 
+  const exportExcel = () => {
+    const workbook = XLSX.utils.book_new();
+    const usedNames = new Set<string>();
+    const details = filtered.map((row: any) => ({ row, name: uniqueSheetName(row.scenario.title, usedNames) }));
+    const summary = XLSX.utils.aoa_to_sheet([
+      ["Case Name", "Status", "Report", "Screen", "Type", "Result Sheet"],
+      ...details.map(({ row, name }) => [
+        row.scenario.title, row.overallStatus || "pending",
+        row.scenario.reports?.workstreams?.name || "", row.scenario.reports?.name || "",
+        row.scenario.type || "", name,
+      ]),
+    ]);
+    details.forEach(({ name }, index) => {
+      const cell = summary[XLSX.utils.encode_cell({ r: index + 1, c: 5 })];
+      if (cell) cell.l = { Target: `#'${name.replace(/'/g, "''")}'!A1` };
+    });
+    XLSX.utils.book_append_sheet(workbook, summary, "Summary");
+    details.forEach(({ row, name }) => XLSX.utils.book_append_sheet(
+      workbook, XLSX.utils.aoa_to_sheet(resultDetailRows(row)), name,
+    ));
+    XLSX.writeFile(workbook, `test-execution-status-${new Date().toISOString().slice(0, 10)}.xlsx`);
+  };
+
   return (
     <AppLayout>
       <div className="p-8 space-y-4">
@@ -140,15 +251,12 @@ export default function Scenarios() {
               Latest execution per scenario, with RCA and proposed fixes.
             </p>
           </div>
-          <Link
-            to={`/scenarios?deferred=${deferred ? "false" : "true"}`}
-            className="text-xs text-accent"
-          >
-            Show {deferred ? "active" : "deferred"} →
-          </Link>
         </div>
 
         <div className="flex gap-2 flex-wrap items-center">
+          <div className="rounded-md border bg-muted/40 px-3 py-2 text-xs font-medium text-muted-foreground mono">
+            {filtered.length} scenarios
+          </div>
           <Input
             placeholder="Search title, report, workstream, analysis…"
             value={search}
@@ -184,7 +292,15 @@ export default function Scenarios() {
               <SelectItem value="low">Low</SelectItem>
             </SelectContent>
           </Select>
-          <div className="text-xs text-muted-foreground mono ml-auto">{filtered.length} scenarios</div>
+          <Button
+            size="sm"
+            variant="outline"
+            className="border-green-300 bg-green-100 text-green-800 hover:bg-green-200"
+            onClick={exportExcel}
+            disabled={!filtered.length}
+          >
+            <Download className="h-4 w-4 mr-1" />Export Excel
+          </Button>
         </div>
 
         <Card>

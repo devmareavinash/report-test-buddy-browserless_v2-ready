@@ -4,8 +4,11 @@ import { deriveStoredResultRows, resolveKpiTol, storedKpiSpec, type StoredResult
 import { compareTables, summarizeTableCompare } from "@/lib/tableCompare";
 import { pickTrendView } from "@/lib/trend-payload";
 
-function fmt(v: any): string {
+function fmt(v: any, label?: string): string {
   if (v === null || v === undefined) return "—";
+  if (label && /\b(phone|telephone|mobile|zip|zipcode|zip code|postal|postal code)\b/i.test(label)) {
+    return String(v);
+  }
   if (typeof v === "number") return v.toLocaleString();
   if (typeof v === "string") return v;
   return "—";
@@ -163,8 +166,8 @@ export function StoredResultTable({
                   </td>
                 ) : (
                   <>
-                    <td className="p-2 align-top mono font-semibold">{r.skipped && r.a == null ? "" : fmt(r.a)}</td>
-                    <td className="p-2 align-top mono font-semibold">{r.skipped && r.e == null ? "" : fmt(r.e)}</td>
+                    <td className="p-2 align-top mono font-semibold">{r.skipped && r.a == null ? "" : fmt(r.a, r.k)}</td>
+                    <td className="p-2 align-top mono font-semibold">{r.skipped && r.e == null ? "" : fmt(r.e, r.k)}</td>
                   </>
                 )}
                 <td className="p-2 mono align-top">
