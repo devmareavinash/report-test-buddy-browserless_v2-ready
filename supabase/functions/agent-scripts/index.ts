@@ -569,10 +569,9 @@ You are the FALLBACK after proven templates (Overview KPI, Activity KPI, Geograp
 chart Show Data). Mimic those working scripts — do NOT invent new filter cadence or waits.
 
 MUST KEEP IDENTICAL TO WORKING SCRIPTS:
-1. Geography filter cadence — apply in this order only:
-     GEO_ORDER = ['Area', 'Region', 'Territory', 'Time Bucket']
-   (or omit Time Bucket only when the Overview KPI template style is clearly required:
-     ['Area', 'Region', 'Territory']). Never invent a different geo order.
+1. Filter cadence — apply in this order only:
+     GEO_ORDER = ['Team', 'Brand', 'Area', 'Region', 'Territory', 'Time Bucket']
+   Skip keys that are absent, then apply all remaining filters in input order.
 2. After EVERY successful filter pick AND before extraction:
      await waitForLoadingToFinish();
      await waitForDashboard();
@@ -996,7 +995,7 @@ checks). The only hardcoded list allowed is the geo cascade order, used purely
 to decide ordering — every key in \`filters\` (geo or not) is still applied via
 the same generic loop:
 
-  const GEO_ORDER = ['Area', 'Region', 'Territory'];
+  const GEO_ORDER = ['Team', 'Brand', 'Area', 'Region', 'Territory', 'Time Bucket'];
   const allKeys = Object.keys(filters);
   const geoKeys = GEO_ORDER.filter(k => allKeys.includes(k));
   const otherKeys = allKeys.filter(k => !GEO_ORDER.includes(k));

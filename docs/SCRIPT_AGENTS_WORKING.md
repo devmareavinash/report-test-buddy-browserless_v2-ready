@@ -117,7 +117,7 @@ Pipeline constants (`script-gen-skill.ts`):
 
 **Only the KPI Overview filter path is proven reliable.**
 
-- Order: `GEO_ORDER = ['Area', 'Region', 'Territory']` then other keys
+- Order: `GEO_ORDER = ['Team', 'Brand', 'Area', 'Region', 'Territory', 'Time Bucket']` then other keys
 - Geography Details may also apply **Time Bucket** after geo (`GRID_GEO_ORDER`)
 - Weekly / Monthly / Quarterly are **chart radios**, not geography filters and not footer tabs
 - Helper: `selectByLabel` from the **RTB filter core**
@@ -405,7 +405,7 @@ Repair agent uses the same skill block plus the validation report (`formatValida
 
 - [ ] Detector still matches the intended scenarios only
 - [ ] URL / labels / `NAV_STEPS` / time grain are the only substitutions
-- [ ] Filter order is still Area → Region → Territory (+ Time Bucket for geo)
+- [ ] Filter order is still Team → Brand → Area → Region → Territory → Time Bucket → other
 - [ ] Extract helper body matches the working reference
 - [ ] Chart still rejects 1-column / 1-value “tables”
 - [ ] Grid still rejects Overview KPI chrome

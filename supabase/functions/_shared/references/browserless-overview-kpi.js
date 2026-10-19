@@ -581,7 +581,7 @@ export default async ({ page, context }) => {
 
   /** Apply a whole combination in geo order, aborting on the first unverified pick. */
   const applyFiltersVerified = async (filters, geoOrder) => {
-    const order = geoOrder || ['Area', 'Region', 'Territory'];
+    const order = geoOrder || ['Team', 'Brand', 'Area', 'Region', 'Territory', 'Time Bucket'];
     const debug = {};
     const allKeys = Object.keys(filters || {});
     const geoKeys = order.filter(k => allKeys.indexOf(k) !== -1);
@@ -699,7 +699,7 @@ export default async ({ page, context }) => {
       await waitForDashboard();
     }
     const debug = {};
-    const GEO_ORDER = ['Area', 'Region', 'Territory', 'Time Bucket'];
+    const GEO_ORDER = ['Team', 'Brand', 'Area', 'Region', 'Territory', 'Time Bucket'];
     const allKeys = Object.keys(filters);
     const geoKeys = GEO_ORDER.filter(k => allKeys.includes(k));
     const otherKeys = allKeys.filter(k => !GEO_ORDER.includes(k));

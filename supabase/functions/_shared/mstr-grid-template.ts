@@ -571,7 +571,7 @@ ${FILTER_CORE_JS}
 
   const scrapeOnce = async (filters) => {
     const debug = {};
-    const GEO_ORDER = ['Area', 'Region', 'Territory', 'Time Bucket'];
+    const GEO_ORDER = ['Team', 'Brand', 'Area', 'Region', 'Territory', 'Time Bucket'];
     const allKeys = Object.keys(filters || {});
     const geoKeys = GEO_ORDER.filter(k => allKeys.includes(k));
     const otherKeys = allKeys.filter(k => !GEO_ORDER.includes(k));
@@ -2169,7 +2169,7 @@ ${FILTER_CORE_JS}
 
   const scrapeOnce = async (filters) => {
     const debug = {};
-    const GEO_ORDER = ['Area', 'Region', 'Territory', 'Time Bucket'];
+    const GEO_ORDER = ['Team', 'Brand', 'Area', 'Region', 'Territory', 'Time Bucket'];
     const VIEW_BY_KEY = 'View By';
     const allKeys = Object.keys(filters || {});
     const geoKeys = GEO_ORDER.filter(k => allKeys.includes(k));

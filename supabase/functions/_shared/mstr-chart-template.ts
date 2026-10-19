@@ -118,7 +118,7 @@ export function validateAssembledScript(code: string): { ok: boolean; reason?: s
   }
   if (!/waitForLoadingToFinish/.test(code)) return { ok: false, reason: "missing_wait_loading" };
   if (!/waitForDashboard/.test(code)) return { ok: false, reason: "missing_wait_dashboard" };
-  if (!/GEO_ORDER\s*=\s*\[\s*['"]Area['"]/.test(code) && !/applyFiltersInOrder/.test(code)) {
+  if (!/GEO_ORDER\s*=\s*\[\s*['"]Team['"]/.test(code) && !/applyFiltersInOrder/.test(code)) {
     return { ok: false, reason: "missing_geo_filters" };
   }
   // Filters must go through the hardened core: bounded binding + verified read-back.

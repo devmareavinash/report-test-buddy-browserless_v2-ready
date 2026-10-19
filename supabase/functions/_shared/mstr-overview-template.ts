@@ -633,7 +633,7 @@ ${FILTER_CORE_JS}
     }
 
     const debug = {};
-    const GEO_ORDER = ['Area', 'Region', 'Territory'];
+    const GEO_ORDER = ['Team', 'Brand', 'Area', 'Region', 'Territory', 'Time Bucket'];
     const allKeys = Object.keys(filters);
     const geoKeys = GEO_ORDER.filter(k => allKeys.includes(k));
     const otherKeys = allKeys.filter(k => !GEO_ORDER.includes(k));

@@ -59,7 +59,7 @@ FIXED (copy from working templates — do not rewrite):
   3) waitForLoadingToFinish
   4) Navigate NAV_STEPS via clickByText (pages/tabs the user named)
   5) waitForDashboard / filter bar on THAT page
-  6) Apply filters: GEO_ORDER Area→Region→Territory then others;
+  6) Apply filters: GEO_ORDER Team→Brand→Area→Region→Territory→Time Bucket then others;
      selectByLabel from the RTB FILTER CORE; wait load after EACH pick
   7) Wait data load
   8) Extract by kind ONLY (see above)

@@ -507,7 +507,7 @@ export const FILTER_CORE_JS = String.raw`// @@RTB_FILTER_CORE_START@@
 
   /** Apply a whole combination in geo order, aborting on the first unverified pick. */
   const applyFiltersVerified = async (filters, geoOrder) => {
-    const order = geoOrder || ['Area', 'Region', 'Territory'];
+    const order = geoOrder || ['Team', 'Brand', 'Area', 'Region', 'Territory', 'Time Bucket'];
     const debug = {};
     const allKeys = Object.keys(filters || {});
     const geoKeys = order.filter(k => allKeys.indexOf(k) !== -1);
