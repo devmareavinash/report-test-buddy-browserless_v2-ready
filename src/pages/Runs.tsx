@@ -9,6 +9,8 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { XCircle, Trash2 } from "lucide-react";
 import { toast } from "@/hooks/use-toast";
+import { fetchRunAssertionSpecs, fetchRunTestResults } from "@/lib/runTestResults";
+import { deriveRunResults, matchesRunOutcome, presentedRunStatus } from "@/lib/runPresentation";
 
 export default function Runs() {
   const queryClient = useQueryClient();
@@ -44,26 +46,23 @@ export default function Runs() {
   });
 
   // Build run_id → set of {workstream_id, report_id, report_name, ws_name} from test_results
-  const { data: runMeta } = useQuery({
-    queryKey: ["run-meta", (runs || []).length],
+  const { data: runMeta, isPending: resultsLoading, error: resultsError } = useQuery({
+    queryKey: ["run-meta", (runs || []).map((run) => run.id)],
     enabled: !!runs?.length,
     staleTime: 0,
     refetchOnMount: "always",
     refetchInterval: (runs || []).some((run: any) => run.status === "running") ? 3000 : false,
     queryFn: async () => {
       const ids = (runs || []).map((r: any) => r.id);
-      const { data } = await supabase
-        .from("test_results")
-        .select("run_id, scenario_id, status, scenarios(reports(id, name, workstream_id, workstreams(id, name)))")
-        .in("run_id", ids)
-        .limit(10000);
+      const data = await fetchRunTestResults(ids);
+       const specs = await fetchRunAssertionSpecs(data.map((row) => row.scenario_id));
       const map: Record<string, {
         ws: Set<string>;
         reports: Set<string>;
         labels: Set<string>;
         cases: Map<string, Array<"pass" | "fail" | "pending">>;
       }> = {};
-      for (const row of data || []) {
+      for (const row of deriveRunResults(data, specs)) {
         const rep: any = (row as any).scenarios?.reports;
         if (!rep) continue;
         const m = (map[(row as any).run_id] ||= {
@@ -76,9 +75,7 @@ export default function Runs() {
         if (scenarioId) {
           const statuses = m.cases.get(scenarioId) || [];
           statuses.push(
-            (row as any).status === "pass" || (row as any).status === "fail"
-              ? (row as any).status
-              : "pending",
+            row.derivedStatus,
           );
           m.cases.set(scenarioId, statuses);
         }
@@ -104,7 +101,7 @@ export default function Runs() {
       : (scenarios || [])
           .filter((s: any) => !s.deferred && reportIds.has(s.report_id))
           .map((s: any) => s.id);
-    for (const scenarioId of scopedScenarioIds) {
+    for (const scenarioId of run.status === "running" ? scopedScenarioIds : []) {
       if (!caseStatus.has(scenarioId)) caseStatus.set(scenarioId, "pending");
     }
     let pass = 0, fail = 0, pending = 0;
@@ -120,14 +117,7 @@ export default function Runs() {
     const q = search.toLowerCase().trim();
     return (runs || []).filter((r: any) => {
       const counts = caseCounts(r);
-      if (status === "fail" && (r.status !== "completed" || counts.fail <= 0)) return false;
-      if (status === "pass") {
-        if (r.status !== "completed" || counts.fail !== 0 || counts.pending !== 0 || counts.total <= 0) {
-          return false;
-        }
-      }
-      if (status === "running" && r.status !== "running") return false;
-      if (status === "cancelled" && r.status !== "cancelled") return false;
+      if (!matchesRunOutcome(r, counts, status)) return false;
       const m = runMeta?.[r.id];
       if (wsId !== "all" && !m?.ws.has(wsId)) return false;
       if (reportId !== "all" && !m?.reports.has(reportId)) return false;
@@ -213,6 +203,7 @@ export default function Runs() {
 
         <Card>
           <CardContent className="space-y-1 overflow-x-auto p-0">
+            {resultsError && <div role="alert" className="p-3 text-sm text-destructive">Unable to load run results. Please refresh to try again.</div>}
             <div className="grid min-w-[850px] grid-cols-[90px_minmax(180px,1fr)_90px_140px_190px_110px_28px] items-center gap-3 rounded-t-xl border-b bg-slate-100 px-3 py-3 text-xs font-bold text-slate-600 dark:bg-slate-800 dark:text-slate-200">
               <span>Run ID</span>
               <span>Description</span>
@@ -250,18 +241,18 @@ export default function Runs() {
                   </span>
                   <span className="text-xs whitespace-nowrap flex items-center gap-1">
                     <span className="text-emerald-600 dark:text-emerald-400 font-medium">
-                      {counts.pass}✓
+                      {resultsLoading || resultsError ? "—" : counts.pass}✓
                     </span>
                     <span className="text-muted-foreground">/</span>
                     <span className="text-destructive font-medium">
-                      {counts.fail}✗
+                      {resultsLoading || resultsError ? "—" : counts.fail}✗
                     </span>
                   </span>
                   <span className="text-xs text-muted-foreground whitespace-nowrap">{r.trigger_source}</span>
                   <span className="text-xs text-muted-foreground whitespace-nowrap">
                     {new Date(r.started_at!).toLocaleString()}
                   </span>
-                  <StatusChip status={counts.fail > 0 && r.status !== "cancelled" ? "failed" : r.status} />
+                  <StatusChip status={resultsLoading || resultsError ? "pending" : presentedRunStatus(r, counts)} />
                   {r.status === "running" ? (
                     <button
                       onClick={async (e) => {

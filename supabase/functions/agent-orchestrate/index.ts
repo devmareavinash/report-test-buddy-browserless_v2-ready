@@ -81,31 +81,72 @@ function makeCallFn(getCallerAuthorization: () => Promise<string>) {
 // The database function locks the parent row before incrementing `done`. Doing
 // this as a client-side read/modify/write loses increments when hosted child
 // invocations finish concurrently, leaving the parent permanently "running".
+function errorDetail(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message;
+  if (typeof error === "string" && error.trim()) return error;
+  if (error && typeof error === "object") {
+    const value = error as Record<string, unknown>;
+    const parts = ["message", "details", "hint", "code"]
+      .map((key) => value[key])
+      .filter((part) => typeof part === "string" && part.trim());
+    if (parts.length) return parts.join(" | ");
+    try {
+      const serialized = JSON.stringify(error);
+      if (serialized && serialized !== "{}") return serialized;
+    } catch {
+      // Fall through to the generic description.
+    }
+  }
+  return "unknown database error";
+}
+
+async function retryFinalizationOperation<T>(
+  operation: () => Promise<T>,
+  getError: (result: T) => unknown,
+  attempts = 3,
+): Promise<T> {
+  let result!: T;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    result = await operation();
+    if (!getError(result) || attempt === attempts) return result;
+    await new Promise((resolve) => setTimeout(resolve, attempt * 150));
+  }
+  return result;
+}
+
 async function finalizeChild(sb: any, runId: string, reportId: string, addPass: number, addFail: number, hadError: boolean, errMsg?: string) {
   jsonLog("child_finalization_started", {
     run_id: runId, report_id: reportId, add_pass: addPass, add_fail: addFail,
     had_error: hadError, error: errMsg?.slice(0, 500) || null,
   });
-  const { error } = await sb.rpc("finalize_workstream_report", {
-    p_run_id: runId,
-    p_report_id: reportId,
-    p_add_pass: addPass,
-    p_add_fail: addFail,
-    p_had_error: hadError,
-    p_error_message: errMsg || null,
-  });
+  const { error } = await retryFinalizationOperation(
+    () => sb.rpc("finalize_workstream_report", {
+      p_run_id: runId,
+      p_report_id: reportId,
+      p_add_pass: addPass,
+      p_add_fail: addFail,
+      p_had_error: hadError,
+      p_error_message: errMsg || null,
+    }),
+    (result: any) => result?.error,
+  );
   if (!error) {
     jsonLog("child_finalization_completed", { run_id: runId, report_id: reportId, method: "rpc" });
     return;
   }
-  jsonLog("child_finalization_rpc_failed", { run_id: runId, report_id: reportId, error: error.message });
+  const rpcError = errorDetail(error);
+  jsonLog("child_finalization_rpc_failed", { run_id: runId, report_id: reportId, error: rpcError });
 
   // Portable fallback (same rules as the SQL function): one entry per report,
   // compare-and-swap on summary so concurrent children don't clobber each other.
   for (let attempt = 0; attempt < 12; attempt++) {
-    const { data: current, error: readError } = await sb
-      .from("runs").select("summary, status").eq("id", runId).maybeSingle();
-    if (readError) throw new Error(`Failed to read workstream run: ${readError.message}`);
+    const { data: current, error: readError } = await retryFinalizationOperation(
+      () => sb.from("runs").select("summary, status").eq("id", runId).maybeSingle(),
+      (result: any) => result?.error,
+    );
+    if (readError) {
+      throw new Error(`Could not finalize report because the parent run could not be read: ${errorDetail(readError)} (RPC: ${rpcError})`);
+    }
     if (!current || current.status !== "running") return;
     const summary: any = current.summary || {};
     const reports: Record<string, any> = { ...(summary.reports || {}) };
@@ -136,7 +177,7 @@ async function finalizeChild(sb: any, runId: string, reportId: string, addPass: 
     const { data: updated, error: updateError } = await sb
       .from("runs").update(patch).eq("id", runId).eq("status", "running")
       .filter("summary", "eq", JSON.stringify(summary)).select("id").maybeSingle();
-    if (updateError) throw new Error(`Failed to finalize workstream report: ${updateError.message}`);
+    if (updateError) throw new Error(`Failed to finalize workstream report: ${errorDetail(updateError)} (RPC: ${rpcError})`);
     if (updated) {
       jsonLog("child_finalization_completed", {
         run_id: runId, report_id: reportId, method: "compare_and_swap", attempt: attempt + 1,
@@ -145,7 +186,7 @@ async function finalizeChild(sb: any, runId: string, reportId: string, addPass: 
     }
     await new Promise((resolve) => setTimeout(resolve, 25 + attempt * 25));
   }
-  throw new Error(`Failed to finalize workstream report after retries: ${error.message}`);
+  throw new Error(`Failed to finalize workstream report after retries: ${rpcError}`);
 }
 
 function orchestrateConcurrency(override?: unknown): number {
@@ -767,35 +808,44 @@ Deno.serve(async (req) => {
 
     if (!existing_run_id && scope_type === "workstream") {
       const dispatch = async () => {
-        // For workstream runs, the requested concurrency controls how many
-        // reports/screens run at once. Keep each child report serial so the
-        // total Browserless pressure remains bounded by that setting.
-        const reportConcurrency = concurrency;
-        const childConcurrency = 1;
-        await mapPool(reportIds, reportConcurrency, async (rid) => {
-          try {
-            jsonLog("child_dispatch_started", { run_id: run.id, report_id: rid });
-            const child = await callFn("agent-orchestrate", {
-              scope_type: "report",
-              scope_id: rid,
-              trigger_source,
-              existing_run_id: run.id,
-              single_report_id: rid,
-              comparator_override,
-              concurrency: childConcurrency,
-            });
-            if (child?.error || child?.ok === false) {
-              throw new Error(child?.error || child?.message || "child orchestration failed");
+        try {
+          // For workstream runs, the requested concurrency controls how many
+          // reports/screens run at once. Keep each child report serial so the
+          // total Browserless pressure remains bounded by that setting.
+          const reportConcurrency = concurrency;
+          const childConcurrency = 1;
+          await mapPool(reportIds, reportConcurrency, async (rid) => {
+            try {
+              jsonLog("child_dispatch_started", { run_id: run.id, report_id: rid });
+              const child = await callFn("agent-orchestrate", {
+                scope_type: "report",
+                scope_id: rid,
+                trigger_source,
+                existing_run_id: run.id,
+                single_report_id: rid,
+                comparator_override,
+                concurrency: childConcurrency,
+              });
+              if (child?.error || child?.ok === false) {
+                throw new Error(child?.error || child?.message || "child orchestration failed");
+              }
+              jsonLog("child_dispatch_completed", { run_id: run.id, report_id: rid });
+            } catch (e) {
+              jsonLog("child_dispatch_failed", {
+                run_id: run.id, report_id: rid, error: errorDetail(e).slice(0, 500),
+              });
+              try {
+                await finalizeChild(sb, run.id, rid, 0, 0, true, errorDetail(e));
+              } catch (finalizeError) {
+                jsonLog("child_dispatch_finalization_failed", {
+                  run_id: run.id, report_id: rid, error: errorDetail(finalizeError).slice(0, 1000),
+                });
+              }
             }
-            jsonLog("child_dispatch_completed", { run_id: run.id, report_id: rid });
-          } catch (e) {
-            jsonLog("child_dispatch_failed", {
-              run_id: run.id, report_id: rid, error: String((e as any)?.message || e).slice(0, 500),
             });
-            await finalizeChild(sb, run.id, rid, 0, 0, true, String((e as any)?.message || e));
-          }
-        });
-        releaseSession();
+        } finally {
+          releaseSession();
+        }
       };
       // @ts-ignore
       if (typeof EdgeRuntime !== "undefined" && EdgeRuntime?.waitUntil) {

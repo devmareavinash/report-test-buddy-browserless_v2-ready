@@ -8,11 +8,11 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { RunScenarioCard } from "@/components/RunScenarioCard";
 import { StatusChip } from "@/components/StatusChip";
-import { deriveStoredResultStatus } from "@/lib/kpi-values";
+import { countRunCases, deriveRunResults, presentedRunStatus } from "@/lib/runPresentation";
 import { Button } from "@/components/ui/button";
 import { XCircle, Trash2 } from "lucide-react";
 import { toast } from "@/hooks/use-toast";
-import { pickCanonicalScript } from "@/lib/canonicalScript";
+import { fetchRunAssertionSpecs, fetchRunTestResults } from "@/lib/runTestResults";
 
 function formatRunDuration(startedAt?: string | null, finishedAt?: string | null) {
   if (!startedAt) return "—";
@@ -50,14 +50,8 @@ export default function RunDetail() {
   const isRunning = run?.status === "running";
   const { data: results, refetch } = useQuery({
     queryKey: ["results", id],
-    queryFn: async () =>
-      (await supabase
-        .from("test_results")
-        .select(
-          "id, scenario_id, run_id, status, criticality, severity, analysis, expected, actual, diff, healing_status, healing_proposal, screenshot_url, created_at, scenarios(id, title, type, criticality, report_id, reports(id, name, workstream_id, workstreams(id, name)))",
-        )
-        .eq("run_id", id!)
-        .order("created_at", { ascending: true })).data ?? [],
+    queryFn: async () => (await fetchRunTestResults(id ? [id] : []))
+      .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)) || String(a.id).localeCompare(String(b.id))),
     refetchInterval: isRunning ? 3000 : false,
     staleTime: 0,
     refetchOnMount: "always",
@@ -127,25 +121,7 @@ export default function RunDetail() {
   const { data: assertionSpecs } = useQuery({
     queryKey: ["run-assertion-specs", id, scenarioIds.join(",")],
     enabled: scenarioIds.length > 0,
-    queryFn: async () => {
-      const { data, error } = await supabase
-        .from("scripts")
-        .select("scenario_id, assertion_spec, playwright_code, created_at")
-        .in("scenario_id", scenarioIds);
-      if (error) throw error;
-      const rowsByScenario = new Map<string, any[]>();
-      for (const row of data || []) {
-        const rows = rowsByScenario.get((row as any).scenario_id) || [];
-        rows.push(row);
-        rowsByScenario.set((row as any).scenario_id, rows);
-      }
-      return Object.fromEntries(
-        Array.from(rowsByScenario, ([scenarioId, rows]) => [
-          scenarioId,
-          (pickCanonicalScript(rows) as any)?.assertion_spec,
-        ]),
-      ) as Record<string, any>;
-    },
+    queryFn: () => fetchRunAssertionSpecs(scenarioIds),
     staleTime: 0,
     refetchOnMount: "always",
   });
@@ -169,20 +145,7 @@ export default function RunDetail() {
   }, [merged, wsId]);
 
   const withDerivedStatus = useMemo(() => {
-    return (merged || []).map((r: any) => {
-      // Use the same KPI-level comparison shown inside the expanded card.
-      // The persisted status is only a fallback when stored values cannot be
-      // evaluated, preventing a stale "fail" from contradicting passing KPIs.
-      const derivedStatus = deriveStoredResultStatus({
-        actual: r.actual,
-        expected: r.expected,
-        spec: assertionSpecs?.[r.scenario_id],
-        scenarioType: r.scenarios?.type,
-        diff: r.diff,
-        fallbackStatus: r.status,
-      });
-      return { ...r, derivedStatus };
-    });
+    return deriveRunResults(merged || [], assertionSpecs);
   }, [merged, assertionSpecs]);
 
   const filtered = useMemo(() => {
@@ -207,27 +170,13 @@ export default function RunDetail() {
   }, [withDerivedStatus, search, status, wsId, reportId, criticality]);
 
   const counts = useMemo(() => {
-    const byScenario = new Map<string, "pass" | "fail" | "pending">();
-    for (const r of withDerivedStatus || []) {
-      const previous = byScenario.get(r.scenario_id);
-      const next = r.derivedStatus as "pass" | "fail" | "pending";
-      if (previous === "fail" || next === "fail") byScenario.set(r.scenario_id, "fail");
-      else if (previous === "pending" || next === "pending") byScenario.set(r.scenario_id, "pending");
-      else byScenario.set(r.scenario_id, "pass");
-    }
-    let pass = 0, fail = 0, pending = 0;
-    for (const result of byScenario.values()) {
-      if (result === "pass") pass++;
-      else if (result === "fail") fail++;
-      else pending++;
-    }
-    return { pass, fail, pending };
+    return countRunCases(withDerivedStatus);
   }, [withDerivedStatus]);
   const storedSummary = (run as any)?.summary || {};
   // Header totals are case/scenario totals. Filter combinations remain visible
   // inside each case card but do not inflate the run counters.
   const displayedCounts = counts;
-  const displayedRunStatus = run?.status;
+  const displayedRunStatus = run ? presentedRunStatus(run, counts) : undefined;
   const reportOutcomes: Record<string, any> = storedSummary.reports || {};
   const failedReportIds = Object.keys(reportOutcomes).filter((rid) => reportOutcomes[rid]?.status === "error");
   const { data: failedReportNames } = useQuery({
