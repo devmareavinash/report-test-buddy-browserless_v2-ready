@@ -1,6 +1,6 @@
 import { corsHeaders } from "../_shared/cors.ts";
-import { requireAuth } from "../_shared/auth.ts";
-import { callAgent, getSupabase, tryParseJson } from "../_shared/llm.ts";
+import { getSupabaseForRequest, requireAuth } from "../_shared/auth.ts";
+import { callAgent, tryParseJson } from "../_shared/llm.ts";
 
 const VALID_OPS = new Set(["eq", "lte", "gte", "gt", "lt"]);
 
@@ -18,14 +18,18 @@ Deno.serve(async (req) => {
       );
     }
 
-    const sb = getSupabase();
-    const { data: report } = await sb.from("reports").select("*").eq("id", report_id).maybeSingle();
+    // Keep the caller's session on every read/write. Self-hosted servers may
+    // only have the anonymous project key, which cannot access these rows alone.
+    const sb = getSupabaseForRequest(req);
+    const { data: report, error: reportError } = await sb.from("reports").select("*").eq("id", report_id).maybeSingle();
+    if (reportError) throw new Error(`Could not load report: ${reportError.message}`);
     if (!report) throw new Error("report not found");
 
-    const { data: existing } = await sb
+    const { data: existing, error: existingError } = await sb
       .from("scenarios")
       .select("title,description,type")
       .eq("report_id", report_id);
+    if (existingError) throw new Error(`Could not load existing scenarios: ${existingError.message}`);
 
     const existingBlock = (existing || []).length
       ? `\n\nExisting scenarios (DO NOT duplicate — skip anything overlapping in intent):\n${(existing || [])

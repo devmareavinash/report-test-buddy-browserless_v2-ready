@@ -9,6 +9,18 @@ import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { toast } from "sonner";
 
+function loginErrorMessage(error: unknown): string {
+  const err = error as { message?: string; status?: number; statusCode?: number };
+  const status = err?.status ?? err?.statusCode;
+  const message = String(err?.message || "");
+
+  if (status === 522 || /\b522\b|failed to fetch|fetch failed|network request failed/i.test(message)) {
+    return "Unable to connect with Supabase. Status code: 522";
+  }
+
+  return message || "Sign in failed";
+}
+
 export default function Auth() {
   const { user, loading } = useAuth();
   const nav = useNavigate();
@@ -55,7 +67,7 @@ export default function Auth() {
       toast.success("Signed in");
       nav("/", { replace: true });
     } catch (err: any) {
-      toast.error(err.message || "Sign in failed");
+      toast.error(loginErrorMessage(err));
     } finally {
       setBusy(false);
     }

@@ -11,6 +11,11 @@ function shouldUseLocalBackend(_name: string) {
   // (Vite proxy locally, nginx → :8000 on AWS). Opt back into Edge only with
   // VITE_USE_CLOUD_FUNCTIONS=true.
   if (useCloudFunctions) return false;
+  // Lovable preview/published hosts have no local Deno server behind
+  // /functions/v1, so always call the hosted functions there.
+  if (typeof window !== "undefined" && /(\.lovableproject\.com|\.lovable\.app)$/.test(window.location.hostname)) {
+    return false;
+  }
   return true;
 }
 
