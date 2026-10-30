@@ -24,6 +24,18 @@ function functionsBaseUrl() {
   return "";
 }
 
+/** Streaming chat uses the same Cloud/local/AWS routing as ordinary functions. */
+export function functionEndpoint(name: string) {
+  const base = shouldUseLocalBackend(name)
+    ? functionsBaseUrl()
+    : import.meta.env.VITE_SUPABASE_URL;
+  return `${base}/functions/v1/${name}`;
+}
+
+export async function functionAuthHeaders() {
+  return authHeaders();
+}
+
 function jwtExpMs(token: string): number | null {
   try {
     const parts = token.split(".");

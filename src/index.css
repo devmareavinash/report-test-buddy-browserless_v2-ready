@@ -74,3 +74,8 @@
   body { @apply bg-background text-foreground font-sans antialiased; }
   code, pre, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 }
+
+@keyframes shimmer-slide {
+  0% { background-position: 100% center; }
+  100% { background-position: 0% center; }
+}

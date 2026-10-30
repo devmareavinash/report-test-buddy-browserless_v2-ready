@@ -1,0 +1,16 @@
+CREATE TABLE public.script_agent_conversations (
+ id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+ script_id uuid NOT NULL REFERENCES public.scripts(id) ON DELETE CASCADE,
+ user_id uuid NOT NULL,
+ messages jsonb NOT NULL DEFAULT '[]'::jsonb,
+ access_denial jsonb,
+ updated_at timestamptz NOT NULL DEFAULT now(),
+ UNIQUE (script_id, user_id)
+);
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.script_agent_conversations TO authenticated;
+GRANT ALL ON public.script_agent_conversations TO service_role;
+ALTER TABLE public.script_agent_conversations ENABLE ROW LEVEL SECURITY;
+CREATE POLICY script_agent_own_select ON public.script_agent_conversations FOR SELECT TO authenticated USING (user_id = auth.uid() AND EXISTS (SELECT 1 FROM public.scripts s WHERE s.id = script_id));
+CREATE POLICY script_agent_own_insert ON public.script_agent_conversations FOR INSERT TO authenticated WITH CHECK (user_id = auth.uid() AND EXISTS (SELECT 1 FROM public.scripts s WHERE s.id = script_id));
+CREATE POLICY script_agent_own_update ON public.script_agent_conversations FOR UPDATE TO authenticated USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid() AND EXISTS (SELECT 1 FROM public.scripts s WHERE s.id = script_id));
+CREATE POLICY script_agent_own_delete ON public.script_agent_conversations FOR DELETE TO authenticated USING (user_id = auth.uid());

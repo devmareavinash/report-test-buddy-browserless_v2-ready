@@ -1,4 +1,4 @@
-// RECORD_COUNT_TEMPLATE_VERSION: 2026-10-05.4
+// RECORD_COUNT_TEMPLATE_VERSION: 2026-10-27.3
 export default async ({ page }) => {
 
   // === AUTO-INJECTED SESSION-AWARE AUTH CHECK (do not remove) ===
@@ -219,14 +219,26 @@ export default async ({ page }) => {
                 '.mstrmojo-WaitBox, .mstrmojo-Wait, .mstrWaitBox, ' +
                 '[class*="WaitBox" i], [class*="spinner" i], [class*="loading" i]'
               )).some(isVisible);
+            const wanted = norm(wantedTitle);
+            const aliases = [wanted];
+            // "View My HCP List" UI sometimes shortens to "View My HCP" / "HCP List".
+            if (wanted.length > 10) {
+              const parts = wanted.split(' ').filter(Boolean);
+              if (parts.length >= 3) aliases.push(parts.slice(0, -1).join(' '));
+              if (parts.length >= 2) aliases.push(parts.slice(-2).join(' '));
+            }
             let title = null;
             for (const el of Array.from(document.querySelectorAll('*'))) {
               if (!isVisible(el)) continue;
               let direct = '';
               for (const n of el.childNodes) if (n.nodeType === Node.TEXT_NODE) direct += n.textContent || '';
               const directNorm = norm(direct);
-              const wanted = norm(wantedTitle);
-              if (directNorm === wanted || directNorm.includes(wanted) || wanted.includes(directNorm)) {
+              const innerNorm = norm((el.innerText || '').split('\n')[0] || '');
+              const hit = aliases.some((a) =>
+                (directNorm && (directNorm === a || directNorm.includes(a) || a.includes(directNorm)))
+                || (innerNorm && (innerNorm === a || (innerNorm.includes(a) && innerNorm.length <= a.length + 24)))
+              );
+              if (hit) {
                 title = el;
                 break;
               }
@@ -284,7 +296,27 @@ export default async ({ page }) => {
       }
       await sleep(700);
     }
-    return { ok: false, error: 'View My HCP List grid did not become stable', last_seen: lastSeen };
+    return { ok: false, error: `Grid for "${titleText}" did not become stable`, last_seen: lastSeen };
+  };
+
+  /** Soft label variants for dossier TOC / panel tabs (never invent unrelated screens). */
+  const navLabelAliases = (label) => {
+    const raw = String(label || '').replace(/\s+/g, ' ').trim();
+    if (!raw) return [];
+    const out = [raw];
+    const seen = new Set([raw.toLowerCase()]);
+    const add = (s) => {
+      const t = String(s || '').replace(/\s+/g, ' ').trim();
+      if (!t || seen.has(t.toLowerCase())) return;
+      seen.add(t.toLowerCase());
+      out.push(t);
+    };
+    add(raw.replace(/[’']/g, ''));
+    const parts = raw.split(' ').filter(Boolean);
+    if (parts.length >= 4) add(parts.slice(0, -1).join(' ')); // View My HCP List → View My HCP
+    if (parts.length >= 3) add(parts.slice(-3).join(' ')); // My HCP List
+    if (parts.length >= 2) add(parts.slice(-2).join(' ')); // HCP List
+    return out;
   };
 
   const evalAcrossFrames = async (fn, ...args) => {
@@ -444,7 +476,15 @@ export default async ({ page }) => {
         const dist = (r.top - lr.top) + dx;
         if (dist < valueDist) { valueDist = dist; valueEl = el; }
       }
-      if (valueEl) { valueEl.click(); return { opened: true, via: 'click-current-value', clickedText: getDirectText(valueEl) }; }
+      if (valueEl) {
+        const currentVal = getDirectText(valueEl);
+        // Already on the requested value — do not reopen (avoids false Total hits).
+        if (extractCode(currentVal) === optCode || norm(currentVal) === normOpt) {
+          return { clicked: true, via: 'already-selected', option: currentVal, skipped: true };
+        }
+        valueEl.click();
+        return { opened: true, via: 'click-current-value', clickedText: currentVal };
+      }
 
       const nearby = [];
       for (const el of Array.from(document.querySelectorAll('*'))) {
@@ -458,6 +498,64 @@ export default async ({ page }) => {
       }
       return { error: 'No selector or clickable value found near: ' + label, nearby };
     }, labelText, optionText).catch(() => ({ error: 'evaluate failed for ' + labelText }));
+
+    // Read the prompt chip value next to a filter label (iframe-aware).
+    const readFilterValue = async () => {
+      const readInFrame = frame => frame.evaluate((label) => {
+        function getDirectText(el) {
+          let t = '';
+          for (const n of el.childNodes) if (n.nodeType === Node.TEXT_NODE) t += n.textContent;
+          return t.trim();
+        }
+        const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const isVisible = el => {
+          const r = el.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) return false;
+          const st = getComputedStyle(el);
+          return st.visibility !== 'hidden' && st.display !== 'none';
+        };
+        let labelEl = null, labelArea = Infinity;
+        for (const el of Array.from(document.querySelectorAll('*'))) {
+          if (!isVisible(el)) continue;
+          if (norm(getDirectText(el)) !== norm(label)) continue;
+          const r = el.getBoundingClientRect();
+          const area = r.width * r.height;
+          if (area < labelArea) { labelEl = el; labelArea = area; }
+        }
+        if (!labelEl) return null;
+        const lr = labelEl.getBoundingClientRect();
+        let valueEl = null, valueDist = Infinity;
+        for (const el of Array.from(document.querySelectorAll('*'))) {
+          if (!isVisible(el)) continue;
+          const d = getDirectText(el);
+          if (!d || norm(d) === norm(label)) continue;
+          const r = el.getBoundingClientRect();
+          if (r.top < lr.top - 2) continue;
+          if (r.top - lr.top > 60) continue;
+          const dx = Math.abs(r.left - lr.left);
+          if (dx > 250) continue;
+          const dist = (r.top - lr.top) + dx;
+          if (dist < valueDist) { valueDist = dist; valueEl = el; }
+        }
+        return valueEl ? getDirectText(valueEl) : null;
+      }, labelText).catch(() => null);
+      const frames = cachedDossierFrame && !cachedDossierFrame.isDetached()
+        ? [cachedDossierFrame, ...page.frames().filter(f => f !== cachedDossierFrame)]
+        : page.frames();
+      for (const frame of frames) {
+        const v = await readInFrame(frame);
+        if (v) return v;
+      }
+      return null;
+    };
+
+    const valuesMatch = (wanted, actual) => {
+      if (actual == null) return false;
+      const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const code = s => norm(s).split(/\s+/)[0] || '';
+      return code(actual) === code(wanted) || norm(actual) === norm(wanted);
+    };
+
     let result = { error: 'Label not found: ' + labelText };
     let resultFrame = null;
     const frames = cachedDossierFrame && !cachedDossierFrame.isDetached()
@@ -481,36 +579,104 @@ export default async ({ page }) => {
       await closeAnyOpenDropdown();
       await waitForLoadingToFinish();
       await waitForDashboard();
-      return { ok: true, ...result };
+      const verified = await readFilterValue();
+      if (!valuesMatch(optionText, verified)) {
+        return {
+          ok: false,
+          error: 'FILTER_NOT_APPLIED',
+          label: labelText,
+          requested: optionText,
+          actual: verified,
+          via: result.via,
+        };
+      }
+      return { ok: true, verified, ...result };
     }
 
     if (result.opened) {
       await sleep(400);
+      // Prefer open popup/listbox. Athena dossiers often use unlabeled floating
+      // lists, so fall back to option-like nodes — but NEVER page-wide fuzzy
+      // match for generic "Total" (that clicks Metric "Total NPS…" chips).
       const pickInFrame = frame => frame.evaluate((opt) => {
         const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
         const optCode = norm(opt).split(/\s+/)[0];
         const normOpt = norm(opt);
+        const generic = /^(total|all|none)$/i.test(String(opt || '').trim());
         const isVisible = el => {
           const r = el.getBoundingClientRect();
           if (r.width === 0 || r.height === 0) return false;
           const st = getComputedStyle(el);
           return st.visibility !== 'hidden' && st.display !== 'none';
         };
-        const cands = Array.from(document.querySelectorAll(
-          'li, [role="option"], [role="menuitem"], [role="listbox"] *, ul *, div, span, td'
-        ));
-        let exact = null, codeMatch = null, contains = null;
-        for (const el of cands) {
-          if (!isVisible(el)) continue;
-          const t = norm(el.innerText || el.textContent || '');
-          if (!t || t.length > 60) continue;
-          if (t === normOpt && !exact) exact = el;
-          else if (t.split(/\s+/)[0] === optCode && !codeMatch) codeMatch = el;
-          else if (t.includes(normOpt) && !contains) contains = el;
+        const optionish = el => {
+          const role = (el.getAttribute && (el.getAttribute('role') || '') || '').toLowerCase();
+          const tag = (el.tagName || '').toLowerCase();
+          const cls = String(el.className || '');
+          return tag === 'li' || role === 'option' || role === 'menuitem'
+            || /option|menuitem|listitem|pulldown|dropdown/i.test(cls);
+        };
+        const rejectNoise = raw => {
+          const t = norm(raw);
+          if (!t || t.length > 80) return true;
+          // Metric multi-select chip: "Total NPS, Total Units, % …"
+          if (t.includes(',') || /\bnps\b/.test(t) || t.includes('%')) return true;
+          return false;
+        };
+        const popupRoots = Array.from(document.querySelectorAll(
+          '[role="listbox"], [role="menu"], .mstrmojo-Popup, .mstrmojo-Pulldown-box, .mstrmojo-ListBase, .mstrmojo-PopupList, [class*="Popup" i], [class*="pulldown" i], [class*="dropdown" i], [class*="DropDown" i], [class*="suggest" i], [class*="Suggest" i]'
+        )).filter(isVisible);
+        // Floating panels without those class names (common on Athena): large
+        // absolute/fixed boxes that contain several short option-like children.
+        if (!popupRoots.length) {
+          for (const el of Array.from(document.querySelectorAll('div, ul, section'))) {
+            if (!isVisible(el)) continue;
+            const st = getComputedStyle(el);
+            const pos = st.position;
+            if (pos !== 'absolute' && pos !== 'fixed') continue;
+            const r = el.getBoundingClientRect();
+            if (r.width < 80 || r.height < 40 || r.height > 700) continue;
+            const kids = Array.from(el.querySelectorAll('li, [role="option"], div, span')).filter(isVisible);
+            let shortKids = 0;
+            for (const k of kids) {
+              const tx = norm((k.innerText || k.textContent || '').split('\n')[0]);
+              if (tx && tx.length <= 60 && !tx.includes(',')) shortKids++;
+              if (shortKids >= 3) break;
+            }
+            if (shortKids >= 3) popupRoots.push(el);
+          }
         }
-        const best = exact || codeMatch || contains;
-        if (best) { best.click(); return { clicked: true, text: (best.innerText || best.textContent || '').trim().substring(0, 60) }; }
-        return null;
+        const roots = popupRoots.length ? popupRoots : [document.body];
+        const scoped = popupRoots.length > 0;
+        let best = null;
+        for (const root of roots) {
+          const cands = Array.from(root.querySelectorAll(
+            'li, [role="option"], [role="menuitem"], a, span, div, td'
+          ));
+          for (const el of cands) {
+            if (!isVisible(el)) continue;
+            let direct = '';
+            for (const n of el.childNodes) if (n.nodeType === Node.TEXT_NODE) direct += n.textContent;
+            const raw = (direct || (el.innerText || el.textContent || '')).trim();
+            if (rejectNoise(raw)) continue;
+            const t = norm(raw.split('\n')[0] || '');
+            // Generic values (Total/All) require exact text — never prefix/contains.
+            let rank = 0;
+            if (t === normOpt) rank = optionish(el) ? 4 : 3;
+            else if (!generic && scoped && t.split(/\s+/)[0] === optCode) rank = optionish(el) ? 2 : 1;
+            else if (!generic && scoped && t.startsWith(normOpt)) rank = 1;
+            if (!rank) continue;
+            // Unscoped body fallback: only exact option-like matches.
+            if (!scoped && rank < 3) continue;
+            const area = el.getBoundingClientRect().width * el.getBoundingClientRect().height;
+            if (area > 120000) continue;
+            if (!best || rank > best.rank || (rank === best.rank && area < best.area)) {
+              best = { el, rank, area, text: raw.substring(0, 60), scoped };
+            }
+          }
+        }
+        if (best) { best.el.click(); return { clicked: true, text: best.text, rank: best.rank, scoped: best.scoped }; }
+        return { clicked: false, error: scoped ? 'option-not-in-popup' : 'option-not-found', popup_count: popupRoots.length };
       }, optionText).catch(() => null);
       let picked = null;
       const pickFrames = resultFrame
@@ -524,9 +690,21 @@ export default async ({ page }) => {
         await closeAnyOpenDropdown();
         await waitForLoadingToFinish();
         await waitForDashboard();
-        return { ok: true, via: 'opened-then-picked', ...picked };
+        const verified = await readFilterValue();
+        if (!valuesMatch(optionText, verified)) {
+          return {
+            ok: false,
+            error: 'FILTER_NOT_APPLIED',
+            label: labelText,
+            requested: optionText,
+            actual: verified,
+            clickedText: picked.text,
+            via: 'opened-then-picked',
+          };
+        }
+        return { ok: true, via: 'opened-then-picked', verified, ...picked };
       }
-      return { ok: false, error: 'Opened dropdown for ' + labelText + ' but option not found: ' + optionText, clickedTo: result.clickedText };
+      return { ok: false, error: 'Opened dropdown for ' + labelText + ' but option not found: ' + optionText, clickedTo: result.clickedText, pick: picked };
     }
 
     return { ok: false, ...result };
@@ -535,19 +713,27 @@ export default async ({ page }) => {
   // @@RTB_FILTER_CORE_END@@
 
   const clickByText = async (text, { scope, openers } = {}) => {
-    const tryClickInFrame = frame => frame.evaluate((label, scopeSel) => {
+    const labels = navLabelAliases(text);
+    const tryClickInFrame = (frame, label) => frame.evaluate((labelText, scopeSel) => {
       function getDirectText(el) {
         let t = '';
         for (const n of el.childNodes) if (n.nodeType === Node.TEXT_NODE) t += n.textContent;
         return t.trim();
       }
       const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-      const target = norm(label);
+      const target = norm(labelText);
       const isVisible = el => {
         const r = el.getBoundingClientRect();
         if (r.width === 0 || r.height === 0) return false;
         const st = el.ownerDocument.defaultView.getComputedStyle(el);
         return st.visibility !== 'hidden' && st.display !== 'none';
+      };
+      const matchText = (direct, inner) => {
+        if (direct === target || inner === target) return 'exact';
+        if (direct && (direct.includes(target) || target.includes(direct)) && Math.min(direct.length, target.length) >= 6) return 'soft';
+        if (inner.includes(target) && inner.length <= target.length + 48) return 'contains';
+        if (target.length >= 10 && inner.includes(target.slice(0, Math.min(18, target.length))) && inner.length <= target.length + 48) return 'prefix';
+        return '';
       };
       const roots = [];
       const pushRoot = (root) => {
@@ -559,66 +745,64 @@ export default async ({ page }) => {
       for (const f of Array.from(document.querySelectorAll('iframe, frame'))) {
         try { pushRoot(f.contentDocument); } catch (_) {}
       }
-      const exact = [], attr = [], contains = [];
+      const hits = [];
       for (const root of roots) {
-        for (const el of Array.from(root.querySelectorAll('*'))) {
+        for (const el of Array.from(root.querySelectorAll(
+          'a, button, li, div, span, td, [role="tab"], [role="menuitem"], [role="treeitem"], [role="button"], [class*="toc" i], [class*="TreeNode" i], [class*="tab" i]'
+        ))) {
           if (!isVisible(el)) continue;
-          const direct = getDirectText(el);
-          if (direct && norm(direct) === target) {
-            const r = el.getBoundingClientRect();
-            exact.push({ el, area: r.width * r.height });
-            continue;
-          }
+          const direct = norm(getDirectText(el));
+          const inner = norm(el.innerText || el.textContent || '');
           const al = el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('alt') || el.getAttribute('data-tooltip'));
-          if (al && norm(al) === target) {
-            const r = el.getBoundingClientRect();
-            attr.push({ el, area: r.width * r.height });
-          }
-        }
-        for (const el of Array.from(root.querySelectorAll('a, button, li, div, span, td, [role="tab"], [role="menuitem"], [role="button"]'))) {
-          if (!isVisible(el)) continue;
-          const it = norm(el.innerText || el.textContent || '');
-          if (!it || !it.includes(target)) continue;
+          const kind = matchText(direct, inner) || (al && norm(al) === target ? 'attr' : '');
+          if (!kind) continue;
           const r = el.getBoundingClientRect();
-          if (r.width * r.height > 200000) continue;
-          contains.push({ el, area: r.width * r.height, len: it.length });
+          const area = r.width * r.height;
+          const role = (el.getAttribute('role') || '').toLowerCase();
+          const cls = String(el.className || '');
+          const tabish = role === 'tab' || role === 'treeitem' || /toc|treenode|tab/i.test(cls);
+          if (!tabish && area > 220000) continue;
+          const score = (kind === 'exact' ? 8 : kind === 'attr' ? 7 : kind === 'soft' ? 5 : 3)
+            + (tabish ? 4 : 0)
+            + (role === 'tab' ? 2 : 0);
+          hits.push({ el, area, score, kind, exact: kind === 'exact' ? 1 : 0 });
         }
       }
-      exact.sort((a, b) => a.area - b.area);
-      attr.sort((a, b) => a.area - b.area);
-      contains.sort((a, b) => (a.len - b.len) || (a.area - b.area));
-      const best = exact[0] || attr[0] || contains[0];
-      if (best) {
-        const el = best.el;
-        const forId = el.getAttribute && el.getAttribute('for');
-        if (forId) {
-          const inp = el.ownerDocument.getElementById(forId);
-          if (inp) { inp.click(); return { clicked: true, via: 'label-for', text: label }; }
-        }
-        const innerRadio = el.querySelector && el.querySelector('input[type="radio"], input[type="checkbox"]');
-        if (innerRadio) { innerRadio.click(); return { clicked: true, via: 'inner-radio', text: label }; }
-        el.click();
-        return { clicked: true, via: exact[0] ? 'text' : attr[0] ? 'attr' : 'contains', text: label };
+      if (!hits.length) return { error: 'navigation target not found: ' + labelText };
+      hits.sort((a, b) => (b.exact - a.exact) || (b.score - a.score) || (a.area - b.area));
+      const el = hits[0].el;
+      try { el.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) {}
+      const forId = el.getAttribute && el.getAttribute('for');
+      if (forId) {
+        const inp = el.ownerDocument.getElementById(forId);
+        if (inp) { inp.click(); return { clicked: true, via: 'label-for', text: labelText, matched: hits[0].kind }; }
       }
-      for (const inp of Array.from(document.querySelectorAll('input[type="radio"], input[type="checkbox"]'))) {
-        const id = inp.id;
-        if (id) {
-          const lab = document.querySelector('label[for="' + id + '"]');
-          if (lab && norm(lab.innerText || '') === target) { inp.click(); return { clicked: true, via: 'radio-label', text: label }; }
-        }
-        const parent = inp.parentElement;
-        if (parent && norm(parent.innerText || '') === target) { inp.click(); return { clicked: true, via: 'radio-parent', text: label }; }
-      }
-      return { error: 'navigation target not found: ' + label };
-    }, text, scope || null).catch(() => ({ error: 'evaluate failed: ' + text }));
+      el.click();
+      return { clicked: true, via: 'frame-eval', text: labelText, matched: hits[0].kind };
+    }, label, scope || null).catch(() => ({ error: 'evaluate failed: ' + label }));
 
-    const tryClick = async () => {
+    const labelVisibleInFrames = async (label) => {
+      for (const frame of page.frames()) {
+        try {
+          const hit = await frame.evaluate((labelText) => {
+            const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const target = norm(labelText);
+            const body = norm(document.body ? document.body.innerText : '');
+            return !!(target && body.includes(target));
+          }, label);
+          if (hit) return true;
+        } catch (_) {}
+      }
+      return false;
+    };
+
+    const tryClick = async (label) => {
       const frames = cachedDossierFrame && !cachedDossierFrame.isDetached()
         ? [cachedDossierFrame, ...page.frames().filter(f => f !== cachedDossierFrame)]
         : page.frames();
-      let last = { error: 'navigation target not found: ' + text };
+      let last = { error: 'navigation target not found: ' + label };
       for (const frame of frames) {
-        const candidate = await tryClickInFrame(frame);
+        const candidate = await tryClickInFrame(frame, label);
         if (candidate && !candidate.error) {
           cachedDossierFrame = frame;
           return { ...candidate, frame_url: frame.url() };
@@ -628,7 +812,11 @@ export default async ({ page }) => {
       return last;
     };
 
-    let res = await tryClick();
+    let res = { error: 'navigation target not found: ' + text };
+    for (const label of labels) {
+      res = await tryClick(label);
+      if (res && !res.error) break;
+    }
     if (res && res.error && Array.isArray(openers) && openers.length) {
       for (const op of openers) {
         const opened = await page.evaluate((opLabel) => {
@@ -645,8 +833,20 @@ export default async ({ page }) => {
         }, op).catch(() => false);
         if (opened) {
           await sleep(600);
-          res = await tryClick();
+          for (const label of labels) {
+            res = await tryClick(label);
+            if (res && !res.error) break;
+          }
           if (res && !res.error) break;
+        }
+      }
+    }
+    // Report URL / prior nav may already show this chapter — treat visible label as success.
+    if (res && res.error) {
+      for (const label of labels) {
+        if (await labelVisibleInFrames(label)) {
+          res = { clicked: true, via: 'already-visible', text: label };
+          break;
         }
       }
     }
@@ -1193,19 +1393,28 @@ export default async ({ page }) => {
 
       await waitForDashboard();
       const tabFilters = {};
-      for (const key of geoKeys) {
-        tabFilters[key] = await selectByLabel(key, filters[key]);
+      let filterFailed = null;
+      for (const key of geoKeys.concat(otherKeys)) {
+        const applied = await selectByLabel(key, filters[key]);
+        tabFilters[key] = applied;
         await dismissGenericErrorDialog();
-      }
-      for (const key of otherKeys) {
-        tabFilters[key] = await selectByLabel(key, filters[key]);
-        await dismissGenericErrorDialog();
+        if (!applied || applied.ok === false) {
+          filterFailed = { key, ...applied };
+          break;
+        }
       }
       await closeAnyOpenDropdown();
       // The validator expects the applied filter map at the top level. Each tab
       // also carries its own diagnostic copy for multi-tab cases.
       if (!Object.keys(row.filters_applied).length) row.filters_applied = tabFilters;
       row[kpiKey + '_filters'] = tabFilters;
+      if (filterFailed) {
+        row.ok = false;
+        row.error = 'FILTER_NOT_APPLIED';
+        row.failed_on = filterFailed.key;
+        row.filter_error = filterFailed;
+        return row;
+      }
 
       const gridReady = await waitForTargetGridStable(tab, 60000);
       row[kpiKey + '_grid_ready'] = gridReady;

@@ -28,6 +28,7 @@ const FUNCTIONS = [
   "agent-scenarios",
   "agent-scrape",
   "agent-scripts",
+  "script-agent-chat",
   "bootstrap-admin",
   "playwright-runtime",
   "run-warehouse-sql",
@@ -67,10 +68,17 @@ for (const name of FUNCTIONS) {
 }
 currentName = "";
 
-if (handlers.size !== FUNCTIONS.length) {
+// Agent chat needs extra npm packages that a corporate proxy may block; it must
+// not stop test execution from starting.
+const OPTIONAL = new Set(["script-agent-chat"]);
+const missingRequired = FUNCTIONS.filter((n) => !handlers.has(n) && !OPTIONAL.has(n));
+if (missingRequired.length) {
   throw new Error(
-    `Backend startup aborted: only ${handlers.size}/${FUNCTIONS.length} functions loaded`,
+    `Backend startup aborted: failed to load ${missingRequired.join(", ")} (see [load failed] lines above)`,
   );
+}
+for (const n of OPTIONAL) {
+  if (!handlers.has(n)) console.warn(`[warning] ${n} unavailable — see [load failed] line above`);
 }
 
 // Restore real Deno.serve and start the gateway

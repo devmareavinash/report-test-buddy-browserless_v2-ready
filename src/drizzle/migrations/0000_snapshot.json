@@ -1,0 +1,69 @@
+-- Records each report's outcome in a workstream run exactly once (keyed by
+-- report id), and marks the run failed when any report errored.
+CREATE OR REPLACE FUNCTION public.finalize_workstream_report(
+  p_run_id uuid,
+  p_report_id uuid,
+  p_add_pass integer,
+  p_add_fail integer,
+  p_had_error boolean,
+  p_error_message text DEFAULT NULL
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  cur public.runs%ROWTYPE;
+  s jsonb;
+  reports jsonb;
+  child_count integer;
+  done_count integer;
+  failed_count integer;
+  errors jsonb;
+BEGIN
+  SELECT * INTO cur FROM public.runs WHERE id = p_run_id FOR UPDATE;
+  IF NOT FOUND OR cur.status <> 'running' THEN RETURN; END IF;
+
+  s := COALESCE(cur.summary, '{}'::jsonb);
+  reports := COALESCE(s -> 'reports', '{}'::jsonb);
+  IF reports ? p_report_id::text THEN RETURN; END IF; -- already recorded
+
+  reports := reports || jsonb_build_object(p_report_id::text, jsonb_build_object(
+    'status', CASE WHEN p_had_error THEN 'error' ELSE 'done' END,
+    'pass', COALESCE(p_add_pass, 0),
+    'fail', COALESCE(p_add_fail, 0),
+    'error', p_error_message
+  ));
+  child_count := COALESCE((s ->> 'child_count')::integer, 0);
+  SELECT count(*), count(*) FILTER (WHERE value ->> 'status' = 'error')
+    INTO done_count, failed_count FROM jsonb_each(reports);
+
+  errors := COALESCE(s -> 'errors', '[]'::jsonb);
+  IF p_had_error THEN
+    errors := errors || jsonb_build_array(COALESCE(p_error_message, 'report error'));
+  END IF;
+
+  s := s || jsonb_build_object(
+    'pass', COALESCE((s ->> 'pass')::integer, 0) + COALESCE(p_add_pass, 0),
+    'fail', COALESCE((s ->> 'fail')::integer, 0) + COALESCE(p_add_fail, 0),
+    'total', COALESCE((s ->> 'total')::integer, 0) + COALESCE(p_add_pass, 0) + COALESCE(p_add_fail, 0),
+    'done', done_count,
+    'failed_reports', failed_count,
+    'reports', reports
+  );
+  IF jsonb_array_length(errors) > 0 THEN s := s || jsonb_build_object('errors', errors); END IF;
+
+  UPDATE public.runs SET
+    summary = s,
+    status = CASE WHEN child_count > 0 AND done_count >= child_count
+      THEN CASE WHEN failed_count > 0 THEN 'failed' ELSE 'completed' END
+      ELSE status END,
+    finished_at = CASE WHEN child_count > 0 AND done_count >= child_count THEN now() ELSE finished_at END
+  WHERE id = p_run_id;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.finalize_workstream_report(uuid, uuid, integer, integer, boolean, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.finalize_workstream_report(uuid, uuid, integer, integer, boolean, text) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.finalize_workstream_report(uuid, uuid, integer, integer, boolean, text) TO service_role;

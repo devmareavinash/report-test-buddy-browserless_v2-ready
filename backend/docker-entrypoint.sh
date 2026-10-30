@@ -12,4 +12,4 @@ if [ -n "${HTTP_PROXY}${HTTPS_PROXY}${http_proxy}${https_proxy}" ]; then
   fi
 fi
 
-exec deno run --cached-only $EXTRA_FLAGS --allow-net --allow-env --allow-read --allow-write server.ts
+exec deno run --cached-only $EXTRA_FLAGS --allow-net --allow-env --allow-read --allow-write --allow-sys server.ts

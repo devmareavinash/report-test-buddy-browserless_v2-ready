@@ -30,6 +30,9 @@ import { compareTables, summarizeTableCompare } from "@/lib/tableCompare";
 import { attachTrendFields, trendStatusFromValues } from "@/lib/trend-payload";
 import { fetchCanonicalScript, persistCanonicalScript } from "@/lib/canonicalScript";
 import { pairCombosWithResults } from "@/lib/latestTestResults";
+import { ScriptAgentChat } from "@/components/ScriptAgentChat";
+import { summarizeRunFailureForChat } from "@/lib/script-agent-proposal";
+import { MessageSquare } from "lucide-react";
 
 const canonFilters = (f: Record<string, string>) => {
   const keys = Object.keys(f || {}).map((k) => k.trim()).filter(Boolean).sort();
@@ -93,6 +96,8 @@ export default function ScenarioDetail() {
   });
 
   const [code, setCode] = useState("");
+  const [agentChatOpen, setAgentChatOpen] = useState(false);
+  const [agentChatTarget, setAgentChatTarget] = useState<"main" | "reference">("main");
   const [refCode, setRefCode] = useState("");
   const [spec, setSpec] = useState("{}");
   const [tplId, setTplId] = useState("");
@@ -1560,6 +1565,9 @@ export default function ScenarioDetail() {
                   >
                     Apply to all in report
                   </Button>
+                  <Button size="sm" variant="outline" disabled={!script?.id || !code.trim()} onClick={() => { setAgentChatTarget("main"); setAgentChatOpen(true); }}>
+                    <MessageSquare className="h-3 w-3" /> Agent chat
+                  </Button>
                   <ScriptHistory
                     scenarioId={id!}
                     scriptId={script?.id}
@@ -1646,6 +1654,14 @@ export default function ScenarioDetail() {
                         toast.success(`Loaded v${v.version} — click Save to persist`);
                       }}
                     />
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={!script?.id || !refCode.trim()}
+                      onClick={() => { setAgentChatTarget("reference"); setAgentChatOpen(true); }}
+                    >
+                      <MessageSquare className="h-3 w-3" /> Agent chat
+                    </Button>
                     <Button
                       size="sm"
                       onClick={() => genReferenceScript.mutate()}
@@ -2169,6 +2185,34 @@ export default function ScenarioDetail() {
           </AlertDialogContent>
         </AlertDialog>
       </div>
+      {script?.id && <ScriptAgentChat
+        key={`${script.id}-${agentChatTarget}`}
+        open={agentChatOpen}
+        onOpenChange={setAgentChatOpen}
+        scriptId={script.id}
+        target={agentChatTarget}
+        title={scenario.title}
+        code={agentChatTarget === "reference" ? refCode : code}
+        runtimeError={
+          (() => {
+            const firstCombo = Array.isArray(combos) && combos[0] && typeof (combos[0] as { filters?: unknown }).filters === "object"
+              ? (combos[0] as { filters: Record<string, string> }).filters
+              : null;
+            return agentChatTarget === "reference"
+              ? summarizeRunFailureForChat(refRunError, refRunResult, 5_000, firstCombo)
+              : summarizeRunFailureForChat(runError, runResult, 5_000, firstCombo);
+          })()
+        }
+        onApply={(corrected) => {
+          if (agentChatTarget === "reference") {
+            setRefCode(corrected);
+            toast.success("Correction loaded into reference editor — click Save to persist");
+          } else {
+            setCode(corrected);
+            toast.success("Correction loaded into editor — click Save to persist");
+          }
+        }}
+      />}
     </AppLayout>
   );
 }

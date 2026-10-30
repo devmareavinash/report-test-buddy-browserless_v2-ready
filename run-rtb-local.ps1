@@ -250,7 +250,7 @@ elseif (Test-Path (Join-Path $root "scripts\dev-backend.ps1")) {
 }
 else {
   $backend = Join-Path $root "backend"
-  Start-ChildCommand $backend "deno run --unsafely-ignore-certificate-errors --allow-net --allow-env --allow-read --allow-write server.ts"
+  Start-ChildCommand $backend "deno run --unsafely-ignore-certificate-errors --allow-net --allow-env --allow-read --allow-write --allow-sys server.ts"
   Wait-Port 8000 "Deno backend" 120 | Out-Null
 }
 
@@ -278,7 +278,7 @@ if ($down -contains "Deno backend") {
   Write-Host "    Start the backend by hand in its own terminal and watch the error:" -ForegroundColor Yellow
   Write-Host "        cd `"$root\scripts`"; .\dev-backend.ps1" -ForegroundColor White
   Write-Host "    or directly:" -ForegroundColor Yellow
-  Write-Host "        cd `"$root\backend`"; deno run --unsafely-ignore-certificate-errors --allow-net --allow-env --allow-read --allow-write server.ts" -ForegroundColor White
+  Write-Host "        cd `"$root\backend`"; deno run --unsafely-ignore-certificate-errors --allow-net --allow-env --allow-read --allow-write --allow-sys server.ts" -ForegroundColor White
   Write-Host ""
 }
 

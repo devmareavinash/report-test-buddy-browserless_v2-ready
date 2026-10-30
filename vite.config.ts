@@ -25,6 +25,7 @@ export default defineConfig(() => ({
         "**/infra/**",
         "**/scripts/**",
         "**/dist/**",
+        "**/.tmp-pkgs/**",
         "**/__pycache__/**",
         "**/*.pyc",
         "**/tmp-*.ts",
@@ -43,6 +44,13 @@ export default defineConfig(() => ({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
+      // Lightweight local shims — full packages are too large for this VDI disk.
+      streamdown: path.resolve(__dirname, "./src/shims/streamdown.tsx"),
+      "@streamdown/cjk": path.resolve(__dirname, "./src/shims/streamdown-cjk.ts"),
+      "@streamdown/code": path.resolve(__dirname, "./src/shims/streamdown-code.ts"),
+      "@streamdown/math": path.resolve(__dirname, "./src/shims/streamdown-math.ts"),
+      "@streamdown/mermaid": path.resolve(__dirname, "./src/shims/streamdown-mermaid.ts"),
+      shiki: path.resolve(__dirname, "./src/shims/shiki.ts"),
     },
     dedupe: ["react", "react-dom", "react/jsx-runtime", "react/jsx-dev-runtime", "@tanstack/react-query", "@tanstack/query-core"],
   },
