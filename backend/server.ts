@@ -81,6 +81,33 @@ for (const n of OPTIONAL) {
   if (!handlers.has(n)) console.warn(`[warning] ${n} unavailable — see [load failed] line above`);
 }
 
+// Persist MicroStrategy login cookies around playwright-runtime without
+// modifying that function — restore/capture happens in this gateway wrapper.
+{
+  const pw = handlers.get("playwright-runtime");
+  if (pw) {
+    const gatewayCandidates = [
+      new URL("../supabase/functions/_shared/auth-session-gateway.ts", import.meta.url),
+      new URL("./functions/_shared/auth-session-gateway.ts", import.meta.url),
+    ];
+    let wrapped = false;
+    for (const candidate of gatewayCandidates) {
+      try {
+        const { withPlaywrightAuthSession } = await import(candidate.href);
+        handlers.set("playwright-runtime", withPlaywrightAuthSession(pw));
+        console.log("[wrapped] playwright-runtime auth-session reuse");
+        wrapped = true;
+        break;
+      } catch {
+        /* try next path (local repo vs Docker FUNCTIONS_DIR layout) */
+      }
+    }
+    if (!wrapped) {
+      console.warn("[warning] auth-session gateway unavailable — playwright-runtime runs without session reuse");
+    }
+  }
+}
+
 // Restore real Deno.serve and start the gateway
 // @ts-ignore
 Deno.serve = originalServe;

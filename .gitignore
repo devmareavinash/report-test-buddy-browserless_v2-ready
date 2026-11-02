@@ -11,6 +11,9 @@ build/
 .env.*
 !.env.example
 
+# Persisted Browserless/Playwright login sessions (cookies) — never commit
+.auth-sessions/
+
 # Logs
 logs/
 *.log
