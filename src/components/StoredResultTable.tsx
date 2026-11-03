@@ -3,6 +3,20 @@ import { GridComparePanels, isChartTable, toTableModel } from "@/components/KpiG
 import { deriveStoredResultRows, resolveKpiTol, storedKpiSpec, type StoredResultStatus } from "@/lib/kpi-values";
 import { compareTables, summarizeTableCompare } from "@/lib/tableCompare";
 import { pickTrendView } from "@/lib/trend-payload";
+import { scrapeBadgeLabel } from "@/lib/scrapeReuse";
+
+function scrapeChip(side: unknown, label: string) {
+  const text = scrapeBadgeLabel(side);
+  const reused = text.startsWith("Reused");
+  const cls = reused
+    ? "bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/30"
+    : "bg-secondary text-muted-foreground border-border";
+  return (
+    <span className={`mono text-[10px] px-1.5 py-0.5 rounded border ${cls}`} title={label}>
+      {label}: {text}
+    </span>
+  );
+}
 
 function fmt(v: any, label?: string): string {
   if (v === null || v === undefined) return "—";
@@ -71,10 +85,17 @@ export function StoredResultTable({
     : null;
   const grains = trend?.grains || [];
   const expectedLabel = isTrend ? "Required" : isRef ? "Reference URL" : "Expected (BE / SQL)";
+  const scrapeRow = (
+    <div className="flex flex-wrap items-center gap-2 text-xs">
+      {scrapeChip(actual, "Actual")}
+      {scrapeChip(expected, isRef ? "Reference" : "Expected")}
+    </div>
+  );
 
   if (isTrend && grains.length) {
     return (
       <div className="space-y-2">
+        {scrapeRow}
         <div className="flex items-center gap-2 text-xs">
           <span className="text-muted-foreground">Overall Status:</span>
           {badge(derived.status)}
@@ -118,6 +139,7 @@ export function StoredResultTable({
   if (isTrend) {
     return (
       <div className="space-y-2">
+        {scrapeRow}
         <div className="flex items-center gap-2 text-xs">
           <span className="text-muted-foreground">Overall Status:</span>
           {badge(derived.status)}
@@ -131,11 +153,17 @@ export function StoredResultTable({
   }
 
   if (!rows.length) {
-    return <div className="text-muted-foreground">No KPI values extracted yet.</div>;
+    return (
+      <div className="space-y-2">
+        {scrapeRow}
+        <div className="text-muted-foreground">No KPI values extracted yet.</div>
+      </div>
+    );
   }
 
   return (
     <div className="space-y-2">
+      {scrapeRow}
       <div className="flex items-center gap-2 text-xs">
         <span className="text-muted-foreground">Overall Status:</span>
         {badge(derived.status)}

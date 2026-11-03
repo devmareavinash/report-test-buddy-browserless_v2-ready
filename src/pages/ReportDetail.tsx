@@ -20,8 +20,34 @@ import { ConcurrencySelect, readOrchestrateConcurrency, useOrchestrateConcurrenc
 import { duplicateReport, duplicateScenario } from "@/lib/duplicateEntities";
 import { deleteReport, deleteScenario, deleteReportConfirm, deleteScenarioConfirm } from "@/lib/deleteEntities";
 import { useExecutionLocks } from "@/hooks/useExecutionLocks";
+import { confirmReuseRunMessage } from "@/lib/scrapeReuse";
 
 const CRIT = ["low", "medium", "high", "critical"];
+
+type SuitePreset = {
+  reuse_main: boolean;
+  reuse_reference: boolean;
+  comparator_override?: string;
+};
+
+function pickSuitePreset(): SuitePreset | null {
+  const raw = window.prompt(
+    "Scrape mode:\n  both = scrape Main + Reference live\n  preprod = scrape Pre-prod, reuse Prod from Supabase\n  prod = scrape Prod, reuse Pre-prod from Supabase",
+    "both",
+  );
+  if (raw == null) return null;
+  const choice = raw.trim().toLowerCase();
+  if (choice === "preprod" || choice === "pre-prod") {
+    if (!confirm(confirmReuseRunMessage("preprod"))) return null;
+    return { reuse_main: true, reuse_reference: false, comparator_override: "lte" };
+  }
+  if (choice === "prod") {
+    if (!confirm(confirmReuseRunMessage("prod"))) return null;
+    return { reuse_main: false, reuse_reference: true, comparator_override: "eq" };
+  }
+  if (!confirm(confirmReuseRunMessage("both"))) return null;
+  return { reuse_main: false, reuse_reference: false };
+}
 
 export default function ReportDetail() {
   const { id } = useParams();
@@ -88,11 +114,12 @@ export default function ReportDetail() {
     onError: (e: any) => toast.error(e?.message || "Scenario generation failed"),
   });
   const runSuite = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (preset: SuitePreset) => {
       const { data, error } = await invokeFunction("agent-orchestrate", {
         scope_type: "report",
         scope_id: id,
         concurrency,
+        ...preset,
       });
       if (error) throw error;
       return data;
@@ -148,7 +175,11 @@ export default function ReportDetail() {
               disabled={runSuite.isPending || executionLocks.isReportRunning(id!, report.workstream_id)}
             />
             <Button
-              onClick={() => runSuite.mutate()}
+              onClick={() => {
+                const preset = pickSuitePreset();
+                if (!preset) return;
+                runSuite.mutate(preset);
+              }}
               disabled={runSuite.isPending || executionLocks.isReportRunning(id!, report.workstream_id)}
             >
               {runSuite.isPending || executionLocks.isReportRunning(id!, report.workstream_id)
@@ -233,11 +264,32 @@ export default function ReportDetail() {
   );
 }
 
+async function linkPairedReports(reportId: string, pairedId: string | null, previousPairedId?: string | null) {
+  // Clear previous partner first so one-way links cannot linger.
+  if (previousPairedId && previousPairedId !== pairedId) {
+    await supabase.from("reports").update({ paired_report_id: null }).eq("id", previousPairedId).eq("paired_report_id", reportId);
+  }
+  if (pairedId) {
+    const { data: peer } = await supabase.from("reports").select("paired_report_id").eq("id", pairedId).maybeSingle();
+    const peerPrev = (peer as any)?.paired_report_id as string | null | undefined;
+    if (peerPrev && peerPrev !== reportId) {
+      await supabase.from("reports").update({ paired_report_id: null }).eq("id", peerPrev).eq("paired_report_id", pairedId);
+    }
+  }
+  const { error } = await supabase.from("reports").update({ paired_report_id: pairedId }).eq("id", reportId);
+  if (error) throw error;
+  if (pairedId) {
+    const { error: peerErr } = await supabase.from("reports").update({ paired_report_id: reportId }).eq("id", pairedId);
+    if (peerErr) throw peerErr;
+  }
+}
+
 function ReportHeader({ report }: { report: any }) {
   const qc = useQueryClient();
   const navigate = useNavigate();
   const [edit, setEdit] = useState(false);
   const [duping, setDuping] = useState(false);
+  const [pairing, setPairing] = useState(false);
   const { data: tree } = useQuery({
     queryKey: ["report-tree"],
     queryFn: async () => {
@@ -246,6 +298,8 @@ function ReportHeader({ report }: { report: any }) {
       return { ws, rep };
     },
   });
+  const peerReports = (tree?.rep || []).filter((r: any) => r.id !== report.id);
+  const paired = peerReports.find((r: any) => r.id === report.paired_report_id) || null;
   const del = async () => {
     if (!confirm(deleteReportConfirm(report.name))) return;
     try {
@@ -270,13 +324,55 @@ function ReportHeader({ report }: { report: any }) {
       setDuping(false);
     }
   };
+  const setPaired = async (nextId: string) => {
+    const pairedId = nextId === "__none__" ? null : nextId;
+    setPairing(true);
+    try {
+      await linkPairedReports(report.id, pairedId, report.paired_report_id || null);
+      toast.success(pairedId ? "Paired for scrape reuse" : "Pairing cleared");
+      qc.invalidateQueries({ queryKey: ["report", report.id] });
+      qc.invalidateQueries({ queryKey: ["report-tree"] });
+    } catch (e: any) {
+      toast.error(e?.message || "Could not update pairing");
+    } finally {
+      setPairing(false);
+    }
+  };
   return (
-    <div className="flex items-start justify-between">
-      <div className="space-y-1 flex-1">
+    <div className="flex items-start justify-between gap-4">
+      <div className="space-y-1 flex-1 min-w-0">
         <div className="text-xs text-muted-foreground mono">{report.workstreams?.name}</div>
         <h1 className="text-2xl font-semibold">{report.name}</h1>
         <a href={report.url} target="_blank" className="text-xs text-accent mono break-all">{report.url}</a>
         {report.reference_url && <div className="text-xs text-muted-foreground mono">ref: {report.reference_url}</div>}
+        <div className="pt-2 flex flex-wrap items-center gap-2 max-w-xl">
+          <div className="text-[10px] text-muted-foreground uppercase mono">Paired screen (scrape reuse)</div>
+          <Select
+            value={report.paired_report_id || "__none__"}
+            onValueChange={(v) => void setPaired(v)}
+            disabled={pairing}
+          >
+            <SelectTrigger className="w-72 h-8 text-xs">
+              <SelectValue placeholder="None" />
+            </SelectTrigger>
+            <SelectContent className="max-h-60">
+              <SelectItem value="__none__">None</SelectItem>
+              {peerReports.map((r: any) => (
+                <SelectItem key={r.id} value={r.id}>{r.name}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          {paired && (
+            <Link to={`/reports/${paired.id}`} className="text-xs text-accent mono truncate">
+              ↔ {paired.name}
+            </Link>
+          )}
+          {!report.paired_report_id && (
+            <span className="text-[10px] text-muted-foreground">
+              Without a pair, Mon/Tue reuse only looks at this screen&apos;s own history.
+            </span>
+          )}
+        </div>
       </div>
       <div className="flex flex-wrap gap-1 items-center justify-end">
         <Button size="sm" variant="outline" onClick={() => setEdit(true)}><Pencil className="h-3 w-3 mr-1" /> Edit Screen Details</Button>
@@ -489,8 +585,20 @@ function ScheduleEditor({ reportId }: { reportId: string }) {
   const [minute, setMinute] = useState(0);
   const [dow, setDow] = useState("1");
   const [comparator, setComparator] = useState<string>("eq");
+  // both | preprod (reuse prod/main) | prod (reuse pre-prod/reference)
+  const [reusePreset, setReusePreset] = useState<"both" | "preprod" | "prod">("both");
   const browserTz = typeof Intl !== "undefined" ? Intl.DateTimeFormat().resolvedOptions().timeZone : "UTC";
   const [timezone, setTimezone] = useState<string>(browserTz || "UTC");
+
+  const reuseFlagsFromPreset = (p: "both" | "preprod" | "prod") => ({
+    reuse_main: p === "preprod",
+    reuse_reference: p === "prod",
+  });
+  const presetFromFlags = (s: { reuse_main?: boolean; reuse_reference?: boolean }) => {
+    if (s.reuse_main && !s.reuse_reference) return "preprod";
+    if (!s.reuse_main && s.reuse_reference) return "prod";
+    return "both";
+  };
 
   const TZ_OPTIONS = Array.from(new Set([
     browserTz, "UTC",
@@ -502,7 +610,17 @@ function ScheduleEditor({ reportId }: { reportId: string }) {
   const cron = (FREQ_PRESETS[freq] || FREQ_PRESETS.daily)(hour, minute, dow);
 
   const save = async () => {
-    const { error } = await supabase.from("schedules").insert({ scope_type: "report", scope_id: reportId, cron, enabled: true, comparator, timezone });
+    const reuse = reuseFlagsFromPreset(reusePreset);
+    if (reusePreset !== "both" && !confirm(confirmReuseRunMessage(reusePreset))) return;
+    const { error } = await supabase.from("schedules").insert({
+      scope_type: "report",
+      scope_id: reportId,
+      cron,
+      enabled: true,
+      comparator,
+      timezone,
+      ...reuse,
+    });
     if (error) return toast.error(error.message);
     toast.success(`Scheduled — ${describe(cron)} (${timezone})`);
     qc.invalidateQueries({ queryKey: ["schedules", reportId] });
@@ -524,9 +642,22 @@ function ScheduleEditor({ reportId }: { reportId: string }) {
     await supabase.from("schedules").update({ timezone: v }).eq("id", s.id);
     qc.invalidateQueries({ queryKey: ["schedules", reportId] });
   };
+  const updateReuse = async (s: any, preset: "both" | "preprod" | "prod") => {
+    if (preset !== "both" && !confirm(confirmReuseRunMessage(preset))) return;
+    await supabase.from("schedules").update(reuseFlagsFromPreset(preset)).eq("id", s.id);
+    qc.invalidateQueries({ queryKey: ["schedules", reportId] });
+  };
   const runNow = async (s: any) => {
     try {
-      await invokeFunction("agent-orchestrate", { scope_type: "report", scope_id: reportId, trigger_source: "schedule_manual", schedule_id: s.id, concurrency: readOrchestrateConcurrency() });
+      await invokeFunction("agent-orchestrate", {
+        scope_type: "report",
+        scope_id: reportId,
+        trigger_source: "schedule_manual",
+        schedule_id: s.id,
+        concurrency: readOrchestrateConcurrency(),
+        reuse_main: !!s.reuse_main,
+        reuse_reference: !!s.reuse_reference,
+      });
       toast.success("Run started with schedule's comparator");
     } catch (e: any) {
       toast.error(e?.message || "Failed to start run");
@@ -615,6 +746,17 @@ function ScheduleEditor({ reportId }: { reportId: string }) {
               </SelectContent>
             </Select>
           </div>
+          <div>
+            <div className="text-[10px] text-muted-foreground mb-1 uppercase">Scrape mode</div>
+            <Select value={reusePreset} onValueChange={(v) => setReusePreset(v as "both" | "preprod" | "prod")}>
+              <SelectTrigger className="w-56"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="both">Both live</SelectItem>
+                <SelectItem value="preprod">Pre-prod live · reuse Prod</SelectItem>
+                <SelectItem value="prod">Prod live · reuse Pre-prod</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
           <Button onClick={save}><Plus className="h-3 w-3 mr-1" /> Add schedule</Button>
         </div>
 
@@ -640,6 +782,17 @@ function ScheduleEditor({ reportId }: { reportId: string }) {
                   <SelectItem value="eq">actual = reference</SelectItem>
                   <SelectItem value="lte">actual ≤ reference</SelectItem>
                   <SelectItem value="lt">actual &lt; reference</SelectItem>
+                </SelectContent>
+              </Select>
+              <Select
+                value={presetFromFlags(s)}
+                onValueChange={(v) => void updateReuse(s, v as "both" | "preprod" | "prod")}
+              >
+                <SelectTrigger className="w-52 h-8 text-xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="both">Both live</SelectItem>
+                  <SelectItem value="preprod">Pre-prod · reuse Prod</SelectItem>
+                  <SelectItem value="prod">Prod · reuse Pre-prod</SelectItem>
                 </SelectContent>
               </Select>
               <div className="flex gap-1">

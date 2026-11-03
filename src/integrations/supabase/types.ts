@@ -350,6 +350,7 @@ export type Database = {
           id: string
           kpi_config: Json
           name: string
+          paired_report_id: string | null
           reference_credential_profile_id: string | null
           reference_url: string | null
           schedule_cron: string | null
@@ -365,6 +366,7 @@ export type Database = {
           id?: string
           kpi_config?: Json
           name: string
+          paired_report_id?: string | null
           reference_credential_profile_id?: string | null
           reference_url?: string | null
           schedule_cron?: string | null
@@ -380,6 +382,7 @@ export type Database = {
           id?: string
           kpi_config?: Json
           name?: string
+          paired_report_id?: string | null
           reference_credential_profile_id?: string | null
           reference_url?: string | null
           schedule_cron?: string | null
@@ -407,6 +410,13 @@ export type Database = {
             columns: ["default_sql_template_id"]
             isOneToOne: false
             referencedRelation: "sql_templates"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "reports_paired_report_id_fkey"
+            columns: ["paired_report_id"]
+            isOneToOne: false
+            referencedRelation: "reports"
             referencedColumns: ["id"]
           },
           {
@@ -570,6 +580,7 @@ export type Database = {
           deferred: boolean
           description: string | null
           id: string
+          pair_key: string | null
           prerun_id: string | null
           reference_url: string | null
           report_id: string
@@ -583,6 +594,7 @@ export type Database = {
           deferred?: boolean
           description?: string | null
           id?: string
+          pair_key?: string | null
           prerun_id?: string | null
           reference_url?: string | null
           report_id: string
@@ -596,6 +608,7 @@ export type Database = {
           deferred?: boolean
           description?: string | null
           id?: string
+          pair_key?: string | null
           prerun_id?: string | null
           reference_url?: string | null
           report_id?: string
@@ -622,6 +635,8 @@ export type Database = {
           id: string
           last_run_at: string | null
           next_run_at: string | null
+          reuse_main: boolean
+          reuse_reference: boolean
           scope_id: string | null
           scope_type: string
           timezone: string
@@ -634,6 +649,8 @@ export type Database = {
           id?: string
           last_run_at?: string | null
           next_run_at?: string | null
+          reuse_main?: boolean
+          reuse_reference?: boolean
           scope_id?: string | null
           scope_type: string
           timezone?: string
@@ -646,6 +663,8 @@ export type Database = {
           id?: string
           last_run_at?: string | null
           next_run_at?: string | null
+          reuse_main?: boolean
+          reuse_reference?: boolean
           scope_id?: string | null
           scope_type?: string
           timezone?: string

@@ -28,12 +28,13 @@ type ScenarioRow = {
   prerun_id?: string | null;
   reference_url?: string | null;
   deferred?: boolean | null;
+  pair_key?: string | null;
 };
 
 function scenarioCloneFields(
   src: ScenarioRow,
   reportId: string,
-  opts: { title?: string; prerunId?: string | null; deferred?: boolean },
+  opts: { title?: string; prerunId?: string | null; deferred?: boolean; pairKey?: string | null },
 ) {
   return {
     report_id: reportId,
@@ -45,6 +46,8 @@ function scenarioCloneFields(
     prerun_id: opts.prerunId !== undefined ? opts.prerunId : src.prerun_id ?? null,
     reference_url: (src as any).reference_url ?? null,
     deferred: opts.deferred ?? false,
+    // Share pair_key so Pre-prod ↔ Prod scenarios stay linked after duplicate.
+    pair_key: opts.pairKey !== undefined ? opts.pairKey : (src.pair_key ?? src.id),
   };
 }
 
@@ -232,11 +235,17 @@ export async function duplicateReport(
     const { data: full, error: fullErr } = await supabase.from("scenarios").select("*").eq("id", s.id).maybeSingle();
     throwIf(fullErr, "Failed to read scenario");
     if (!full) continue;
+    const pairKey = (full as ScenarioRow).pair_key || full.id;
+    // Ensure source keeps a stable pair_key for future matching.
+    if (!(full as ScenarioRow).pair_key) {
+      await supabase.from("scenarios").update({ pair_key: pairKey }).eq("id", full.id);
+    }
     const { data: newSc, error: scErr } = await supabase
       .from("scenarios")
       .insert(scenarioCloneFields(full as ScenarioRow, created.id, {
         prerunId: remapOrNull(full.prerun_id, prerunIdMap),
         deferred: !!full.deferred,
+        pairKey,
       }))
       .select("id")
       .single();

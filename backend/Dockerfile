@@ -2,9 +2,6 @@
 # Use AWS Public ECR for the OS because Docker Hub's CloudFront blob endpoint
 # is blocked or unreliable on the corporate network.
 FROM public.ecr.aws/docker/library/debian:bookworm-slim
-
-
-
 ARG DENO_VERSION=1.46.3
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl unzip wget \

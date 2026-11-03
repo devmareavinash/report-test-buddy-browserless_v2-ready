@@ -5,6 +5,12 @@ import { RunSession, getRunSession, registerRunSession, releaseRunSession } from
 import { extractFirstTableAlias, qualifyColumn } from "../_shared/sql-filter.ts";
 import { fetchCanonicalScript, scriptHasSavedCode, updateScriptRow } from "../_shared/canonical-script.ts";
 import { compareTables, summarizeTableCompare, toTableModel } from "../_shared/table-compare.ts";
+import {
+  buildScrapeTag,
+  findLiveDonor,
+  toRuntimeResponseFromValues,
+  type ScrapeProvenance,
+} from "../_shared/scrape-reuse.ts";
 
 // Orchestrator: scope_type ∈ {workstream, report, scenario}.
 // For each non-deferred scenario:
@@ -707,9 +713,16 @@ Deno.serve(async (req) => {
     } = body;
     const concurrency = orchestrateConcurrency(requestedConcurrency);
     let comparator_override: string | null = body.comparator_override || null;
-    if (!comparator_override && schedule_id) {
-      const { data: sch } = await sb.from("schedules").select("comparator").eq("id", schedule_id).maybeSingle();
-      if (sch?.comparator) comparator_override = sch.comparator;
+    let reuse_main = body.reuse_main === true;
+    let reuse_reference = body.reuse_reference === true;
+    if (schedule_id) {
+      const { data: sch } = await sb.from("schedules")
+        .select("comparator, reuse_main, reuse_reference")
+        .eq("id", schedule_id)
+        .maybeSingle();
+      if (!comparator_override && sch?.comparator) comparator_override = sch.comparator;
+      if (body.reuse_main === undefined && sch?.reuse_main === true) reuse_main = true;
+      if (body.reuse_reference === undefined && sch?.reuse_reference === true) reuse_reference = true;
     }
     if (comparator_override && !["gte","lte","eq","gt","lt"].includes(comparator_override)) comparator_override = null;
 
@@ -742,8 +755,11 @@ Deno.serve(async (req) => {
       if (!run) throw new Error(`run ${existing_run_id} not found`);
     } else {
       const initialSummary = scope_type === "workstream"
-        ? { pass: 0, fail: 0, total: 0, done: 0, child_count: reportIds.length, concurrency }
-        : { concurrency };
+        ? {
+          pass: 0, fail: 0, total: 0, done: 0, child_count: reportIds.length, concurrency,
+          reuse_main, reuse_reference,
+        }
+        : { concurrency, reuse_main, reuse_reference };
       const existingConflict = await findActiveRunConflict(sb, scope_type, scope_id);
       if (existingConflict) {
         return new Response(JSON.stringify({
@@ -884,7 +900,7 @@ Deno.serve(async (req) => {
             .select("fe_label, be_column").eq("report_id", reportId);
 
           let scenariosQuery = sb.from("scenarios")
-            .select("id, title, type, criticality, deferred")
+            .select("id, title, type, criticality, deferred, pair_key, report_id")
             .eq("report_id", reportId)
             .eq("deferred", false);
           if (scope_type === "scenario") scenariosQuery = scenariosQuery.eq("id", scope_id);
@@ -894,7 +910,7 @@ Deno.serve(async (req) => {
             let { data: script, error: scriptErr } = await fetchCanonicalScript(
               sb,
               s.id,
-              "id, playwright_code, assertion_spec, sql_template_id, created_at",
+              "id, playwright_code, assertion_spec, sql_template_id, created_at, credential_profile_id, reference_credential_profile_id",
             );
             if (scriptErr) {
               await sb.from("test_results").insert({
@@ -1015,11 +1031,77 @@ Deno.serve(async (req) => {
             // one attempt to avoid doubling their long Browserless runtime.
             // playwright-runtime remains unchanged; its existing override narrows
             // the injected matrix to exactly one combination.
+            const mainUrl = String((report as any)?.url || "");
+            const refUrl = String((report as any)?.reference_url || "");
+            const pairedReportId = (report as any)?.paired_report_id || null;
+            const mainCredId = (script as any)?.credential_profile_id
+              || (report as any)?.credential_profile_id
+              || null;
+            const refCredId = (script as any)?.reference_credential_profile_id
+              || (report as any)?.reference_credential_profile_id
+              || mainCredId;
+
             const invokeRuntimeWithRetry = async (
               body: Record<string, any>,
               target: "main" | "reference",
               comboLabel: string | null,
             ) => {
+              const wantReuse = target === "main" ? reuse_main : reuse_reference;
+              const sideUrl = target === "main" ? mainUrl : refUrl;
+              const credId = target === "main" ? mainCredId : refCredId;
+              if (wantReuse && sideUrl) {
+                try {
+                  const donor = await findLiveDonor({
+                    sb,
+                    scenario: s,
+                    pairedReportId,
+                    side: target === "main" ? "main" : "reference",
+                    reportUrl: sideUrl,
+                    credentialProfileId: credId,
+                    comboLabel: String(comboLabel || ""),
+                    neededLabels: comparisonKpiLabels,
+                  });
+                  if (donor) {
+                    jsonLog("scrape_reuse_hit", {
+                      run_id: run.id,
+                      scenario_id: s.id,
+                      target,
+                      combo: comboLabel,
+                      source_test_result_id: donor.testResultId,
+                    });
+                    const synth = toRuntimeResponseFromValues(
+                      donor.values,
+                      comboLabel,
+                      {
+                        reused_from: donor.provenance.scraped_at,
+                        source_test_result_id: donor.testResultId,
+                      },
+                    );
+                    (synth as any).__scrape = buildScrapeTag({
+                      mode: "reused",
+                      reportUrl: sideUrl,
+                      credentialProfileId: credId,
+                      sourceTestResultId: donor.testResultId,
+                      scrapedAt: donor.provenance.scraped_at,
+                    });
+                    return synth;
+                  }
+                  jsonLog("scrape_reuse_miss", {
+                    run_id: run.id,
+                    scenario_id: s.id,
+                    target,
+                    combo: comboLabel,
+                  });
+                } catch (e) {
+                  jsonLog("scrape_reuse_error", {
+                    run_id: run.id,
+                    scenario_id: s.id,
+                    target,
+                    error: String(e),
+                  });
+                }
+              }
+
               let response = await callFn("playwright-runtime", body);
               const reason = !isPccScenario && comboExtractionNeedsRetry(response, comboLabel)
                 ? "runtime_or_empty_extraction"
@@ -1033,6 +1115,18 @@ Deno.serve(async (req) => {
                   reason,
                 });
                 response = await callFn("playwright-runtime", body);
+              }
+              const liveFailed =
+                response?.error ||
+                response?.ok === false ||
+                response?.extracted?.ok === false ||
+                !!response?.extracted?.error;
+              if (!liveFailed) {
+                (response as any).__scrape = buildScrapeTag({
+                  mode: "live",
+                  reportUrl: sideUrl,
+                  credentialProfileId: credId,
+                });
               }
               return response;
             };
@@ -1611,18 +1705,33 @@ Deno.serve(async (req) => {
                   tolerancesSnapshot[lbl] = { value: 0, unit: "pct", op: "eq" };
                 }
               }
+              const mainScrape: ScrapeProvenance | undefined = (comboRunResp as any)?.__scrape;
+              const refScrape: ScrapeProvenance | undefined = isRef
+                ? ((isolatedRefResponses.get(String(combo.label || "")) || refResp) as any)?.__scrape
+                : undefined;
+              const expectedPayload: Record<string, unknown> = {
+                source: sqlMeta.source,
+                filter: combo.label,
+                where_clause: sqlMeta.where_clause,
+                values: expectedMap,
+                row: sqlRow,
+                sql: sqlMeta,
+              };
+              if (isRef && refScrape) expectedPayload.scrape = refScrape;
+              const actualPayload: Record<string, unknown> = {
+                filter: combo.label,
+                values: actualMap,
+                filters_applied: pickComboFiltersApplied(comboRunResp, combo.label) || combo.filters || null,
+                tolerances_snapshot: tolerancesSnapshot,
+                structured_source_keys: Object.keys(structuredSourceKeys).length
+                  ? structuredSourceKeys
+                  : null,
+              };
+              if (mainScrape) actualPayload.scrape = mainScrape;
               const { data: tr, error: trError } = await sb.from("test_results").insert({
                 run_id: run.id, scenario_id: s.id, status,
-                expected: { source: sqlMeta.source, filter: combo.label, where_clause: sqlMeta.where_clause, values: expectedMap, row: sqlRow, sql: sqlMeta },
-                actual: {
-                  filter: combo.label,
-                  values: actualMap,
-                  filters_applied: pickComboFiltersApplied(comboRunResp, combo.label) || combo.filters || null,
-                  tolerances_snapshot: tolerancesSnapshot,
-                  structured_source_keys: Object.keys(structuredSourceKeys).length
-                    ? structuredSourceKeys
-                    : null,
-                },
+                expected: expectedPayload,
+                actual: actualPayload,
                 diff: diffMap,
                 criticality: crit,
                 severity: crit,

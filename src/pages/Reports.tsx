@@ -18,6 +18,34 @@ import { duplicateReport, duplicateWorkstream } from "@/lib/duplicateEntities";
 import { deleteReport, deleteWorkstream, deleteReportConfirm, deleteWorkstreamConfirm } from "@/lib/deleteEntities";
 import { fetchLatestTestResultsByScenarioIds } from "@/lib/latestTestResults";
 import { useExecutionLocks } from "@/hooks/useExecutionLocks";
+import { confirmReuseRunMessage } from "@/lib/scrapeReuse";
+
+type RunVars = {
+  scope_type: string;
+  scope_id: string;
+  reuse_main?: boolean;
+  reuse_reference?: boolean;
+  comparator_override?: string;
+};
+
+function promptRunPreset(): Omit<RunVars, "scope_type" | "scope_id"> | null {
+  const raw = window.prompt(
+    "Scrape mode for this run:\n  both = scrape Main + Reference live\n  preprod = scrape Pre-prod (reference), reuse Prod from Supabase\n  prod = scrape Prod (main), reuse Pre-prod from Supabase",
+    "both",
+  );
+  if (raw == null) return null;
+  const choice = raw.trim().toLowerCase();
+  if (choice === "preprod" || choice === "pre-prod") {
+    if (!confirm(confirmReuseRunMessage("preprod"))) return null;
+    return { reuse_main: true, reuse_reference: false, comparator_override: "lte" };
+  }
+  if (choice === "prod") {
+    if (!confirm(confirmReuseRunMessage("prod"))) return null;
+    return { reuse_main: false, reuse_reference: true, comparator_override: "eq" };
+  }
+  if (!confirm(confirmReuseRunMessage("both"))) return null;
+  return { reuse_main: false, reuse_reference: false };
+}
 
 export default function Reports() {
   const qc = useQueryClient();
@@ -67,7 +95,7 @@ export default function Reports() {
   });
 
   const run = useMutation({
-    mutationFn: async (vars: { scope_type: string; scope_id: string }) => {
+    mutationFn: async (vars: RunVars) => {
       const { data, error } = await invokeFunction("agent-orchestrate", { ...vars, concurrency });
       if (error) throw error;
       return data;
@@ -83,6 +111,12 @@ export default function Reports() {
     },
     onError: (e: any) => toast.error(e.message),
   });
+
+  const startRun = (scope_type: string, scope_id: string) => {
+    const preset = promptRunPreset();
+    if (!preset) return;
+    run.mutate({ scope_type, scope_id, ...preset });
+  };
 
   const filteredReports = useMemo(() => {
     const q = search.toLowerCase().trim();
@@ -200,7 +234,7 @@ export default function Reports() {
                         (run.isPending && run.variables?.scope_id === w.id) ||
                         executionLocks.isWorkstreamRunning(w.id)
                       }
-                      onClick={() => run.mutate({ scope_type: "workstream", scope_id: w.id })}
+                      onClick={() => startRun("workstream", w.id)}
                     >
                       {(run.isPending && run.variables?.scope_id === w.id) ||
                       executionLocks.isWorkstreamRunning(w.id)
@@ -235,7 +269,7 @@ export default function Reports() {
                       key={r.id}
                       r={r}
                       stats={statusMap?.[r.id]}
-                      onRun={() => run.mutate({ scope_type: "report", scope_id: r.id })}
+                      onRun={() => startRun("report", r.id)}
                       running={
                         (run.isPending && run.variables?.scope_id === r.id) ||
                         executionLocks.isReportRunning(r.id, r.workstream_id)
