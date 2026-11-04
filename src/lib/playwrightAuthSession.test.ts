@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   extractCapturedStorageState,
+  extractionLooksUnusable,
   isValidStorageState,
   sanitizeProfileId,
   shouldClearAuthSession,
@@ -30,15 +31,35 @@ describe("playwrightAuthSession", () => {
 
   it("clears session on LOGIN_FAILED nested in result", () => {
     expect(shouldClearAuthSession({ ok: true, result: { ok: false, error: "LOGIN_FAILED" } })).toBe(true);
+    expect(shouldClearAuthSession({ ok: true, result: { ok: false, error: "AUTH_REQUIRED" } })).toBe(true);
     expect(shouldClearAuthSession({ ok: true, result: { ok: true } })).toBe(false);
     expect(shouldClearAuthSession({ ok: false, error: "timeout" })).toBe(false);
   });
 
-  it("saves when cookies exist unless LOGIN_FAILED", () => {
+  it("detects unusable extractions that should trigger a fresh-login retry", () => {
+    expect(extractionLooksUnusable({
+      extracted: { ok: true, result: { "Default": { "Net Sales": null } } },
+    })).toBe(true);
+    expect(extractionLooksUnusable({
+      extracted: { ok: true, result: { "Default": { "Net Sales": 12.5 } } },
+    })).toBe(false);
+    expect(extractionLooksUnusable({
+      extracted: { ok: true, result: { note: "Original generated script had invalid JavaScript and was skipped." } },
+    })).toBe(true);
+  });
+
+  it("saves only when cookies exist and extraction produced usable values", () => {
     const state = { cookies: [{ name: "s", value: "1", domain: "a.com", path: "/" }] };
-    expect(shouldSaveAuthSession({ ok: true, result: { ok: true } }, state)).toBe(true);
-    // KPI/script failure after login should still keep the session
-    expect(shouldSaveAuthSession({ ok: false, error: "boom" }, state)).toBe(true);
+    expect(shouldSaveAuthSession({
+      ok: true,
+      result: { "Default": { "Net Sales": 12.5 } },
+    }, state)).toBe(true);
+    // Empty/failed extraction must not refresh session TTL.
+    expect(shouldSaveAuthSession({ ok: false, error: "boom" }, state)).toBe(false);
+    expect(shouldSaveAuthSession({
+      ok: true,
+      result: { "Default": { "Net Sales": null } },
+    }, state)).toBe(false);
     expect(shouldSaveAuthSession(
       { ok: true, result: { ok: false, error: "LOGIN_FAILED" } },
       state,

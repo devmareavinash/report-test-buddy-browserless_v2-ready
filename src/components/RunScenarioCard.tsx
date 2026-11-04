@@ -247,13 +247,6 @@ function ScenarioResultTable({
     return [{ comboLabel, kind, message: String(actualErr || expectedErr || "Unknown error") }];
   });
 
-  const anyFilters = results.some(
-    (tr) =>
-      tr.actual?.filters_applied &&
-      typeof tr.actual.filters_applied === "object" &&
-      Object.keys(tr.actual.filters_applied).length > 0,
-  );
-
   return (
     <div className="space-y-3">
       <div className="flex items-center gap-2 text-xs">
@@ -281,26 +274,38 @@ function ScenarioResultTable({
 
       <div className="space-y-3">
         {results.map((tr, idx) => {
-          const comboLabel = (tr.actual?.filter || tr.expected?.filter || `Filter #${idx + 1}`) as string;
           const filters = tr.actual?.filters_applied || null;
+          const fromApplied = filters && typeof filters === "object"
+            ? Object.entries(filters)
+                .filter(([key]) => key && !String(key).startsWith("__"))
+                .map(([, value]) => {
+                  if (value == null) return "";
+                  if (typeof value === "object") {
+                    return String((value as any).option ?? (value as any).verified ?? (value as any).value ?? "").trim();
+                  }
+                  return String(value).trim();
+                })
+                .filter(Boolean)
+                .join(" / ")
+            : "";
+          const rawLabel = String(tr.actual?.filter || tr.expected?.filter || fromApplied || `Filter #${idx + 1}`);
+          const comboLabel = /^combo[_ ]?\d+$/i.test(rawLabel) && fromApplied ? fromApplied : rawLabel;
           const hasFilters = filters && typeof filters === "object" && Object.keys(filters).length > 0;
           return (
             <div key={tr.id || idx} className="border border-border rounded-md overflow-hidden bg-background/40">
-              {(results.length > 1 || anyFilters) && (
-                <div className="flex items-center gap-2 px-2 py-1 bg-secondary/40 border-b border-border text-xs">
-                  {hasFilters ? (
-                    <button
-                      className="text-accent hover:underline font-semibold text-left"
-                      onClick={() => setOpenCombo({ label: comboLabel, filters })}
-                    >
-                      {comboLabel}
-                    </button>
-                  ) : (
-                    <span className="font-semibold">{comboLabel}</span>
-                  )}
-                  <span className="ml-auto">{badge((tr.derivedStatus as any) || (tr.status as any) || "pending")}</span>
-                </div>
-              )}
+              <div className="flex items-center gap-2 px-2 py-1 bg-secondary/40 border-b border-border text-xs">
+                {hasFilters ? (
+                  <button
+                    className="text-accent hover:underline font-semibold text-left"
+                    onClick={() => setOpenCombo({ label: comboLabel, filters })}
+                  >
+                    {comboLabel}
+                  </button>
+                ) : (
+                  <span className="font-semibold">{comboLabel}</span>
+                )}
+                <span className="ml-auto">{badge((tr.derivedStatus as any) || (tr.status as any) || "pending")}</span>
+              </div>
               <div className="p-2">
                 <StoredResultTable
                   actual={tr.actual}

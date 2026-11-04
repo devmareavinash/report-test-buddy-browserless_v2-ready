@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { overallStatusFromComboPairs, pairCombosWithResults } from "./latestTestResults";
+import { displayComboLabel, overallStatusFromComboPairs, pairCombosWithResults } from "./latestTestResults";
 
 describe("pairCombosWithResults", () => {
   it("keeps configured combinations visible when only one combination has a result", () => {
@@ -16,6 +16,53 @@ describe("pairCombosWithResults", () => {
     expect(paired).toHaveLength(2);
     expect(paired[0].result?.id).toBe("result-a");
     expect(paired[1].result).toBeNull();
+  });
+
+  it("shows filter values instead of Filter #1 when the combo label is empty", () => {
+    const paired = pairCombosWithResults(
+      [{
+        id: "c1",
+        label: null,
+        filters: {
+          Area: "Total",
+          Region: "AA52 - Northeast",
+          Territory: "Total",
+          "Time Bucket": "R4W",
+        },
+      }],
+      [{
+        id: "result-a",
+        status: "pass",
+        actual: { filter: "combo_1", values: { "NBRx Total": 1 } },
+      }],
+    );
+
+    expect(paired[0].label).toBe("Total / AA52 - Northeast / Total / R4W");
+    expect(paired[0].result?.id).toBe("result-a");
+  });
+
+  it("prefers stored result filter text when filters map is empty", () => {
+    expect(displayComboLabel(
+      { id: "c1", label: null, filters: {} },
+      0,
+      { actual: { filter: "AB - Central / Total / Total / QTD" } },
+    )).toBe("AB - Central / Total / Total / QTD");
+  });
+
+  it("uses current filter values even when the stored label is stale", () => {
+    expect(displayComboLabel(
+      {
+        id: "c1",
+        label: "Total / Total / Total / Latest Week",
+        filters: {
+          Area: "Total",
+          Region: "Total",
+          Territory: "Total",
+          "Time Bucket": "R4W",
+        },
+      },
+      0,
+    )).toBe("Total / Total / Total / R4W");
   });
 
   describe("overallStatusFromComboPairs", () => {

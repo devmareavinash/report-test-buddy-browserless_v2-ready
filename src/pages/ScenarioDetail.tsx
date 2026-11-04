@@ -29,7 +29,7 @@ import {
 import { compareTables, summarizeTableCompare } from "@/lib/tableCompare";
 import { attachTrendFields, trendStatusFromValues } from "@/lib/trend-payload";
 import { fetchCanonicalScript, persistCanonicalScript } from "@/lib/canonicalScript";
-import { pairCombosWithResults } from "@/lib/latestTestResults";
+import { labelFromFilterMap, pairCombosWithResults } from "@/lib/latestTestResults";
 import { ScriptAgentChat } from "@/components/ScriptAgentChat";
 import { summarizeRunFailureForChat } from "@/lib/script-agent-proposal";
 import { MessageSquare } from "lucide-react";
@@ -671,7 +671,7 @@ export default function ScenarioDetail() {
   };
 
   const runSingleCombo = async (combo: any, idx: number) => {
-    const label = combo.label || `Filter #${idx + 1}`;
+    const label = labelFromFilterMap(combo.filters) || combo.label || `Filter #${idx + 1}`;
     setComboScriptRunning(combo.id);
     toast.loading(`Running ${label}…`, { id: `combo-run-${combo.id}` });
     try {
@@ -847,7 +847,7 @@ export default function ScenarioDetail() {
       const nextCombo = { ...comboResults, [combo.id]: { ...data, where_clause: where, pairs, missing } };
       setComboResults(nextCombo);
       if (data?.ok) {
-        toast.success(`${combo.label || "Combination"}: ${data.row_count} row(s)`);
+        toast.success(`${labelFromFilterMap(combo.filters) || combo.label || "Combination"}: ${data.row_count} row(s)`);
         const persisted = await persistWarehouseExpected({
           scenarioId: id!,
           reportId: (scenario as any)?.reports?.id,
@@ -1016,7 +1016,7 @@ export default function ScenarioDetail() {
   const hasComboData = Object.keys(comboResults).length > 0 || !!refRunResult;
   const liveComboHasKpis = !!(combos?.length && runResult && (combos as any[]).some((c: any, idx: number) => {
     const root = pickResultRoot(runResult);
-    const label = c.label || `Filter #${idx + 1}`;
+    const label = labelFromFilterMap(c.filters) || c.label || `Filter #${idx + 1}`;
     const block = pickComboBlock(root, label, idx, c.id);
     return Object.keys(extractKpisFromBlock(block)).length > 0;
   }));
@@ -1910,7 +1910,7 @@ export default function ScenarioDetail() {
                         <div key={c.id} className="rounded-md border border-border bg-card p-3 space-y-2">
                           <div className="flex items-center justify-between gap-2">
                             <div className="text-xs">
-                              <span className="font-semibold">Filter #{idx + 1}{c.label ? ` · ${c.label}` : ""}</span>
+                              <span className="font-semibold">Filter #{idx + 1}{(() => { const n = labelFromFilterMap(c.filters) || c.label; return n ? ` · ${n}` : ""; })()}</span>
                               <div className="mono text-[11px] text-muted-foreground mt-0.5">
                                 {Object.entries(c.filters || {}).map(([k, v]) => `${k}=${v}`).join(" · ")}
                               </div>
@@ -2590,9 +2590,9 @@ function looksLikeLocatorJunk(v: any): boolean {
   return s.startsWith("aria-") || s === "via" || s.includes("locator") || s.includes("row-grid");
 }
 
-/** Same label persist + sync must use. Empty combo.label used to become Filter #N in the UI and combo_N in history. */
+/** Same label persist + sync must use — always from current filter values. */
 function comboPersistLabel(combo: any, idx: number): string {
-  return String(combo?.label || `combo_${idx + 1}`);
+  return labelFromFilterMap(combo?.filters) || String(combo?.label || `combo_${idx + 1}`);
 }
 
 function storedRowFilterLabel(row: any): string {
@@ -3061,6 +3061,15 @@ function normComboLabel(s: string) {
   return String(s || "").toLowerCase().replace(/[–—]/g, "-").replace(/\s+/g, " ").trim();
 }
 
+function countComboShapedChildren(root: any): number {
+  if (!root || typeof root !== "object" || Array.isArray(root)) return 0;
+  return Object.entries(root).filter(([k, v]) => {
+    if (KPI_SKIP_KEYS.has(k) || k.startsWith("__")) return false;
+    if (!v || typeof v !== "object" || Array.isArray(v)) return false;
+    return Object.keys(extractKpisFromBlock(v)).length > 0;
+  }).length;
+}
+
 function pickComboBlock(root: any, label: string, idx: number, comboId?: string): any {
   if (!root || typeof root !== "object") return null;
   const exact = [
@@ -3086,6 +3095,10 @@ function pickComboBlock(root: any, label: string, idx: number, comboId?: string)
     return Object.keys(extractKpisFromBlock(v)).length > 0;
   });
   if (children.length === 1) return children[0][1];
+  // Several combo-shaped siblings and this label missed — do not return the whole
+  // root. That merges other combos' KPIs and invents reference values on Latest
+  // while Runs (per test_result row) correctly shows "not extracted".
+  if (children.length > 1) return null;
   if (Object.keys(extractKpisFromBlock(root)).length) return root;
   return null;
 }
@@ -3137,10 +3150,11 @@ function extractKpisFromRun(rr: any): Record<string, any> | null {
     if (Object.keys(flat).length) return flat;
     const comboKeys = Object.keys(ex).filter((k) => !k.startsWith("__") && !isKpiNoiseKey(k));
     const comboBlocks = comboKeys.filter((k) => ex[k] && typeof ex[k] === "object" && !Array.isArray(ex[k]));
-    if (comboBlocks.length && comboBlocks.length === comboKeys.length) {
-      const merged: Record<string, any> = {};
-      for (const ck of comboBlocks) Object.assign(merged, extractKpisFromBlock(ex[ck]));
-      if (Object.keys(merged).length) return merged;
+    // One unlabeled combo envelope — unwrap it. Several combos must be addressed
+    // by label; merging them invents KPI/reference values across filters.
+    if (comboBlocks.length === 1 && comboBlocks.length === comboKeys.length) {
+      const fromOne = extractKpisFromBlock(ex[comboBlocks[0]]);
+      if (Object.keys(fromOne).length) return fromOne;
     }
   }
   return null;
@@ -4006,13 +4020,21 @@ function FilterComparisonTable({
   };
 
   const perCombo = combos.map((c, idx) => {
-    const label = c.label || `Filter #${idx + 1}`;
+    const label = labelFromFilterMap(c.filters) || c.label || `Filter #${idx + 1}`;
     const pwBlock = comboBlockOverrides?.[c.id] ?? blockFor(pwRoot, label, idx, c.id);
     const refBlock = blockFor(refRoot, label, idx, c.id);
     let kpis = extractKpisFromBlock(pwBlock);
-    if (!Object.keys(kpis).length) kpis = extractKpisFromRun(runResult) || {};
+    if (!Object.keys(kpis).length) {
+      // Whole-run fallback merges every combo's KPIs — only safe when the payload
+      // is a flat (non-combo) map, not when this combo simply has no block.
+      const pwChildren = countComboShapedChildren(pickResultRoot(runResult));
+      if (pwChildren <= 1) kpis = extractKpisFromRun(runResult) || {};
+    }
     let refKpis = refBlock ? extractKpisFromBlock(refBlock) : null;
-    if (!refKpis || !Object.keys(refKpis).length) refKpis = extractKpisFromRun(refRunResult);
+    if (!refKpis || !Object.keys(refKpis).length) {
+      const refChildren = countComboShapedChildren(pickResultRoot(refRunResult));
+      if (refChildren <= 1) refKpis = extractKpisFromRun(refRunResult);
+    }
     const sqlRes = comboResults[c.id] || (globalSqlResult?.ok ? globalSqlResult : null);
     const kpiNames = resultKpiNames(tolerances, scriptKpiLabels, kpis, refKpis);
     const rows: Row[] = kpiNames.map((k) => {
@@ -4609,8 +4631,18 @@ function FilterCombinations({ scenarioId, reportId }: { scenarioId: string; repo
 
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [label, setLabel] = useState("");
   const [pairs, setPairs] = useState<FilterPair[]>([{ label: "", value: "" }]);
+  const draftFilters = useMemo(() => {
+    const filters: Record<string, string> = {};
+    for (const p of pairs) {
+      const k = p.label.trim();
+      const v = p.value.trim();
+      if (!k || !v) continue;
+      filters[k] = v;
+    }
+    return filters;
+  }, [pairs]);
+  const draftLabel = labelFromFilterMap(draftFilters);
   const [mapOpen, setMapOpen] = useState(false);
   const [pasteOpen, setPasteOpen] = useState(false);
   // "Apply this combination to every case in ..." — combo pending confirmation.
@@ -4623,10 +4655,10 @@ function FilterCombinations({ scenarioId, reportId }: { scenarioId: string; repo
     if (!applyCombo || !reportId) return;
     setApplyBusy(true);
     try {
-      const res = await applyFilterComboToScope({
+      const res =       await applyFilterComboToScope({
         reportId,
         scope: applyScope,
-        label: applyCombo.label,
+        label: labelFromFilterMap(applyCombo.filters) || applyCombo.label,
         filters: applyCombo.filters || {},
         excludeScenarioId: scenarioId,
       });
@@ -4656,7 +4688,10 @@ function FilterCombinations({ scenarioId, reportId }: { scenarioId: string; repo
         reportId,
         scope: "report",
         sourceScenarioId: scenarioId,
-        combos: combos.map((c) => ({ label: c.label, filters: c.filters || {} })),
+        combos: combos.map((c) => ({
+          label: labelFromFilterMap(c.filters) || c.label,
+          filters: c.filters || {},
+        })),
       });
       if (!res.targets) toast.info("No other test cases found in this report");
       else if (!res.inserted) toast.info(`All ${res.targets} other case(s) already have these combinations`);
@@ -4671,7 +4706,6 @@ function FilterCombinations({ scenarioId, reportId }: { scenarioId: string; repo
 
   const reset = () => {
     setEditingId(null);
-    setLabel("");
     setPairs([{ label: "", value: "" }]);
   };
 
@@ -4682,7 +4716,6 @@ function FilterCombinations({ scenarioId, reportId }: { scenarioId: string; repo
 
   const openEdit = (c: FilterCombo) => {
     setEditingId(c.id);
-    setLabel(c.label ?? "");
     const entries = Object.entries(c.filters || {});
     setPairs(entries.length ? entries.map(([k, v]) => ({ label: k, value: String(v) })) : [{ label: "", value: "" }]);
     setDialogOpen(true);
@@ -4711,17 +4744,18 @@ function FilterCombinations({ scenarioId, reportId }: { scenarioId: string; repo
       toast.error("This exact filter combination already exists");
       return;
     }
+    const autoLabel = labelFromFilterMap(filters) || null;
     if (editingId) {
       const { error } = await supabase
         .from("scenario_filter_matrix")
-        .update({ label: label.trim() || null, filters })
+        .update({ label: autoLabel, filters })
         .eq("id", editingId);
       if (error) return toast.error(error.message);
       toast.success("Filter combination updated");
     } else {
       const { error } = await supabase.from("scenario_filter_matrix").insert({
         scenario_id: scenarioId,
-        label: label.trim() || null,
+        label: autoLabel,
         filters,
       });
       if (error) return toast.error(error.message);
@@ -4759,10 +4793,12 @@ function FilterCombinations({ scenarioId, reportId }: { scenarioId: string; repo
       <CardContent className="space-y-4">
         {!!combos?.length && (
           <div className="space-y-2">
-            {combos.map((c) => (
+            {combos.map((c) => {
+              const comboName = labelFromFilterMap(c.filters) || c.label;
+              return (
               <div key={c.id} className="flex items-start gap-2 border border-border rounded-md p-2">
                 <div className="flex-1 min-w-0 space-y-1">
-                  {c.label && <div className="text-xs font-medium">{c.label}</div>}
+                  {comboName && <div className="text-xs font-medium">{comboName}</div>}
                   <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs mono">
                     {Object.entries(c.filters || {}).map(([k, v]) => (
                       <span key={k}>
@@ -4788,7 +4824,8 @@ function FilterCombinations({ scenarioId, reportId }: { scenarioId: string; repo
                   <Trash2 className="h-3 w-3" />
                 </Button>
               </div>
-            ))}
+              );
+            })}
           </div>
         )}
 
@@ -4867,12 +4904,10 @@ function FilterCombinations({ scenarioId, reportId }: { scenarioId: string; repo
               <DialogTitle>{editingId ? "Edit filter combination" : "New filter combination"}</DialogTitle>
             </DialogHeader>
             <div className="space-y-3">
-              <Input
-                placeholder="Combination label (optional, e.g. AB / St. Louis / YTD)"
-                value={label}
-                onChange={(e) => setLabel(e.target.value)}
-                className="h-9 text-sm"
-              />
+              <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs">
+                <div className="text-muted-foreground">Name (from filter values)</div>
+                <div className="font-medium mono mt-0.5">{draftLabel || "—"}</div>
+              </div>
               {feLabels.length === 0 && (
                 <div className="text-xs text-muted-foreground">
                   No FE labels defined yet. Add them in{" "}

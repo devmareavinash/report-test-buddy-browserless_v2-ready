@@ -5,6 +5,49 @@ import { RunSession, getRunSession, registerRunSession, releaseRunSession } from
 import { extractFirstTableAlias, qualifyColumn } from "../_shared/sql-filter.ts";
 import { fetchCanonicalScript, scriptHasSavedCode, updateScriptRow } from "../_shared/canonical-script.ts";
 import { compareTables, summarizeTableCompare, toTableModel } from "../_shared/table-compare.ts";
+import { hasFilterCore, injectFilterCore } from "../_shared/mstr-filter-core.ts";
+
+/** LLM/legacy scripts sometimes call applyFilter without defining it. */
+function ensureApplyFilterAliases(src: string): string {
+  const uses =
+    /\bapplyFilter\s*\(/.test(src) ||
+    (/\bapplyFilters\s*\(/.test(src) && !/\bapplyFiltersVerified\s*\(/.test(src));
+  if (!uses) return src;
+  if (/\b(?:const|let|var|function)\s+applyFilter\b/.test(src)) return src;
+  if (!/\bselectByLabel\b/.test(src) && !/\bapplyFiltersVerified\b/.test(src)) return src;
+
+  const shim = `
+  const applyFilter = async (labelOrFilters, valueOrGeo) => {
+    if (labelOrFilters && typeof labelOrFilters === 'object' && !Array.isArray(labelOrFilters)) {
+      return (typeof applyFiltersVerified === 'function')
+        ? applyFiltersVerified(labelOrFilters, valueOrGeo)
+        : selectByLabel(Object.keys(labelOrFilters)[0], labelOrFilters[Object.keys(labelOrFilters)[0]]);
+    }
+    return selectByLabel(labelOrFilters, valueOrGeo);
+  };
+  const applyFilters = (typeof applyFiltersVerified === 'function') ? applyFiltersVerified : applyFilter;
+  const applyFiltersInOrder = applyFilters;
+`;
+
+  const endIdx = src.indexOf("// @@RTB_FILTER_CORE_END@@");
+  if (endIdx !== -1) {
+    const insertAt = endIdx + "// @@RTB_FILTER_CORE_END@@".length;
+    return src.slice(0, insertAt) + shim + src.slice(insertAt);
+  }
+  // Fallback: place after the first selectByLabel / applyFiltersVerified binding.
+  const m = src.match(/\b(?:const|let|var|function)\s+(?:selectByLabel|applyFiltersVerified)\b/);
+  if (!m || m.index == null) return src;
+  // Insert after the statement is impractical without a parser; put shim immediately before first use.
+  const useIdx = src.search(/\bapplyFilter(?:s)?\s*\(/);
+  if (useIdx < 0) return src;
+  return src.slice(0, useIdx) + shim + src.slice(useIdx);
+}
+
+function withCurrentFilterCore(code: string): string {
+  let src = String(code || "");
+  if (hasFilterCore(src)) src = injectFilterCore(src);
+  return ensureApplyFilterAliases(src);
+}
 
 // Orchestrator: scope_type ∈ {workstream, report, scenario}.
 // For each non-deferred scenario:
@@ -545,48 +588,128 @@ function computeCriticality(scenarioCrit: string, diffPct: number | null): strin
   return ["low", "medium", "high", "critical"][idx];
 }
 
+function normComboLabel(s: string): string {
+  return String(s || "").toLowerCase().replace(/[–—]/g, "-").replace(/\s+/g, " ").trim();
+}
+
+function flattenExtractionRoot(c: any): any {
+  if (!c || typeof c !== "object" || Array.isArray(c)) return null;
+  if (c.results && typeof c.results === "object" && !Array.isArray(c.results)) {
+    return flattenExtractionRoot(c.results);
+  }
+  if (c.kpis && typeof c.kpis === "object" && !Array.isArray(c.kpis)) {
+    return flattenExtractionRoot(c.kpis);
+  }
+  if (c.values && typeof c.values === "object" && !Array.isArray(c.values)
+    && !Array.isArray(c.values.columns) && !Array.isArray(c.values.rows)) {
+    const nestedKeys = Object.keys(c.values).filter((k) => !isExtractionNoiseKey(k));
+    if (nestedKeys.length && nestedKeys.every((k) => {
+      const v = (c.values as any)[k];
+      return v && typeof v === "object" && !Array.isArray(v) && !isStructuredVal(v);
+    })) {
+      return flattenExtractionRoot(c.values);
+    }
+  }
+  // Browserless wrapper: { ok, error, result, url }
+  if (c.result && typeof c.result === "object" && !Array.isArray(c.result)
+    && ("ok" in c || "error" in c || "url" in c || "extracted" in c || "screenshot" in c)) {
+    return flattenExtractionRoot(c.result);
+  }
+  if (c.extracted && typeof c.extracted === "object" && !Array.isArray(c.extracted)) {
+    return flattenExtractionRoot(c.extracted);
+  }
+  return c;
+}
+
+function flattenNodeToKpis(node: any): Record<string, any> {
+  const flat: Record<string, any> = {};
+  if (!node || typeof node !== "object") return flat;
+  // Prefer nested kpis/values envelopes when present.
+  const preferred = [node.kpis, node.values, node.result].find((v) =>
+    v && typeof v === "object" && !Array.isArray(v)
+  );
+  const source = preferred && !isStructuredVal(preferred) ? preferred : node;
+  for (const [k, v] of Object.entries(source)) {
+    if (isExtractionNoiseKey(k)) continue;
+    if (k === "kpis" || k === "values" || k === "result" || k === "results" || k === "extracted") continue;
+    if (v && typeof v === "object") {
+      if (k === "grains" || (Array.isArray(v) && (k === "periods" || k === "missing"))) flat[k] = v;
+      else if (isStructuredVal(v)) flat[k] = v;
+      continue;
+    }
+    flat[k] = v;
+  }
+  return flat;
+}
+
+function resolveComboNode(root: any, comboLabel: string | null): any | null {
+  if (!root || typeof root !== "object") return null;
+  if (!comboLabel) return root;
+  if ((root as any)[comboLabel] && typeof (root as any)[comboLabel] === "object") {
+    return (root as any)[comboLabel];
+  }
+  if ((root as any).results?.[comboLabel] && typeof (root as any).results[comboLabel] === "object") {
+    return (root as any).results[comboLabel];
+  }
+  if ((root as any).kpis?.[comboLabel] && typeof (root as any).kpis[comboLabel] === "object") {
+    return (root as any).kpis[comboLabel];
+  }
+  const want = normComboLabel(comboLabel);
+  for (const [k, v] of Object.entries(root)) {
+    if (isExtractionNoiseKey(k) || String(k).startsWith("__")) continue;
+    if (v && typeof v === "object" && !Array.isArray(v) && normComboLabel(k) === want) return v;
+  }
+  // Single child combo envelope — brand scripts often return one unlabeled block.
+  const children = Object.entries(root).filter(([k, v]) => {
+    if (isExtractionNoiseKey(k) || String(k).startsWith("__")) return false;
+    if (!v || typeof v !== "object" || Array.isArray(v)) return false;
+    return Object.keys(flattenNodeToKpis(v)).length > 0 || isStructuredVal(v);
+  });
+  if (children.length === 1) return children[0][1];
+  // Flat KPI map with no combo nesting.
+  if (Object.keys(flattenNodeToKpis(root)).length) return root;
+  return null;
+}
+
+/** "Total / AA52 - Northeast / Total / R4W" from the case's filter map (not a stale label). */
+function labelFromFilterValues(filters: any): string {
+  if (!filters || typeof filters !== "object" || Array.isArray(filters)) return "";
+  const vals = Object.entries(filters)
+    .filter(([key]) => key && !String(key).startsWith("__"))
+    .map(([, value]) => {
+      if (value == null) return "";
+      if (typeof value === "object") {
+        return String(
+          (value as any).option ?? (value as any).verified ?? (value as any).value ?? "",
+        ).trim();
+      }
+      return String(value).trim();
+    })
+    .filter(Boolean);
+  return vals.length ? vals.join(" / ") : "";
+}
+
 // Pull a combo's KPI map out of the script return payload. The script may return
-// data nested under several shapes — be liberal.
+// data nested under several shapes — be liberal (aligned with ScenarioDetail).
 function pickComboKpis(payload: any, comboLabel: string | null): Record<string, any> | null {
   const candidates = [
+    payload?.extracted?.result?.results,
+    payload?.extracted?.result?.kpis,
+    payload?.extracted?.result?.result,
     payload?.extracted?.result,
     payload?.extracted?.extracted,
     payload?.result?.extracted,
+    payload?.result?.results,
     payload?.result,
     payload?.extracted,
   ];
-  for (const root of candidates) {
+  for (const raw of candidates) {
+    const root = flattenExtractionRoot(raw);
     if (!root || typeof root !== "object") continue;
-    // Single-combo (no matrix) shape: flat KPI map
-    if (!comboLabel) {
-      const flat: Record<string, any> = {};
-      for (const [k, v] of Object.entries(root)) {
-        if (isExtractionNoiseKey(k)) continue;
-        if (v && typeof v === "object") {
-          if (k === "grains" || Array.isArray(v) && (k === "periods" || k === "missing")) flat[k] = v;
-          else if (isStructuredVal(v)) flat[k] = v;
-          continue;
-        }
-        flat[k] = v;
-      }
-      if (Object.keys(flat).length) return flat;
-    } else {
-      // Matrix shape: { "<comboLabel>": { "<KPI>": value, filters_applied: ... } }
-      const node = (root as any)[comboLabel] || (root as any).results?.[comboLabel];
-      if (node && typeof node === "object") {
-        const flat: Record<string, any> = {};
-        for (const [k, v] of Object.entries(node)) {
-          if (isExtractionNoiseKey(k)) continue;
-          if (v && typeof v === "object") {
-            if (k === "grains" || Array.isArray(v) && (k === "periods" || k === "missing")) flat[k] = v;
-            else if (isStructuredVal(v)) flat[k] = v;
-            continue;
-          }
-          flat[k] = v;
-        }
-        return flat;
-      }
-    }
+    const node = resolveComboNode(root, comboLabel);
+    if (!node) continue;
+    const flat = flattenNodeToKpis(node);
+    if (Object.keys(flat).length) return flat;
   }
   return null;
 }
@@ -594,16 +717,18 @@ function pickComboKpis(payload: any, comboLabel: string | null): Record<string, 
 // Extract filters_applied for a combo from the runtime payload (pickComboKpis strips it).
 function pickComboFiltersApplied(payload: any, comboLabel: string | null): Record<string, any> | null {
   const candidates = [
+    payload?.extracted?.result?.results,
     payload?.extracted?.result,
     payload?.extracted?.extracted,
     payload?.result?.extracted,
     payload?.result,
     payload?.extracted,
   ];
-  for (const root of candidates) {
+  for (const raw of candidates) {
+    const root = flattenExtractionRoot(raw);
     if (!root || typeof root !== "object") continue;
     if (comboLabel) {
-      const node = (root as any)[comboLabel] || (root as any).results?.[comboLabel];
+      const node = resolveComboNode(root, comboLabel);
       if (node && typeof node === "object" && node.filters_applied && typeof node.filters_applied === "object") {
         return node.filters_applied;
       }
@@ -614,13 +739,42 @@ function pickComboFiltersApplied(payload: any, comboLabel: string | null): Recor
   return null;
 }
 
-function comboExtractionNeedsRetry(payload: any, comboLabel: string | null): boolean {
+const EXTRACTION_MAX_ATTEMPTS = Math.max(
+  1,
+  Math.min(5, Number(Deno.env.get("EXTRACTION_MAX_ATTEMPTS") || 3) || 3),
+);
+
+function looksLikeStructuredKpiLabel(label: string): boolean {
+  return /segment|summary|grid|graph|table|chart|series|heatmap|viz|dataset|geography|performance|overall/i
+    .test(String(label || ""));
+}
+
+function comboExtractionNeedsRetry(
+  payload: any,
+  comboLabel: string | null,
+  opts?: { requireStructured?: boolean; configuredLabels?: string[] },
+): boolean {
   const exec = payload?.extracted;
   if (payload?.error || payload?.ok === false || exec?.ok === false || exec?.error) return true;
   const values = pickComboKpis(payload, comboLabel);
   if (!values || !Object.keys(values).length) return true;
   const useful = Object.entries(values).filter(([key]) => !isExtractionNoiseKey(key));
-  if (!useful.length || useful.every(([, value]) => value == null)) return true;
+  if (!useful.length || useful.every(([, value]) => value == null || String(value).trim() === "")) {
+    return true;
+  }
+  if (
+    useful.some(([, value]) =>
+      value && typeof value === "object" && !Array.isArray(value) &&
+      (value.error || value.show_data_error || value.extract_error || value.tableData?.error)
+    )
+  ) {
+    return true;
+  }
+  const requireStructured = opts?.requireStructured ||
+    (opts?.configuredLabels || []).some((label) => looksLikeStructuredKpiLabel(label));
+  if (requireStructured && !pickComparableStructured(values)) {
+    return true;
+  }
   const grains = values.grains && typeof values.grains === "object"
     ? Object.values(values.grains)
     : [];
@@ -926,7 +1080,7 @@ Deno.serve(async (req) => {
             // Case-level KPI configuration is the source of truth. Report KPI
             // config is only a default for legacy cases that have no saved KPI
             // list or tolerances in their assertion spec.
-            const executableCode = String((script as any)?.playwright_code || "");
+            const executableCode = withCurrentFilterCore(String((script as any)?.playwright_code || ""));
             const assertionSpec: any = (script as any)?.assertion_spec || {};
             const configuredKpis: string[] = Array.isArray(assertionSpec.kpis)
               ? assertionSpec.kpis
@@ -972,8 +1126,18 @@ Deno.serve(async (req) => {
               throw new Error(`filter combination ${single_combo_id} was not found for scenario ${s.id}`);
             }
             const hasCombos = !!(matrix && matrix.length > 0);
+            // Name always from current filter values so an edited combo does not
+            // keep a stale stored label on the next run.
             const combos = hasCombos
-              ? matrix!.map((m: any, i: number) => ({ id: m.id, label: m.label || `combo_${i + 1}`, filters: m.filters || {} }))
+              ? matrix!.map((m: any, i: number) => {
+                  const filters = m.filters || {};
+                  const derived = labelFromFilterValues(filters);
+                  return {
+                    id: m.id,
+                    label: derived || m.label || `combo_${i + 1}`,
+                    filters,
+                  };
+                })
               : [{ id: null, label: null as string | null, filters: {} as Record<string, any> }];
 
             const isRef = s.type === "reference_match";
@@ -1006,31 +1170,41 @@ Deno.serve(async (req) => {
                   }
                 }
               }
+              if (refCode) refCode = withCurrentFilterCore(refCode);
             }
 
             // A long matrix script can carry stale filters, tabs, popups, grids,
             // or chart grain state into the next combination. Give every combo
             // its own Browserless function call/page. Non-PCC scenarios retry
-            // once after an extraction/navigation failure. PCC scenarios use
-            // one attempt to avoid doubling their long Browserless runtime.
-            // playwright-runtime remains unchanged; its existing override narrows
-            // the injected matrix to exactly one combination.
+            // empty / failed extractions up to EXTRACTION_MAX_ATTEMPTS. PCC
+            // scenarios use one attempt to avoid doubling their long Browserless
+            // runtime. playwright-runtime remains unchanged; its existing
+            // override narrows the injected matrix to exactly one combination.
+            const requireStructuredExtraction = comparisonKpiLabels.some((label) =>
+              looksLikeStructuredKpiLabel(label)
+            ) || /graph|chart|grid|show\s*data|segment summary|overall performance/i
+              .test(`${s.title || ""} ${s.description || ""}`);
             const invokeRuntimeWithRetry = async (
               body: Record<string, any>,
               target: "main" | "reference",
               comboLabel: string | null,
             ) => {
+              const maxAttempts = isPccScenario ? 1 : EXTRACTION_MAX_ATTEMPTS;
               let response = await callFn("playwright-runtime", body);
-              const reason = !isPccScenario && comboExtractionNeedsRetry(response, comboLabel)
-                ? "runtime_or_empty_extraction"
-                : null;
-              if (reason) {
+              for (let attempt = 1; attempt < maxAttempts; attempt++) {
+                const needsRetry = comboExtractionNeedsRetry(response, comboLabel, {
+                  requireStructured: requireStructuredExtraction,
+                  configuredLabels: comparisonKpiLabels,
+                });
+                if (!needsRetry) break;
                 jsonLog("combo_extraction_retry", {
                   run_id: run.id,
                   scenario_id: s.id,
                   combo: comboLabel,
                   target,
-                  reason,
+                  attempt: attempt + 1,
+                  max_attempts: maxAttempts,
+                  reason: "runtime_or_empty_extraction",
                 });
                 response = await callFn("playwright-runtime", body);
               }
@@ -1155,6 +1329,31 @@ Deno.serve(async (req) => {
                 return { pass: 0, fail: 1 };
               }
               const scraped = pickComboKpis(comboRunResp, combo.label) || {};
+              const filtersApplied =
+                pickComboFiltersApplied(comboRunResp, combo.label) || combo.filters || null;
+              // Plain matrix filters (string values) mean the script envelope was
+              // missing filters_applied — usually empty/unparseable extraction.
+              const filtersLookUnverified = (() => {
+                if (!filtersApplied || typeof filtersApplied !== "object") return true;
+                const vals = Object.values(filtersApplied);
+                if (!vals.length) return true;
+                return vals.every((v) => v == null || typeof v !== "object");
+              })();
+              const scrapedUseful = Object.entries(scraped).some(([k, v]) =>
+                !isExtractionNoiseKey(k) && v != null && String(v).trim() !== ""
+              );
+              if (!scrapedUseful && filtersLookUnverified) {
+                jsonLog("empty_extracted_main", {
+                  run_id: run.id,
+                  scenario_id: s.id,
+                  combo: combo.label,
+                  result_keys: Object.keys(
+                    (comboRunResp?.extracted?.result && typeof comboRunResp.extracted.result === "object")
+                      ? comboRunResp.extracted.result
+                      : (comboRunResp?.extracted || {}),
+                  ).slice(0, 20),
+                });
+              }
 
               let expectedMap: Record<string, any> = {};
               let sqlMeta: any = { source: isRef ? "reference_script" : (sqlTplId ? "warehouse" : "none") };
@@ -1617,7 +1816,7 @@ Deno.serve(async (req) => {
                 actual: {
                   filter: combo.label,
                   values: actualMap,
-                  filters_applied: pickComboFiltersApplied(comboRunResp, combo.label) || combo.filters || null,
+                  filters_applied: filtersApplied,
                   tolerances_snapshot: tolerancesSnapshot,
                   structured_source_keys: Object.keys(structuredSourceKeys).length
                     ? structuredSourceKeys

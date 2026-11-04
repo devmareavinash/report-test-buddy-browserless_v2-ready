@@ -24,6 +24,8 @@
  * Exposed to the template (drop-in replacements, same names as before):
  *      selectByLabel(label, value)        -> { ok, verified, via, error, ... }
  *      applyFiltersVerified(filters, geo) -> { ok, debug, error, final_state }
+ *      applyFilter(label, value | filters, geo?)  // LLM/legacy alias
+ *      applyFilters / applyFiltersInOrder         // alias -> applyFiltersVerified
  *      __rtbCheckErrorDialog(dismiss)     -> null | { error, details }
  *      __rtbReadFilter(label)             -> string | null
  *
@@ -31,7 +33,7 @@
  * template literal would eat.
  */
 
-export const FILTER_CORE_VERSION = "2.0.0";
+export const FILTER_CORE_VERSION = "2.0.2";
 
 /** Markers so non-TS artifacts (reference .js files) can have this block swapped in. */
 export const FILTER_CORE_START = "// @@RTB_FILTER_CORE_START@@";
@@ -65,7 +67,9 @@ export const FILTER_CORE_JS = String.raw`// @@RTB_FILTER_CORE_START@@
 
   function __rtbHelpersFactory(KNOWN_LABELS) {
     const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-    const code = s => norm(s).split(/\s+/)[0] || '';
+    // Full normalized text — NOT first-token only. First-token matching made
+    // "Latest Week" == "Latest 4 Weeks" / "Latest Month" and skipped the real pick.
+    const code = s => norm(s);
     const getDirectText = el => {
       let t = '';
       for (const n of el.childNodes) if (n.nodeType === Node.TEXT_NODE) t += n.textContent;
@@ -391,7 +395,8 @@ export const FILTER_CORE_JS = String.raw`// @@RTB_FILTER_CORE_START@@
     }, fn, args || []).catch(() => ({ error: 'evaluate failed: ' + fn }));
   };
 
-  const __rtbCode = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase().split(/\s+/)[0] || '';
+  const __rtbNorm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const __rtbCode = s => __rtbNorm(s);
 
   const __rtbCloseDropdown = async () => { await __rtbH('closeDropdown'); await sleep(300); };
 
@@ -540,6 +545,16 @@ export const FILTER_CORE_JS = String.raw`// @@RTB_FILTER_CORE_START@@
     }
     return { ok: true, debug: debug, final_state: finalState };
   };
+
+  // LLM/legacy aliases — saved scripts sometimes call these instead of the verified APIs.
+  const applyFilter = async (labelOrFilters, valueOrGeo) => {
+    if (labelOrFilters && typeof labelOrFilters === 'object' && !Array.isArray(labelOrFilters)) {
+      return applyFiltersVerified(labelOrFilters, valueOrGeo);
+    }
+    return selectByLabel(labelOrFilters, valueOrGeo);
+  };
+  const applyFilters = applyFiltersVerified;
+  const applyFiltersInOrder = applyFiltersVerified;
 // @@RTB_FILTER_CORE_END@@`;
 
 /** Swap the marked core block inside an already-assembled script (used for reference .js files). */

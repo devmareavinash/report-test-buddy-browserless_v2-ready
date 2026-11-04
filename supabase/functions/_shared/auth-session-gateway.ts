@@ -6,6 +6,7 @@ import { fetchCanonicalScript } from "./canonical-script.ts";
 import { authSessionLog } from "./auth-session-log.ts";
 import {
   clearAuthSession,
+  extractionLooksUnusable,
   loadAuthSession,
   saveAuthSession,
   shouldClearAuthSession,
@@ -57,6 +58,32 @@ async function resolveCredentialProfileId(
   }
 }
 
+async function invokePlaywright(
+  handler: Handler,
+  req: Request,
+  body: Record<string, unknown>,
+  code: string,
+): Promise<{ raw?: Response; status: number; headers: Headers; payload: any }> {
+  const nextBody = { ...body, code };
+  const headers = new Headers(req.headers);
+  headers.set("content-type", "application/json");
+  const nextReq = new Request(req.url, {
+    method: req.method,
+    headers,
+    body: JSON.stringify(nextBody),
+  });
+  const resp = await handler(nextReq);
+  const contentType = resp.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) {
+    return { raw: resp, status: resp.status, headers: resp.headers, payload: null };
+  }
+  try {
+    return { status: resp.status, headers: resp.headers, payload: await resp.json() };
+  } catch {
+    return { raw: resp, status: resp.status, headers: resp.headers, payload: null };
+  }
+}
+
 export function withPlaywrightAuthSession(handler: Handler): Handler {
   return async (req: Request) => {
     if (req.method === "OPTIONS") return await handler(req);
@@ -101,26 +128,32 @@ export function withPlaywrightAuthSession(handler: Handler): Handler {
       });
     }
 
-    const nextBody = { ...body, code: wrappedCode };
-    const headers = new Headers(req.headers);
-    headers.set("content-type", "application/json");
-    const nextReq = new Request(req.url, {
-      method: req.method,
-      headers,
-      body: JSON.stringify(nextBody),
-    });
+    let reused = Boolean(storageState);
+    let attempt = await invokePlaywright(handler, req, body, wrappedCode);
 
-    const resp = await handler(nextReq);
-    const contentType = resp.headers.get("content-type") || "";
-    if (!contentType.includes("application/json")) return resp;
-
-    let payload: any;
-    try {
-      payload = await resp.json();
-    } catch {
-      return resp;
+    // Reused MicroStrategy cookies can outlive the server session. Scripts then
+    // scrape an empty/login shell without always returning LOGIN_FAILED. Clear
+    // and retry once with a fresh login so brand runs recover mid-suite.
+    if (profileId && reused && attempt.payload && extractionLooksUnusable(attempt.payload)) {
+      authSessionLog("auth_session_reuse_miss_retry_fresh", {
+        target,
+        profile: profileId,
+        scenario_id: scenarioId || null,
+      });
+      await clearAuthSession(profileId);
+      const freshWrapped = code ? wrapCodeWithAuthSession(code, null) : code;
+      attempt = await invokePlaywright(handler, req, body, freshWrapped);
+      reused = false;
     }
 
+    if (!attempt.payload) {
+      return attempt.raw || new Response(JSON.stringify({ error: "playwright_runtime_non_json" }), {
+        status: attempt.status || 502,
+        headers: { "content-type": "application/json" },
+      });
+    }
+
+    const payload = attempt.payload;
     const extracted = payload?.extracted ?? payload;
     const captured = extractCapturedStorageState(payload);
     const cookieCount = (captured && typeof captured === "object" && Array.isArray((captured as any).cookies))
@@ -130,7 +163,7 @@ export function withPlaywrightAuthSession(handler: Handler): Handler {
     if (profileId) {
       if (shouldClearAuthSession(extracted) || shouldClearAuthSession(payload)) {
         await clearAuthSession(profileId);
-      } else if (shouldSaveAuthSession(extracted, captured)) {
+      } else if (shouldSaveAuthSession(payload, captured)) {
         await saveAuthSession(profileId, captured);
       } else {
         authSessionLog("auth_session_not_saved", {
@@ -138,19 +171,20 @@ export function withPlaywrightAuthSession(handler: Handler): Handler {
           target,
           cookie_count: cookieCount,
           extracted_ok: extracted && typeof extracted === "object" ? (extracted as any).ok : null,
+          unusable: extractionLooksUnusable(payload),
         });
       }
     }
 
     const cleaned = stripCapturedStorageState(payload);
-    if (storageState) cleaned.auth_session_reused = true;
+    if (reused) cleaned.auth_session_reused = true;
 
     return new Response(JSON.stringify(cleaned), {
-      status: resp.status,
+      status: attempt.status,
       headers: {
         "content-type": "application/json",
         ...Object.fromEntries(
-          [...resp.headers.entries()].filter(([k]) => {
+          [...attempt.headers.entries()].filter(([k]) => {
             const key = k.toLowerCase();
             return key !== "content-type" && key !== "content-length";
           }),

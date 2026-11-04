@@ -652,6 +652,25 @@ ${FILTER_CORE_JS}
       const raw = await extractKPI(k);
       row[k] = toNum(raw && raw.value);
     }
+    // Time-bucket / cold-load miss: reload once when every configured KPI is empty.
+    const useful = KPI_LABELS.some((k) => row[k] != null && String(row[k]).trim() !== '');
+    if (!useful && KPI_LABELS.length) {
+      await page.goto(reportUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      await waitForDossierReady();
+      await runNav();
+      await waitForDashboard();
+      for (const key of geoKeys.concat(otherKeys)) {
+        debug[key] = await selectByLabel(key, filters[key]);
+      }
+      await closeAnyOpenDropdown();
+      await waitForLoadingToFinish(15000);
+      await waitForDashboard();
+      row.filters_applied = debug;
+      for (const k of KPI_LABELS) {
+        const raw = await extractKPI(k);
+        row[k] = toNum(raw && raw.value);
+      }
+    }
     results[label] = row;
   }
   return { navigation: navDebug, results };

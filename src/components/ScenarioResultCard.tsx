@@ -8,6 +8,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { StatusChip } from "@/components/StatusChip";
 import { StoredResultTable } from "@/components/StoredResultTable";
 import { deriveStoredResultStatus, storedRunLog, storedRunLogIsRca } from "@/lib/kpi-values";
+import { labelFromFilterMap } from "@/lib/latestTestResults";
 import { fetchCanonicalScript } from "@/lib/canonicalScript";
 import { ChevronDown, ChevronRight, Wrench, Pencil, Clock, Save, History, Play } from "lucide-react";
 import { toast } from "sonner";
@@ -60,11 +61,17 @@ export function ScenarioResultCard({
     ? comboPairs
     : (results && results.length
         ? results.map((r: any, i: number) => ({
-            label: r?.actual?.filter || r?.expected?.filter || `combo ${i + 1}`,
+            label: r?.actual?.filter || r?.expected?.filter
+              || labelFromFilterMap(r?.actual?.filters_applied) || `Filter #${i + 1}`,
             comboId: null,
             result: r,
           }))
-        : (l ? [{ label: l?.actual?.filter || l?.expected?.filter || "combo 1", comboId: null, result: l }] : []));
+        : (l ? [{
+            label: l?.actual?.filter || l?.expected?.filter
+              || labelFromFilterMap(l?.actual?.filters_applied) || "Filter #1",
+            comboId: null,
+            result: l,
+          }] : []));
   const { data: scriptInfo, isLoading: scriptInfoLoading } = useQuery({
     queryKey: ["scenario-script-tolerance", scenarioId],
     enabled: true,
@@ -235,86 +242,60 @@ export function ScenarioResultCard({
                   <span>{runLog}</span>
                 </div>
               )}
-              {(() => {
-                // One test_results row per filter combination. Rendering only the
-                // first showed a single combo here while Latest result showed all.
-                if (pairsWithDerived.length === 1 && pairsWithDerived[0].result) {
-                  const pair = pairsWithDerived[0];
+              <div className="space-y-3">
+                {pairsWithDerived.map((pair, i: number) => {
                   const r = pair.result;
-                  const derivedStatus = pair.derivedStatus;
                   return (
-                    <div className="space-y-2">
-                      <StoredResultTable
-                        actual={r.actual}
-                        expected={r.expected}
-                        spec={(scriptInfo as any)?.assertion_spec}
-                        scenarioType={scenarioType}
-                        status={derivedStatus || r.status}
-                        diff={r.diff}
-                      />
-                      {(derivedStatus === "fail" || derivedStatus === "pending") && (
-                        <RcaEditor trId={r.id} initial={r.analysis || ""} onSave={saveRca} />
-                      )}
+                  <div key={pair.comboId || r?.id || i} className="border border-border rounded-md">
+                    <div className="flex items-center gap-2 px-2 py-1 bg-secondary/40 border-b border-border">
+                      <StatusChip status={pair.derivedStatus || r?.status || "pending"} />
+                      <span className="mono text-xs">
+                        {pair.label || `combo ${i + 1}`}
+                      </span>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="ml-auto h-7"
+                        disabled={!pair.comboId || runningComboId !== null || scenarioRunning}
+                        onClick={() => void runScenarioCombo(pair.comboId)}
+                        title={pair.comboId ? "Run this filter combination" : "No configured combination id"}
+                      >
+                        <Play className="h-3 w-3 mr-1" />
+                        {runningComboId === pair.comboId ? "Starting…" : "Run"}
+                      </Button>
                     </div>
-                  );
-                }
-                return (
-                  <div className="space-y-3">
-                    {pairsWithDerived.map((pair, i: number) => {
-                      const r = pair.result;
-                      return (
-                      <div key={pair.comboId || r?.id || i} className="border border-border rounded-md">
-                        <div className="flex items-center gap-2 px-2 py-1 bg-secondary/40 border-b border-border">
-                          <StatusChip status={pair.derivedStatus || r?.status || "pending"} />
-                          <span className="mono text-xs">
-                            {pair.label || `combo ${i + 1}`}
-                          </span>
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            className="ml-auto h-7"
-                            disabled={!pair.comboId || runningComboId !== null || scenarioRunning}
-                            onClick={() => void runScenarioCombo(pair.comboId)}
-                            title={pair.comboId ? "Run this filter combination" : "No configured combination id"}
-                          >
-                            <Play className="h-3 w-3 mr-1" />
-                            {runningComboId === pair.comboId ? "Starting…" : "Run"}
-                          </Button>
-                        </div>
-                        <div className="p-2">
-                          {r ? (
-                            <div className="space-y-2">
-                              {(pair.derivedStatus === "fail" || pair.derivedStatus === "pending") && storedRunLog(r) && (
-                                <div className="border border-destructive/30 bg-destructive/5 rounded p-2">
-                                  <span className="text-muted-foreground mono">
-                                    {storedRunLogIsRca(r) ? "RCA: " : "Log: "}
-                                  </span>
-                                  <span>{storedRunLog(r)}</span>
-                                </div>
-                              )}
-                              <StoredResultTable
-                                actual={r.actual}
-                                expected={r.expected}
-                                spec={(scriptInfo as any)?.assertion_spec}
-                                scenarioType={scenarioType}
-                                status={pair.derivedStatus || r.status}
-                                diff={r.diff}
-                              />
-                              {(pair.derivedStatus === "fail" || pair.derivedStatus === "pending") && (
-                                <RcaEditor trId={r.id} initial={r.analysis || ""} onSave={saveRca} />
-                              )}
-                            </div>
-                          ) : (
-                            <div className="text-xs text-muted-foreground p-2">
-                              This configured combination has no stored result yet. Select Run to execute it.
+                    <div className="p-2">
+                      {r ? (
+                        <div className="space-y-2">
+                          {(pair.derivedStatus === "fail" || pair.derivedStatus === "pending") && storedRunLog(r) && (
+                            <div className="border border-destructive/30 bg-destructive/5 rounded p-2">
+                              <span className="text-muted-foreground mono">
+                                {storedRunLogIsRca(r) ? "RCA: " : "Log: "}
+                              </span>
+                              <span>{storedRunLog(r)}</span>
                             </div>
                           )}
+                          <StoredResultTable
+                            actual={r.actual}
+                            expected={r.expected}
+                            spec={(scriptInfo as any)?.assertion_spec}
+                            scenarioType={scenarioType}
+                            status={pair.derivedStatus || r.status}
+                            diff={r.diff}
+                          />
+                          {(pair.derivedStatus === "fail" || pair.derivedStatus === "pending") && (
+                            <RcaEditor trId={r.id} initial={r.analysis || ""} onSave={saveRca} />
+                          )}
                         </div>
-                      </div>
-                    )})}
+                      ) : (
+                        <div className="text-xs text-muted-foreground p-2">
+                          This configured combination has no stored result yet. Select Run to execute it.
+                        </div>
+                      )}
+                    </div>
                   </div>
-                );
-              })()}
+                )})}
+              </div>
               {l && latestDerivedStatus !== "pass" && l.healing_proposal && (
                 <div className="border border-border rounded-md p-2 bg-background/40">
                   <div className="text-muted-foreground mono mb-1">

@@ -98,6 +98,50 @@ export async function fetchFilterMatrixByScenarioIds(
   return byScenario;
 }
 
+function isPlaceholderComboLabel(label: string): boolean {
+  return !label || /^filter #\d+$/i.test(label) || /^combo[_ ]?\d+$/i.test(label);
+}
+
+/** Build "Total / AA52 - Northeast / Total / R4W" from a filters / filters_applied map. */
+export function labelFromFilterMap(filters: any): string {
+  if (!filters || typeof filters !== "object" || Array.isArray(filters)) return "";
+  const vals = Object.entries(filters)
+    .filter(([key]) => key && !String(key).startsWith("__"))
+    .map(([, value]) => {
+      if (value == null) return "";
+      if (typeof value === "object") {
+        return String(
+          (value as any).option ?? (value as any).verified ?? (value as any).value ?? "",
+        ).trim();
+      }
+      return String(value).trim();
+    })
+    .filter(Boolean);
+  return vals.length ? vals.join(" / ") : "";
+}
+
+/**
+ * Human-readable combo name for Tests execution / Runs.
+ * Filter values on the case win — a stale stored label must not survive an edit.
+ */
+export function displayComboLabel(combo: any, idx: number, result?: any): string {
+  const fromFilters = labelFromFilterMap(combo?.filters);
+  if (fromFilters) return fromFilters;
+
+  const fromResult = String(
+    result?.actual?.filter ?? result?.expected?.filter ?? result?.actual?.combo ?? result?.expected?.combo ?? "",
+  ).trim();
+  if (fromResult && !isPlaceholderComboLabel(fromResult)) return fromResult;
+
+  const fromApplied = labelFromFilterMap(result?.actual?.filters_applied || result?.expected?.filters_applied);
+  if (fromApplied) return fromApplied;
+
+  const explicit = String(combo?.label ?? "").trim();
+  if (explicit && !isPlaceholderComboLabel(explicit)) return explicit;
+
+  return explicit || `Filter #${idx + 1}`;
+}
+
 /**
  * Pair each CONFIGURED combination with its latest stored result.
  * The scenarios page previously showed only combinations that had a row in
@@ -110,15 +154,28 @@ export function pairCombosWithResults(combos: any[], results: any[]): any[] {
   const keyOf = (r: any) =>
     norm(r?.actual?.filter ?? r?.expected?.filter ?? r?.actual?.combo ?? r?.expected?.combo);
   if (!combos || !combos.length) {
-    return pool.map((r) => ({ label: keyOf(r) || null, result: r }));
+    return pool.map((r, idx) => ({
+      label: displayComboLabel(null, idx, r),
+      result: r,
+    }));
   }
   return combos.map((c: any, idx: number) => {
-    const label = c?.label || `Filter #${idx + 1}`;
-    const aliases = [label, `combo_${idx + 1}`, `Filter #${idx + 1}`].map(norm);
+    const configuredLabel = String(c?.label || "").trim();
+    const fromFilters = labelFromFilterMap(c?.filters);
+    const aliases = [
+      configuredLabel,
+      fromFilters,
+      `combo_${idx + 1}`,
+      `Filter #${idx + 1}`,
+    ].filter(Boolean).map(norm);
     let hit = pool.findIndex((r) => aliases.includes(keyOf(r)));
     if (hit === -1 && combos.length === 1 && pool.length === 1) hit = 0;
     const result = hit >= 0 ? pool.splice(hit, 1)[0] : null;
-    return { label, comboId: c?.id ?? null, result };
+    return {
+      label: displayComboLabel(c, idx, result),
+      comboId: c?.id ?? null,
+      result,
+    };
   });
 }
 
