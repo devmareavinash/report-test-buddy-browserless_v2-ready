@@ -5,7 +5,6 @@ import { RunSession, getRunSession, registerRunSession, releaseRunSession } from
 import { extractFirstTableAlias, qualifyColumn } from "../_shared/sql-filter.ts";
 import { fetchCanonicalScript, scriptHasSavedCode, updateScriptRow } from "../_shared/canonical-script.ts";
 import { compareTables, summarizeTableCompare, toTableModel } from "../_shared/table-compare.ts";
-import { hasFilterCore, injectFilterCore } from "../_shared/mstr-filter-core.ts";
 import {
   createRunCancellationGate,
   isRunAuthExpiredError,
@@ -27,6 +26,7 @@ import {
   statusFromCategory,
   type ExtractionFailureCategory,
 } from "../_shared/extraction-outcome.ts";
+import { missingRequiredStructuredExtraction } from "../_shared/structured-extraction-retry.ts";
 
 /** Persist explicit not-executed rows so expected work cannot vanish from accounting. */
 async function persistUnexecutedScenarios(
@@ -94,58 +94,6 @@ function worseExtractionCategory(
     pass: 0,
   };
   return (rank[a] || 0) >= (rank[b] || 0) ? a : b;
-}
-
-/** LLM/legacy scripts sometimes call applyFilter without defining it. */
-function ensureApplyFilterAliases(src: string): string {
-  const uses =
-    /\bapplyFilter\s*\(/.test(src) ||
-    (/\bapplyFilters\s*\(/.test(src) && !/\bapplyFiltersVerified\s*\(/.test(src));
-  if (!uses) return src;
-  if (/\b(?:const|let|var|function)\s+applyFilter\b/.test(src)) return src;
-  if (!/\bselectByLabel\b/.test(src) && !/\bapplyFiltersVerified\b/.test(src)) return src;
-
-  const shim = `
-  const applyFilter = async (labelOrFilters, valueOrGeo) => {
-    if (labelOrFilters && typeof labelOrFilters === 'object' && !Array.isArray(labelOrFilters)) {
-      return (typeof applyFiltersVerified === 'function')
-        ? applyFiltersVerified(labelOrFilters, valueOrGeo)
-        : selectByLabel(Object.keys(labelOrFilters)[0], labelOrFilters[Object.keys(labelOrFilters)[0]]);
-    }
-    return selectByLabel(labelOrFilters, valueOrGeo);
-  };
-  const applyFilters = (typeof applyFiltersVerified === 'function') ? applyFiltersVerified : applyFilter;
-  const applyFiltersInOrder = applyFilters;
-`;
-
-  const endIdx = src.indexOf("// @@RTB_FILTER_CORE_END@@");
-  if (endIdx !== -1) {
-    const insertAt = endIdx + "// @@RTB_FILTER_CORE_END@@".length;
-    return src.slice(0, insertAt) + shim + src.slice(insertAt);
-  }
-  // Fallback: place after the first selectByLabel / applyFiltersVerified binding.
-  const m = src.match(/\b(?:const|let|var|function)\s+(?:selectByLabel|applyFiltersVerified)\b/);
-  if (!m || m.index == null) return src;
-  // Insert after the statement is impractical without a parser; put shim immediately before first use.
-  const useIdx = src.search(/\bapplyFilter(?:s)?\s*\(/);
-  if (useIdx < 0) return src;
-  return src.slice(0, useIdx) + shim + src.slice(useIdx);
-}
-
-function withCurrentFilterCore(code: string): string {
-  let src = String(code || "");
-  const before = src.length;
-  if (hasFilterCore(src)) src = injectFilterCore(src);
-  src = ensureApplyFilterAliases(src);
-  // Detect accidental wipe of record-count iframe core (Brand empties vs solo).
-  if (before > 0 && src.length + 10_000 < before) {
-    jsonLog("filter_core_inject_shrunk", {
-      before_bytes: before,
-      after_bytes: src.length,
-      has_record_count_frame: /@@RTB_RECORD_COUNT_FRAME_CORE@@/.test(String(code || "")),
-    });
-  }
-  return src;
 }
 
 // Orchestrator: scope_type ∈ {workstream, report, scenario}.
@@ -908,6 +856,43 @@ function countUsableKpisInPayload(payload: any, comboLabel: string | null): numb
   return best;
 }
 
+/**
+ * Full-matrix payloads nest one block per combo. Returns those KPI maps when
+ * 2+ combo children exist so missing-grid retry can check each child (the old
+ * `_multi` short-circuit skipped retries whenever any usable key existed).
+ */
+function collectMatrixComboValues(payload: any): Array<Record<string, any>> | null {
+  const candidates = [
+    payload?.extracted?.result?.results,
+    payload?.extracted?.result?.kpis,
+    payload?.extracted?.result?.result,
+    payload?.extracted?.result,
+    payload?.extracted?.extracted,
+    payload?.result?.extracted,
+    payload?.result?.results,
+    payload?.result,
+    payload?.extracted,
+  ];
+  for (const raw of candidates) {
+    const root = flattenExtractionRoot(raw);
+    if (!root || typeof root !== "object") continue;
+
+    const children = Object.entries(root).filter(([k, v]) => {
+      if (isExtractionNoiseKey(k) || String(k).startsWith("__")) return false;
+      if (!v || typeof v !== "object" || Array.isArray(v)) return false;
+      // Flat `{ grid: table }` — not a combo child.
+      if (STRUCTURED_KPI_KEYS.has(normKpiKey(k))) return false;
+      const flat = flattenNodeToKpis(v);
+      return Object.keys(flat).length > 0 || isStructuredVal(v) || !!pickComparableStructured(flat);
+    });
+
+    if (children.length >= 2) {
+      return children.map(([, node]) => flattenNodeToKpis(node));
+    }
+  }
+  return null;
+}
+
 function comboExtractionNeedsRetry(
   payload: any,
   comboLabel: string | null,
@@ -916,17 +901,26 @@ function comboExtractionNeedsRetry(
   const exec = payload?.extracted;
   const values = pickComboKpis(payload, comboLabel);
   const usableCount = countUsableKpisInPayload(payload, comboLabel);
+  const requireStructured = opts?.requireStructured ||
+    (opts?.configuredLabels || []).some((label) => looksLikeStructuredKpiLabel(label));
+
+  // Grid / chart / Show Data: always retry when the structured extract is missing,
+  // even if other keys (filters_applied, debug) made usableCount > 0.
+  if (
+    missingRequiredStructuredExtraction({
+      requireStructured,
+      configuredLabels: opts?.configuredLabels,
+      comboLabel,
+      comboValues: values,
+      matrixComboValues: comboLabel ? undefined : (collectMatrixComboValues(payload) || undefined),
+    })
+  ) {
+    return true;
+  }
+
   // Partial success (e.g. 154 KPIs + 2 empty) must NOT retry — full-matrix
   // calls with comboLabel=null used to look "empty" and burn 3× Browserless time.
   if (usableCount > 0) {
-    const requireStructured = opts?.requireStructured ||
-      (opts?.configuredLabels || []).some((label) => looksLikeStructuredKpiLabel(label));
-    if (requireStructured) {
-      const structured = pickComparableStructured(values) ||
-        (usableCount > 0 && !comboLabel ? { k: "_multi", v: true } : null);
-      // Multi-combo envelopes are validated per combo later; don't retry the whole matrix.
-      if (!structured && comboLabel) return true;
-    }
     const grains = values?.grains && typeof values.grains === "object"
       ? Object.values(values.grains)
       : [];
@@ -1482,7 +1476,12 @@ Deno.serve(async (req) => {
             // Case-level KPI configuration is the source of truth. Report KPI
             // config is only a default for legacy cases that have no saved KPI
             // list or tolerances in their assertion spec.
-            const executableCode = withCurrentFilterCore(String((script as any)?.playwright_code || ""));
+            // Match Solo (ScenarioDetail Run headless): send the raw saved script.
+            // withCurrentFilterCore here made Brand ≠ Solo bytes and caused intermittent
+            // empty Actual while Solo Latest result extracted the same scenario fine
+            // (see BRAND_EXTRACTION_RCA_RECONCILED.md — SCRIPT_TRANSFORM_DIVERGENCE).
+            // Filter-core upgrades still land on Generate/Regenerate into the saved script.
+            const executableCode = String((script as any)?.playwright_code || "");
             const assertionSpec: any = (script as any)?.assertion_spec || {};
             const configuredKpis: string[] = Array.isArray(assertionSpec.kpis)
               ? assertionSpec.kpis
@@ -1572,16 +1571,17 @@ Deno.serve(async (req) => {
                   }
                 }
               }
-              if (refCode) refCode = withCurrentFilterCore(refCode);
+              // Keep reference bytes aligned with Solo too (raw saved / generated code).
             }
 
             // A long matrix script can carry stale filters, tabs, popups, grids,
             // or chart grain state into the next combination. Give every combo
             // its own Browserless function call/page. Non-PCC scenarios retry
             // empty / failed extractions up to EXTRACTION_MAX_ATTEMPTS. PCC
-            // scenarios use one attempt to avoid doubling their long Browserless
-            // runtime. playwright-runtime remains unchanged; its existing
-            // override narrows the injected matrix to exactly one combination.
+            // scalar scrapes use one attempt to avoid doubling long Browserless
+            // runtime; grid/chart (requireStructured) still retries. playwright-
+            // runtime remains unchanged; its existing override narrows the
+            // injected matrix to exactly one combination.
             const requireStructuredExtraction = comparisonKpiLabels.some((label) =>
               looksLikeStructuredKpiLabel(label)
             ) || /graph|chart|grid|show\s*data|segment summary|overall performance/i
@@ -1605,9 +1605,13 @@ Deno.serve(async (req) => {
               comboLabel: string | null,
             ) => {
               // Auth / Browserless timeouts: always allow a second bounded attempt.
-              // Generic empty KPI retries stay limited for long PCC scrapes.
+              // Generic empty KPI retries stay limited for long PCC scrapes, but
+              // grid/chart (requireStructured) always gets EXTRACTION_MAX_ATTEMPTS
+              // so intermittent empty Show Data / grid scrapes can recover.
               const authOrTimeoutMax = 2;
-              const kpiMaxAttempts = isPccScenario ? 1 : EXTRACTION_MAX_ATTEMPTS;
+              const kpiMaxAttempts = (isPccScenario && !requireStructuredExtraction)
+                ? 1
+                : EXTRACTION_MAX_ATTEMPTS;
               await cancellation.throwIfCancelled(
                 runtimeCtx(target, comboLabel, 1, "before_runtime"),
               );
@@ -1697,8 +1701,10 @@ Deno.serve(async (req) => {
             let refRespRaw: any;
             // Solo Scenario "Run headless" injects the full matrix in one Browserless
             // call. Per-combo isolation was added for long PCC matrices, but for
-            // normal row-count/KPI cases it caused Brand empties (useful_key_count=0)
-            // while the same script succeeded solo. Match solo unless PCC / large.
+            // normal row-count/KPI/grid cases it caused Brand empties
+            // (useful_key_count=0) while the same script succeeded solo. Match solo
+            // unless PCC / large. Missing-grid retries still work via
+            // missingRequiredStructuredExtraction on the full-matrix payload.
             const isolateCombos = hasCombos && (isPccScenario || combos.length > 8);
             if (hasCombos && isolateCombos) {
               const isolated = await mapPool(combos, 1, async (combo) => {

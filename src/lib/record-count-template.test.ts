@@ -107,13 +107,34 @@ describe("record-count extraction contract", () => {
     expect(orchestrator).toContain("lookupConfiguredKpiValue(scraped, lbl, kpiAliases)");
   });
 
-  it("does not retry PCC payloads while preserving isolated sessions", () => {
+  it("does not retry PCC scalar payloads while preserving isolated sessions", () => {
     const orchestrator = readFileSync(orchestratorPath, "utf8");
 
     expect(orchestrator).not.toContain("function pccExtractionRetryReason");
-    expect(orchestrator).toContain("isPccScenario ? 1 : EXTRACTION_MAX_ATTEMPTS");
+    expect(orchestrator).toContain("isPccScenario && !requireStructuredExtraction");
     expect(orchestrator).toContain("comboExtractionNeedsRetry(response, comboLabel");
     expect(orchestrator).toContain("invokeRuntimeWithRetry");
+  });
+
+  it("retries when a required grid/chart extract is missing", () => {
+    const orchestrator = readFileSync(orchestratorPath, "utf8");
+
+    expect(orchestrator).toContain("missingRequiredStructuredExtraction");
+    expect(orchestrator).toContain("function collectMatrixComboValues");
+    expect(orchestrator).not.toContain('{ k: "_multi", v: true }');
+    expect(orchestrator).toContain("isPccScenario || combos.length > 8");
+    expect(orchestrator).not.toContain("combos.length > 8 || requireStructuredExtraction");
+  });
+
+  it("Brand sends raw saved script like Solo (no filter-core rewrite at run time)", () => {
+    const orchestrator = readFileSync(orchestratorPath, "utf8");
+    expect(orchestrator).toContain("Match Solo (ScenarioDetail Run headless): send the raw saved script");
+    expect(orchestrator).toMatch(
+      /const executableCode = String\(\(script as any\)\?\.playwright_code \|\| ""\);/,
+    );
+    expect(orchestrator).not.toMatch(
+      /const executableCode = withCurrentFilterCore\(String\(\(script as any\)\?\.playwright_code/,
+    );
   });
 
   it("does not pass blank PCC metrics as skipped values", () => {
