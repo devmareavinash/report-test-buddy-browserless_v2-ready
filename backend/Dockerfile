@@ -41,11 +41,9 @@ RUN sed -i 's/\r$//' ./docker-entrypoint.sh && chmod +x ./docker-entrypoint.sh
 # --unsafely-ignore-certificate-errors: Bayer SSL inspection breaks Deno's Mozilla CA store.
 # Runtime has no outbound DNS for esm.sh on many corp/Docker Desktop setups, so cache MUST succeed.
 RUN set -e; \
-    for fn in admin-users agent-analyze agent-heal agent-heal-script agent-orchestrate agent-scenarios agent-scrape agent-scripts script-agent-chat bootstrap-admin playwright-runtime run-warehouse-sql schedule-tick test-warehouse-connectivity trigger-run; do \
-      echo "Caching $fn..."; \
-      deno cache --unsafely-ignore-certificate-errors --no-check "functions/${fn}/index.ts"; \
-    done; \
-    deno cache --unsafely-ignore-certificate-errors --no-check server.ts
+    FILES=$(find functions -name '*.ts' ! -name '*.test.ts' | sort); \
+    echo "Caching $(echo $FILES | wc -w) files in one resolution..."; \
+    deno cache --unsafely-ignore-certificate-errors --no-check $FILES server.ts
 
 EXPOSE 8000
 ENV PORT=8000
