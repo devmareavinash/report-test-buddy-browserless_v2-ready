@@ -10,10 +10,13 @@ import {
   loadAuthSession,
   saveAuthSession,
   shouldClearAuthSession,
+  shouldRetryAuthSessionFresh,
   shouldSaveAuthSession,
+  summarizeExtractionShape,
 } from "./auth-session-store.ts";
 import {
   extractCapturedStorageState,
+  extractCaptureMeta,
   stripCapturedStorageState,
   wrapCodeWithAuthSession,
 } from "./auth-session-wrap.ts";
@@ -52,8 +55,10 @@ async function resolveCredentialProfileId(
         || null;
     }
     return script?.credential_profile_id || report.credential_profile_id || null;
-  } catch (e) {
-    authSessionLog("auth_session_profile_resolve_failed", { error: String(e) });
+  } catch {
+    authSessionLog("auth_session_profile_resolve_failed", {
+      error_category: "resolve_error",
+    });
     return null;
   }
 }
@@ -84,6 +89,35 @@ async function invokePlaywright(
   }
 }
 
+function diagFields(
+  profileId: string | null,
+  target: "main" | "reference",
+  scenarioId: string | undefined,
+  reused: boolean,
+  payload: unknown,
+) {
+  const shape = summarizeExtractionShape(payload);
+  const meta = extractCaptureMeta(payload);
+  return {
+    profile: profileId,
+    target,
+    scenario_id: scenarioId || null,
+    // Logging limitation: run_id / report_id / combo_id / retry number are not
+    // present on the playwright-runtime request body without changing orchestrate
+    // or playwright-runtime (out of scope).
+    reused,
+    extracted_ok: shape.extracted_ok,
+    extracted_error: shape.error,
+    url_path: shape.url_path,
+    useful_key_count: shape.useful_key_count,
+    empty_key_count: shape.empty_key_count,
+    unusable: shape.unusable,
+    partial: shape.partial,
+    capture_attempted: meta.capture_attempted,
+    capture_succeeded: meta.capture_succeeded,
+  };
+}
+
 export function withPlaywrightAuthSession(handler: Handler): Handler {
   return async (req: Request) => {
     if (req.method === "OPTIONS") return await handler(req);
@@ -108,6 +142,7 @@ export function withPlaywrightAuthSession(handler: Handler): Handler {
           target,
           profile: profileId,
           cookies: storageState.cookies?.length || 0,
+          scenario_id: scenarioId || null,
         });
       }
     } else {
@@ -125,25 +160,73 @@ export function withPlaywrightAuthSession(handler: Handler): Handler {
         profile: profileId,
         reused: Boolean(storageState),
         code_bytes: wrappedCode.length,
+        scenario_id: scenarioId || null,
       });
     }
 
     let reused = Boolean(storageState);
     let attempt = await invokePlaywright(handler, req, body, wrappedCode);
+    let authAttempt = 1;
+    // Bound: at most one reuse→fresh retry, plus one extra fresh retry when the
+    // first attempt was already fresh (TTL miss / cleared session) but still
+    // landed on the login page. Never retry indefinitely.
+    const AUTH_FRESH_RETRY_MAX = 2;
 
-    // Reused MicroStrategy cookies can outlive the server session. Scripts then
-    // scrape an empty/login shell without always returning LOGIN_FAILED. Clear
-    // and retry once with a fresh login so brand runs recover mid-suite.
-    if (profileId && reused && attempt.payload && extractionLooksUnusable(attempt.payload)) {
+    // Clear + fresh-login ONLY on explicit auth failure evidence.
+    // Generic empty/partial KPI extraction must preserve the reusable session so
+    // later Brand scenarios are not forced into fresh login.
+    if (profileId && reused && attempt.payload && shouldRetryAuthSessionFresh(attempt.payload)) {
       authSessionLog("auth_session_reuse_miss_retry_fresh", {
-        target,
-        profile: profileId,
-        scenario_id: scenarioId || null,
+        ...diagFields(profileId, target, scenarioId, true, attempt.payload),
+        reason: "auth_failure_evidence",
+        session_action: "clear_and_fresh_login",
+        attempt: authAttempt + 1,
+        max_attempts: AUTH_FRESH_RETRY_MAX,
       });
-      await clearAuthSession(profileId);
+      await clearAuthSession(profileId, "auth_failure_reuse_miss");
       const freshWrapped = code ? wrapCodeWithAuthSession(code, null) : code;
       attempt = await invokePlaywright(handler, req, body, freshWrapped);
       reused = false;
+      authAttempt += 1;
+    } else if (
+      profileId &&
+      reused &&
+      attempt.payload &&
+      extractionLooksUnusable(attempt.payload) &&
+      !shouldClearAuthSession(attempt.payload)
+    ) {
+      authSessionLog("auth_session_extraction_failed_session_preserved", {
+        ...diagFields(profileId, target, scenarioId, true, attempt.payload),
+        reason: "non_auth_unusable_extraction",
+        session_action: "preserve",
+        session_preserved: true,
+      });
+    }
+
+    // Fresh-from-start (or after reuse-miss) still on login → one bounded retry.
+    if (
+      profileId &&
+      !reused &&
+      authAttempt < AUTH_FRESH_RETRY_MAX &&
+      attempt.payload &&
+      shouldRetryAuthSessionFresh(attempt.payload)
+    ) {
+      authSessionLog("auth_session_fresh_login_retry", {
+        ...diagFields(profileId, target, scenarioId, false, attempt.payload),
+        reason: "auth_failure_after_fresh",
+        session_action: "clear_and_fresh_login",
+        attempt: authAttempt + 1,
+        max_attempts: AUTH_FRESH_RETRY_MAX,
+      });
+      await clearAuthSession(profileId, "auth_failure_fresh_retry");
+      const freshWrapped = code ? wrapCodeWithAuthSession(code, null) : code;
+      attempt = await invokePlaywright(handler, req, body, freshWrapped);
+      authAttempt += 1;
+    }
+
+    if (attempt.payload && typeof attempt.payload === "object") {
+      (attempt.payload as any).auth_session_attempts = authAttempt;
+      (attempt.payload as any).auth_session_reused = reused;
     }
 
     if (!attempt.payload) {
@@ -159,25 +242,45 @@ export function withPlaywrightAuthSession(handler: Handler): Handler {
     const cookieCount = (captured && typeof captured === "object" && Array.isArray((captured as any).cookies))
       ? (captured as any).cookies.length
       : 0;
+    const shape = summarizeExtractionShape(payload);
+    const captureMeta = extractCaptureMeta(payload);
 
     if (profileId) {
       if (shouldClearAuthSession(extracted) || shouldClearAuthSession(payload)) {
-        await clearAuthSession(profileId);
+        authSessionLog("auth_session_clear_requested", {
+          ...diagFields(profileId, target, scenarioId, reused, payload),
+          reason: "auth_failure_evidence",
+          cookie_count: cookieCount,
+        });
+        await clearAuthSession(profileId, "auth_failure_evidence");
       } else if (shouldSaveAuthSession(payload, captured)) {
         await saveAuthSession(profileId, captured);
+        if (shape.partial) {
+          authSessionLog("auth_session_partial_extraction", {
+            ...diagFields(profileId, target, scenarioId, reused, payload),
+            cookie_count: cookieCount,
+            session_preserved: true,
+            session_saved: true,
+            // configured KPI count unavailable without orchestrator changes
+            configured_count: null,
+          });
+        }
       } else {
+        // Shape fields (partial/unusable/counts) already in diagFields — avoid a second event.
         authSessionLog("auth_session_not_saved", {
-          profile: profileId,
-          target,
+          ...diagFields(profileId, target, scenarioId, reused, payload),
           cookie_count: cookieCount,
-          extracted_ok: extracted && typeof extracted === "object" ? (extracted as any).ok : null,
-          unusable: extractionLooksUnusable(payload),
+          reason: shape.unusable ? "unusable_extraction" : "invalid_or_missing_capture",
+          session_preserved: true,
+          capture_attempted: captureMeta.capture_attempted,
+          capture_succeeded: captureMeta.capture_succeeded,
         });
       }
     }
 
     const cleaned = stripCapturedStorageState(payload);
-    if (reused) cleaned.auth_session_reused = true;
+    cleaned.auth_session_reused = reused;
+    cleaned.auth_session_attempts = authAttempt;
 
     return new Response(JSON.stringify(cleaned), {
       status: attempt.status,

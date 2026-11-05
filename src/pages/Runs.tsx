@@ -11,6 +11,12 @@ import { XCircle, Trash2 } from "lucide-react";
 import { toast } from "@/hooks/use-toast";
 import { fetchRunAssertionSpecs, fetchRunTestResults } from "@/lib/runTestResults";
 import { deriveRunResults, matchesRunOutcome, presentedRunStatus } from "@/lib/runPresentation";
+import {
+  caseOutcomeFromStatus,
+  countAccountedCases,
+  mergeExpectedCaseStatuses,
+  type CaseOutcome,
+} from "@/lib/runAccounting";
 
 export default function Runs() {
   const queryClient = useQueryClient();
@@ -37,8 +43,29 @@ export default function Runs() {
 
   const { data: runs } = useQuery({
     queryKey: ["all-runs"],
-    queryFn: async () =>
-      (await supabase.from("runs").select("*").order("started_at", { ascending: false }).limit(200)).data ?? [],
+    queryFn: async () => {
+      // Recent history (may drop older rows once >200 newer runs exist).
+      const recent = (await supabase
+        .from("runs")
+        .select("*")
+        .order("started_at", { ascending: false })
+        .limit(200)).data ?? [];
+      // Always merge active locks — Screens uses the full running set, so a stuck
+      // run older than the recent window must still appear (and be cancellable).
+      const active = (await supabase
+        .from("runs")
+        .select("*")
+        .eq("status", "running")
+        .order("started_at", { ascending: false })
+        .limit(1000)).data ?? [];
+      const byId = new Map<string, any>();
+      for (const row of [...active, ...recent]) {
+        if (row?.id) byId.set(row.id, row);
+      }
+      return Array.from(byId.values()).sort(
+        (a, b) => new Date(b.started_at || 0).getTime() - new Date(a.started_at || 0).getTime(),
+      );
+    },
     refetchInterval: (query) =>
       ((query.state.data as any[]) || []).some((run: any) => run.status === "running") ? 3000 : false,
     staleTime: 0,
@@ -86,12 +113,15 @@ export default function Runs() {
 
   const caseCounts = (run: any) => {
     const m = runMeta?.[run.id];
-    const caseStatus = new Map<string, "pass" | "fail" | "pending">();
+    const caseStatus = new Map<string, CaseOutcome>();
     for (const [scenarioId, statuses] of m?.cases || []) {
-      caseStatus.set(
-        scenarioId,
-        statuses.includes("fail") ? "fail" : statuses.includes("pending") ? "pending" : "pass",
-      );
+      const outcomes = statuses.map((st) => caseOutcomeFromStatus(st));
+      if (outcomes.some((o) => o === "fail")) caseStatus.set(scenarioId, "fail");
+      else if (outcomes.some((o) => o === "pending")) caseStatus.set(scenarioId, "pending");
+      else if (outcomes.some((o) => o === "blocked")) caseStatus.set(scenarioId, "blocked");
+      else if (outcomes.some((o) => o === "cancelled")) caseStatus.set(scenarioId, "cancelled");
+      else if (outcomes.some((o) => o === "not_started")) caseStatus.set(scenarioId, "not_started");
+      else caseStatus.set(scenarioId, "pass");
     }
     const reportIds = run.scope_type === "workstream"
       ? new Set((reports || []).filter((r: any) => r.workstream_id === run.scope_id).map((r: any) => r.id))
@@ -101,16 +131,71 @@ export default function Runs() {
       : (scenarios || [])
           .filter((s: any) => !s.deferred && reportIds.has(s.report_id))
           .map((s: any) => s.id);
-    for (const scenarioId of run.status === "running" ? scopedScenarioIds : []) {
-      if (!caseStatus.has(scenarioId)) caseStatus.set(scenarioId, "pending");
+    // Finished runs must still account for never-started expected scenarios.
+    const merged = mergeExpectedCaseStatuses(
+      caseStatus,
+      scopedScenarioIds,
+      run.status,
+      run.summary,
+    );
+    const accounted = countAccountedCases(merged.values());
+    return {
+      pass: accounted.pass,
+      fail: accounted.fail,
+      pending: accounted.pending + accounted.not_executed,
+      not_executed: accounted.not_executed,
+      total: accounted.total,
+    };
+  };
+
+  const scopeLabels = (r: any): string[] => {
+    const out: string[] = [];
+    if (r.scope_type === "workstream" && r.scope_id) {
+      const ws = (workstreams || []).find((w: any) => w.id === r.scope_id);
+      if (ws?.name) out.push(String(ws.name).toLowerCase());
+    } else if (r.scope_type === "report" && r.scope_id) {
+      const rep = (reports || []).find((x: any) => x.id === r.scope_id);
+      if (rep?.name) out.push(String(rep.name).toLowerCase());
+      const ws = (workstreams || []).find((w: any) => w.id === rep?.workstream_id);
+      if (ws?.name) out.push(`${ws.name} / ${rep?.name || ""}`.toLowerCase());
+    } else if (r.scope_type === "scenario" && r.scope_id) {
+      const sc = (scenarios || []).find((s: any) => s.id === r.scope_id);
+      const rep = (reports || []).find((x: any) => x.id === sc?.report_id);
+      const ws = (workstreams || []).find((w: any) => w.id === rep?.workstream_id);
+      if (rep?.name) out.push(String(rep.name).toLowerCase());
+      if (ws?.name) out.push(String(ws.name).toLowerCase());
     }
-    let pass = 0, fail = 0, pending = 0;
-    for (const value of caseStatus.values()) {
-      if (value === "pass") pass++;
-      else if (value === "fail") fail++;
-      else pending++;
+    return out;
+  };
+
+  const runMatchesWorkstream = (r: any, m: any, wantWs: string) => {
+    if (m?.ws?.has(wantWs)) return true;
+    if (r.scope_type === "workstream" && r.scope_id === wantWs) return true;
+    if (r.scope_type === "report" && r.scope_id) {
+      const rep = (reports || []).find((x: any) => x.id === r.scope_id);
+      return rep?.workstream_id === wantWs;
     }
-    return { pass, fail, pending, total: caseStatus.size };
+    if (r.scope_type === "scenario" && r.scope_id) {
+      const sc = (scenarios || []).find((s: any) => s.id === r.scope_id);
+      const rep = (reports || []).find((x: any) => x.id === sc?.report_id);
+      return rep?.workstream_id === wantWs;
+    }
+    return false;
+  };
+
+  const runMatchesReport = (r: any, m: any, wantReport: string) => {
+    if (m?.reports?.has(wantReport)) return true;
+    if (r.scope_type === "report" && r.scope_id === wantReport) return true;
+    if (r.scope_type === "scenario" && r.scope_id) {
+      const sc = (scenarios || []).find((s: any) => s.id === r.scope_id);
+      return sc?.report_id === wantReport;
+    }
+    if (r.scope_type === "workstream" && r.scope_id) {
+      return (reports || []).some((rep: any) =>
+        rep.workstream_id === r.scope_id && rep.id === wantReport
+      );
+    }
+    return false;
   };
 
   const filtered = useMemo(() => {
@@ -119,16 +204,19 @@ export default function Runs() {
       const counts = caseCounts(r);
       if (!matchesRunOutcome(r, counts, status)) return false;
       const m = runMeta?.[r.id];
-      if (wsId !== "all" && !m?.ws.has(wsId)) return false;
-      if (reportId !== "all" && !m?.reports.has(reportId)) return false;
+      // Scope-based match so stuck running workstream/report runs remain visible
+      // even when they have no (or incomplete) test_results yet.
+      if (wsId !== "all" && !runMatchesWorkstream(r, m, wsId)) return false;
+      if (reportId !== "all" && !runMatchesReport(r, m, reportId)) return false;
       if (!q) return true;
       if (r.id.toLowerCase().includes(q)) return true;
       if (r.trigger_source?.toLowerCase().includes(q)) return true;
       if (r.scope_type?.toLowerCase().includes(q)) return true;
       for (const lbl of m?.labels || []) if (lbl.includes(q)) return true;
+      for (const lbl of scopeLabels(r)) if (lbl.includes(q)) return true;
       return false;
     });
-  }, [runs, runMeta, reports, scenarios, status, wsId, reportId, search]);
+  }, [runs, runMeta, reports, scenarios, workstreams, status, wsId, reportId, search]);
 
   const setStatus = (s: string | null) => {
     const next = new URLSearchParams(params);
@@ -272,6 +360,8 @@ export default function Runs() {
                         else {
                           toast({ title: "Run cancelled" });
                           queryClient.invalidateQueries({ queryKey: ["all-runs"] });
+                          queryClient.invalidateQueries({ queryKey: ["active-execution-locks"] });
+                          queryClient.invalidateQueries({ queryKey: ["run-meta"] });
                         }
                       }}
                       title="Cancel run"

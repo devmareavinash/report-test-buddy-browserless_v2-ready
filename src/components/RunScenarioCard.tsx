@@ -12,6 +12,10 @@ import { toast } from "sonner";
 import { StoredResultTable } from "@/components/StoredResultTable";
 import { fetchCanonicalScript } from "@/lib/canonicalScript";
 import { configuredKpiNames, deriveStoredResultStatus } from "@/lib/kpi-values";
+import {
+  formatExtractionStatusLabel,
+  resolveValidationDisplayStatus,
+} from "@/lib/extraction-status-label";
 
 type TR = {
   id: string;
@@ -162,6 +166,41 @@ export function RunScenarioCard({
           <ScenarioResultTable results={resultsWithDerived} scenarioType={scenarioType} spec={spec} />
           <ScenarioKpiTolerancesReadOnly scenarioId={scenarioId} scenarioType={scenarioType} results={results} />
 
+          {(() => {
+            const exec =
+              (latest?.actual && typeof latest.actual === "object" && (latest.actual as any).execution) ||
+              (latest?.diff && typeof latest.diff === "object" && (latest.diff as any).__execution) ||
+              null;
+            if (!exec || typeof exec !== "object") return null;
+            const category = String(exec.failure_category || exec.status || "").trim();
+            const missing = Array.isArray(exec.missing_fields) ? exec.missing_fields.filter(Boolean) : [];
+            const attempts = exec.attempt_count != null ? Number(exec.attempt_count) : null;
+            if (!category && !missing.length) return null;
+            const extractionLabel = formatExtractionStatusLabel(category);
+            const validationLabel = resolveValidationDisplayStatus(category, latestDerivedStatus);
+            const validationChipStatus =
+              validationLabel === "PASS" ? "pass" : validationLabel === "PENDING" ? "pending" : "fail";
+            return (
+              <div className="mono text-[11px] text-muted-foreground space-y-0.5">
+                {category && (
+                  <div>
+                    Extraction Status:{" "}
+                    <StatusChip status={category} label={extractionLabel} />
+                    {attempts != null && Number.isFinite(attempts) ? ` · Attempts: ${attempts}` : ""}
+                  </div>
+                )}
+                {category && (
+                  <div>
+                    Validation Status:{" "}
+                    <StatusChip status={validationChipStatus} label={validationLabel} />
+                  </div>
+                )}
+                {missing.length > 0 && (
+                  <div>Missing fields: {missing.join(", ")}</div>
+                )}
+              </div>
+            );
+          })()}
           {latest?.analysis && (
             <div>
               <span className="text-muted-foreground mono">RCA: </span>

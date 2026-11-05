@@ -18,6 +18,7 @@ export const KPI_VALUE_NOISE = new Set([
   "dossierready", "timegrainretry", "via", "role", "nth", "selector", "locator",
   "snapshot", "clicked", "opened", "option", "clickedtext", "jobid",
   "provider", "screenshotb64", "liveurl", "requestedmode", "fallbackreason",
+  "execution", "failurecategory", "missingfields", "attemptcount",
 ]);
 
 export function normKpiKey(k: string) {
@@ -385,7 +386,26 @@ export function overallFromStoredKpiRows(rows: Array<{ pass: boolean | null | un
 }
 
 function toStoredStatus(status: any): StoredResultStatus {
-  return status === "pass" || status === "fail" || status === "pending" ? status : "pending";
+  const s = String(status || "").toLowerCase();
+  if (s === "pass") return "pass";
+  if (s === "pending") return "pending";
+  // Terminal execution categories must never collapse to pending in Latest Result.
+  if (
+    s === "fail" ||
+    s === "partial_extraction" ||
+    s === "auth_failure" ||
+    s === "browserless_timeout" ||
+    s === "cancelled" ||
+    s === "empty_extraction" ||
+    s === "error" ||
+    s === "failed" ||
+    s === "not_started" ||
+    s === "blocked" ||
+    s === "infrastructure_blocked"
+  ) {
+    return "fail";
+  }
+  return "pending";
 }
 
 export function deriveStoredResultRows({

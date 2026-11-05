@@ -339,10 +339,18 @@ export default function ScenarioDetail() {
           const pass = (remaining || []).filter((r: any) => r.status === "pass").length;
           const fail = (remaining || []).filter((r: any) => r.status === "fail").length;
           const pending = (remaining || []).filter((r: any) => r.status === "pending").length;
-          await supabase.from("runs").update({
-            status: fail > 0 ? "failed" : (pending > 0 ? "running" : "completed"),
-            summary: { pass, fail, pending, total: (remaining || []).length },
-          }).eq("id", row.run_id);
+          // Never clobber Brand/report workstream summaries from a history-row delete.
+          const { data: parentRun } = await supabase
+            .from("runs")
+            .select("scope_type")
+            .eq("id", row.run_id)
+            .maybeSingle();
+          if (parentRun?.scope_type === "scenario") {
+            await supabase.from("runs").update({
+              status: fail > 0 ? "failed" : (pending > 0 ? "running" : "completed"),
+              summary: { pass, fail, pending, total: (remaining || []).length },
+            }).eq("id", row.run_id);
+          }
         }
       }
       toast.success("Execution log deleted");
@@ -1136,10 +1144,21 @@ export default function ScenarioDetail() {
     }
     return statusFromKpis(displayActual, displayExpected, kpiTolerances);
   })();
-  const persistedStatus: "pass" | "fail" | "pending" | undefined =
-    latest?.status === "pass" || latest?.status === "fail" || latest?.status === "pending"
-      ? latest.status
-      : undefined;
+  const persistedStatus: "pass" | "fail" | "pending" | undefined = (() => {
+    const s = String(latest?.status || "").toLowerCase();
+    if (s === "pass" || s === "pending") return s;
+    if (
+      s === "fail" ||
+      s === "partial_extraction" ||
+      s === "auth_failure" ||
+      s === "browserless_timeout" ||
+      s === "cancelled" ||
+      s === "empty_extraction"
+    ) {
+      return "fail";
+    }
+    return undefined;
+  })();
   // Live KPI/grid comparison wins when available (including pending); saved DB is fallback.
   const tableOverall =
     tableLiveOverall === "pass" || tableLiveOverall === "fail" || tableLiveOverall === "pending"
@@ -3223,8 +3242,15 @@ function resolveExpectedValues(opts: {
       const block = pickComboBlock(pickResultRoot(referencePayload), label, idx, comboId);
       const fromBlock = extractKpisFromBlock(block);
       if (Object.keys(fromBlock).length) return fromBlock;
+      // Single-combo only — multi-combo whole-payload fallback contaminates rows.
       const fromRun = extractKpisFromRun(referencePayload);
-      if (fromRun && Object.keys(fromRun).length) return fromRun;
+      if (fromRun && Object.keys(fromRun).length && idx === 0) {
+        const root = pickResultRoot(referencePayload);
+        const siblingBlocks = root && typeof root === "object"
+          ? Object.keys(root).filter((k) => looksLikeComboLabel(k) || k === label)
+          : [];
+        if (siblingBlocks.length <= 1) return fromRun;
+      }
     }
     return findStoredExpected(storedRows, label);
   }
@@ -3324,7 +3350,11 @@ async function persistManualHeadlessRun(opts: {
       const label = comboPersistLabel(c, i);
       const block = pickComboBlock(root, label, i, c.id);
       let values = extractKpisFromBlock(block);
-      if (!Object.keys(values).length) values = extractKpisFromRun(payload) || {};
+      // Never fall back to the whole multi-combo payload — that reuses another
+      // combo's KPIs (e.g. both rows getting 428) and leaves false history.
+      if (!Object.keys(values).length && (combos?.length || 0) <= 1) {
+        values = extractKpisFromRun(payload) || {};
+      }
       values = attachTrendFields(values, block, payload, payload?.extracted, payload?.extracted?.result);
       values = aliasConfiguredKpis(values, tolerances);
       const expectedValues = aliasConfiguredKpis(resolveExpectedValues({
@@ -3569,22 +3599,41 @@ async function persistReferenceHeadlessRun(opts: {
   const expectedByLabel = new Map<string, Record<string, any>>();
   if (combos?.length) {
     for (let i = 0; i < combos.length; i++) {
-      const lbl = combos[i].label || `combo_${i + 1}`;
-      const block = pickComboBlock(root, lbl, i, combos[i].id);
+      const c = combos[i];
+      // Must match comboPersistLabel used when writing actual.filter.
+      const lbl = comboPersistLabel(c, i);
+      const block = pickComboBlock(root, lbl, i, c.id);
       let vals = extractKpisFromBlock(block);
-      if (!Object.keys(vals).length) vals = extractKpisFromRun(payload) || {};
+      if (!Object.keys(vals).length && combos.length <= 1) {
+        vals = extractKpisFromRun(payload) || {};
+      }
       vals = aliasConfiguredKpis(vals, tolerances);
-      if (Object.keys(vals).length) expectedByLabel.set(String(lbl), vals);
+      if (Object.keys(vals).length) {
+        expectedByLabel.set(String(lbl), vals);
+        if (c?.label) expectedByLabel.set(String(c.label), vals);
+        if (c?.id) expectedByLabel.set(String(c.id), vals);
+        expectedByLabel.set(`combo_${i + 1}`, vals);
+      }
     }
   }
-  const fallbackValues = extractKpisFromRun(payload) || {};
+  const fallbackValues = (combos?.length || 0) <= 1
+    ? (extractKpisFromRun(payload) || {})
+    : {};
   if (!expectedByLabel.size && !Object.keys(fallbackValues).length) return false;
 
   let updated = 0;
-  for (const row of runRows as any[]) {
-    const rowLabel = row.actual?.filter || row.expected?.filter || combos?.[0]?.label;
+  const targets = combos?.length ? combos : [null];
+  for (let i = 0; i < targets.length; i++) {
+    const c = targets[i];
+    const liveLabel = c ? comboPersistLabel(c, i) : storedRowFilterLabel(runRows[0]);
+    const row = c ? matchStoredComboRow(runRows, c, i, liveLabel) : runRows[0];
+    if (!row) continue;
+    const rowLabel = storedRowFilterLabel(row) || liveLabel;
     const values = (rowLabel && expectedByLabel.get(String(rowLabel)))
-      || (expectedByLabel.size === 1 ? [...expectedByLabel.values()][0] : fallbackValues);
+      || (liveLabel && expectedByLabel.get(String(liveLabel)))
+      || (c?.id && expectedByLabel.get(String(c.id)))
+      || (expectedByLabel.size === 1 ? [...expectedByLabel.values()][0] : null)
+      || fallbackValues;
     if (!values || !Object.keys(values).length) continue;
     const prevExpected = (row.expected && typeof row.expected === "object") ? row.expected : {};
     const actualValues = kpiMapFromStored(row.actual) || {};
@@ -3598,24 +3647,35 @@ async function persistReferenceHeadlessRun(opts: {
         extracted: payload?.extracted ?? null,
       },
       status,
+      analysis: status === "pending"
+        ? "Reference applied but comparison still incomplete"
+        : "Updated from manual scenario run",
     }).eq("id", row.id);
     if (!error) updated += 1;
   }
   if (updated && latestRunId) {
-    const { data: allRows } = await supabase.from("test_results").select("status").eq("run_id", latestRunId);
-    const pass = (allRows || []).filter((r: any) => r.status === "pass").length;
-    const fail = (allRows || []).filter((r: any) => r.status === "fail").length;
-    const pending = (allRows || []).filter((r: any) => r.status === "pending").length;
-    await supabase.from("runs").update({
-      status: fail > 0 ? "failed" : (pending > 0 ? "running" : "completed"),
-      summary: {
-        source: "reference_script",
-        pass,
-        fail,
-        pending,
-        total: (allRows || []).length,
-      },
-    }).eq("id", latestRunId);
+    // Solo scenario runs only — never overwrite Brand/report coordinator summaries.
+    const { data: parentRun } = await supabase
+      .from("runs")
+      .select("scope_type")
+      .eq("id", latestRunId)
+      .maybeSingle();
+    if (parentRun?.scope_type === "scenario") {
+      const { data: allRows } = await supabase.from("test_results").select("status").eq("run_id", latestRunId);
+      const pass = (allRows || []).filter((r: any) => r.status === "pass").length;
+      const fail = (allRows || []).filter((r: any) => r.status === "fail").length;
+      const pending = (allRows || []).filter((r: any) => r.status === "pending").length;
+      await supabase.from("runs").update({
+        status: fail > 0 ? "failed" : (pending > 0 ? "running" : "completed"),
+        summary: {
+          source: "reference_script",
+          pass,
+          fail,
+          pending,
+          total: (allRows || []).length,
+        },
+      }).eq("id", latestRunId);
+    }
   }
   return updated > 0;
 }

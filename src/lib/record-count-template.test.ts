@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { parseSubTabs } from "../../supabase/functions/_shared/mstr-grid-template";
+import { injectFilterCore } from "../../supabase/functions/_shared/mstr-filter-core";
 
 const root = process.cwd();
 const referencePath = resolve(
@@ -20,6 +21,23 @@ describe("record-count extraction contract", () => {
       title: "HCP Customer - 'Which is writing fewer NBRx than they used to?' tab Record Count: Pre Prod vs Prod",
       description: "",
     })).toEqual(["Which is writing fewer NBRx than they used to?"]);
+  });
+
+  it("does not wipe the record-count iframe core when refreshing filter core", () => {
+    const reference = readFileSync(referencePath, "utf8");
+    expect(reference).toContain("@@RTB_RECORD_COUNT_FRAME_CORE@@");
+    expect(reference).toContain("const tryFrame = frame");
+    const after = injectFilterCore(reference);
+    expect(after).toBe(reference);
+    expect(after).toContain("@@RTB_RECORD_COUNT_FRAME_CORE@@");
+    expect(after).toContain("resultFrame");
+  });
+
+  it("does not promote incidental scrape tables onto a scalar row-count KPI", () => {
+    const orchestrator = readFileSync(orchestratorPath, "utf8");
+    expect(orchestrator).toContain("skipIncidentalStructuredPromotion");
+    expect(orchestrator).toContain("configuredKpiOwnsScalar");
+    expect(orchestrator).toContain("isUsableScalarKpi");
   });
 
   it("versions the extractor without automatically replacing saved scripts", () => {

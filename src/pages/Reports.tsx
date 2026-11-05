@@ -57,10 +57,25 @@ export default function Reports() {
         if (!rep) continue;
         const m = (map[rep] ||= { pass: 0, fail: 0, pending: 0, total: 0 });
         m.total += 1;
-        const st = latest.get(s.id as string);
+        const st = String(latest.get(s.id as string) || "").toLowerCase();
         if (st === "pass") m.pass += 1;
-        else if (st === "fail") m.fail += 1;
-        else m.pending += 1;
+        else if (
+          st === "fail" ||
+          st === "partial_extraction" ||
+          st === "auth_failure" ||
+          st === "browserless_timeout" ||
+          st === "cancelled" ||
+          st === "empty_extraction" ||
+          st === "error" ||
+          st === "failed"
+        ) {
+          m.fail += 1;
+        } else if (st === "pending" || !st) {
+          m.pending += 1;
+        } else {
+          // Unknown non-terminal statuses stay pending so they remain visible.
+          m.pending += 1;
+        }
       }
       return map;
     },
@@ -86,16 +101,61 @@ export default function Reports() {
 
   const filteredReports = useMemo(() => {
     const q = search.toLowerCase().trim();
+    const wsNameById = new Map((tree?.ws || []).map((w: any) => [w.id, String(w.name || "").toLowerCase()]));
     return (tree?.rep || []).filter((r: any) => {
       if (wsId !== "all" && r.workstream_id !== wsId) return false;
       if (!q) return true;
-      return r.name?.toLowerCase().includes(q) || r.url?.toLowerCase().includes(q);
+      const wsName = wsNameById.get(r.workstream_id) || "";
+      return (
+        r.name?.toLowerCase().includes(q) ||
+        r.url?.toLowerCase().includes(q) ||
+        wsName.includes(q)
+      );
     });
   }, [tree, search, wsId]);
 
   const visibleWs = (tree?.ws || []).filter((w: any) =>
     wsId === "all" ? true : w.id === wsId,
   );
+
+  const cancelActiveForWorkstream = async (workstreamId: string, workstreamName: string) => {
+    const active = (executionLocks.data?.activeRuns || []).filter((run) => {
+      if (run.scope_type === "workstream" && run.scope_id === workstreamId) return true;
+      if (run.scope_type === "report" && run.scope_id) {
+        const rep = (tree?.rep || []).find((r: any) => r.id === run.scope_id);
+        return rep?.workstream_id === workstreamId;
+      }
+      if (run.scope_type === "scenario" && run.scope_id) {
+        const reportId = executionLocks.data?.scenarioReport?.get(run.scope_id);
+        const rep = (tree?.rep || []).find((r: any) => r.id === reportId);
+        return rep?.workstream_id === workstreamId;
+      }
+      return false;
+    });
+    if (!active.length) {
+      toast.info(`No active DB run found for ${workstreamName}`);
+      await qc.invalidateQueries({ queryKey: ["active-execution-locks"] });
+      return;
+    }
+    if (!confirm(`Cancel ${active.length} active run(s) for ${workstreamName}?`)) return;
+    let failed = 0;
+    for (const run of active) {
+      const { error } = await supabase
+        .from("runs")
+        .update({
+          status: "cancelled",
+          finished_at: new Date().toISOString(),
+          summary: { cancelled: true, cancelled_from: "screens_ui" },
+        })
+        .eq("id", run.id)
+        .eq("status", "running");
+      if (error) failed += 1;
+    }
+    if (failed) toast.error(`Failed to cancel ${failed} run(s)`);
+    else toast.success(`Cancelled ${active.length} run(s)`);
+    await qc.invalidateQueries({ queryKey: ["active-execution-locks"] });
+    await qc.invalidateQueries({ queryKey: ["all-runs"] });
+  };
 
   return (
     <AppLayout>
@@ -193,21 +253,29 @@ export default function Reports() {
                         ? <Loader2 className="h-3 w-3 animate-spin" />
                         : <Copy className="h-3 w-3" />}
                     </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      disabled={
-                        (run.isPending && run.variables?.scope_id === w.id) ||
-                        executionLocks.isWorkstreamRunning(w.id)
-                      }
-                      onClick={() => run.mutate({ scope_type: "workstream", scope_id: w.id })}
-                    >
-                      {(run.isPending && run.variables?.scope_id === w.id) ||
-                      executionLocks.isWorkstreamRunning(w.id)
-                        ? <Loader2 className="h-3 w-3 mr-1 animate-spin" />
-                        : <Play className="h-3 w-3 mr-1" />}
-                      {executionLocks.isWorkstreamRunning(w.id) ? "Running…" : "Run report"}
-                    </Button>
+                    {executionLocks.isWorkstreamRunning(w.id) ? (
+                      <Button
+                        size="sm"
+                        variant="destructive"
+                        onClick={() => cancelActiveForWorkstream(w.id, w.name)}
+                        title="Cancel the stuck/active run locking this report"
+                      >
+                        <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                        Cancel run
+                      </Button>
+                    ) : (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={run.isPending && run.variables?.scope_id === w.id}
+                        onClick={() => run.mutate({ scope_type: "workstream", scope_id: w.id })}
+                      >
+                        {(run.isPending && run.variables?.scope_id === w.id)
+                          ? <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                          : <Play className="h-3 w-3 mr-1" />}
+                        Run report
+                      </Button>
+                    )}
                     <Button
                       size="sm"
                       variant="ghost"

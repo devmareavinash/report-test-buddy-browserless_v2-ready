@@ -30,8 +30,6 @@ docker compose up -d --build               # web + backend + browserless; add --
 
 Health checks: `curl http://127.0.0.1:8000/healthz`, `curl "http://127.0.0.1:3000/pressure?token=local-dev-token"`. A healthy backend logs `Backend listening on :8000 — N/N functions loaded`.
 
-Note: `npm run dev:all` references `scripts/dev-all.ps1`, which does not exist.
-
 ## Architecture
 
 ```
@@ -48,7 +46,7 @@ Deno gateway backend/server.ts (:8000) ── hosts every supabase/functions/<na
 - **Edge functions are not deployed to Supabase Edge in normal use.** `backend/server.ts` monkey-patches `Deno.serve` to capture each function's handler, then routes `/functions/v1/<name>/*` to it in one process. A new function must be added to the `FUNCTIONS` list there. Hosted Edge idle-kills Playwright at 150s, so the frontend (`src/lib/functions.ts`) defaults to the local/same-origin backend; `VITE_USE_CLOUD_FUNCTIONS=true` opts back into hosted Edge.
 - `playwright-runtime` is wrapped at the gateway by `_shared/auth-session-gateway.ts` to persist/restore MicroStrategy login cookies (`.auth-sessions/`, gitignored).
 - **Run flow:** `trigger-run` / `schedule-tick` → `agent-orchestrate` (the core: concurrency pool, active-run locking, per-combination extraction, KPI comparison with tolerances/dates/structured values, atomic run finalization) → `playwright-runtime` (main + reference scrapes) and/or `run-warehouse-sql` → results written to Supabase.
-- **Script generation:** `agent-scripts` detects the template kind from the user's description (`kpi`, `chart_show_data`, `trend_check`, `geography_grid`, `date_refresh`) and assembles it from `_shared/mstr-*-template.ts`; LLM generation is only a fallback. Generate/Regenerate runs a validate-and-repair loop (`_shared/script-gen-validate-loop.ts`, `_shared/script-validation.ts`). Saved scripts are never replaced automatically — regeneration is an explicit user action. `script-agent-chat` is optional at startup (may fail to load behind the proxy).
+- **Script generation:** `agent-scripts` detects the template kind from the user's description and assembles it from `_shared/mstr-*-template.ts`; LLM generation is only a fallback. Detection order: **trend_check → grid → chart → date_refresh → kpi → LLM**. Generate/Regenerate runs a validate-and-repair loop (`_shared/script-gen-validate-loop.ts`, `_shared/script-validation.ts`). Saved scripts are never replaced automatically — regeneration is an explicit user action. `script-agent-chat` is optional at startup (may fail to load behind the proxy).
 - **Filter core:** `_shared/mstr-filter-core.ts` is embedded in every template between `// @@RTB_FILTER_CORE_START@@` / `// @@RTB_FILTER_CORE_END@@`. Fix the core file, never a copy inside a template, reference script, or healed script.
 - **Browserless script contract** (see `docs/SCRIPT_AGENTS_WORKING.md` §10): `export default async ({ page }) => {...}`, no imports; runtime injects `__creds`, `__filterCombinations`, report URL; never hardcode filter values or credentials; `domcontentloaded` not `networkidle`; no `page.waitForTimeout`, `getByText`/`getByRole`, or locator chaining.
 
@@ -84,3 +82,4 @@ Copy `.env.example` → `.env`. `SUPABASE_SERVICE_ROLE_KEY` is server-only — n
 - `docs/VALIDATION_AGENT.md` — Generate-time validate/repair loop.
 - `docs/ARCHITECTURE_AND_FUNCTIONING.md`, `docs/DEPLOYMENT_GUIDE.md` — AWS ECS Express deployment (single Fargate task, four containers, `nginx.aws.conf`, `infra/ecs/task-definition.json`).
 - `LOCAL_TEST_STEPS.md` — manual regression checklist (result/history consistency, multi-user execution locks).
+- `.cursor/skills/` — Cursor IDE skills for MicroStrategy script generation/validation (not used by Claude Code).

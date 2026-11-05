@@ -9,6 +9,11 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { RunScenarioCard } from "@/components/RunScenarioCard";
 import { StatusChip } from "@/components/StatusChip";
 import { countRunCases, deriveRunResults, presentedRunStatus } from "@/lib/runPresentation";
+import {
+  caseOutcomeFromStatus,
+  countAccountedCases,
+  missingScenarioStubStatus,
+} from "@/lib/runAccounting";
 import { Button } from "@/components/ui/button";
 import { XCircle, Trash2 } from "lucide-react";
 import { toast } from "@/hooks/use-toast";
@@ -57,7 +62,7 @@ export default function RunDetail() {
     refetchOnMount: "always",
   });
 
-  // While a run is in progress, surface scenarios that haven't produced a result yet as "pending".
+  // Always load expected executable scenarios so unfinished cases cannot vanish from totals.
   const { data: scopeScenarios } = useQuery({
     queryKey: ["run-scope-scenarios", id, (run as any)?.scope_type, (run as any)?.scope_id],
     enabled: !!(run as any)?.scope_id,
@@ -66,13 +71,14 @@ export default function RunDetail() {
       if (r.scope_type === "report") {
         return (await supabase
           .from("scenarios")
-          .select("id, title, type, criticality, report_id, reports(id, name, workstream_id, workstreams(id, name))")
-          .eq("report_id", r.scope_id)).data ?? [];
+          .select("id, title, type, criticality, report_id, deferred, reports(id, name, workstream_id, workstreams(id, name))")
+          .eq("report_id", r.scope_id)
+          .eq("deferred", false)).data ?? [];
       }
       if (r.scope_type === "scenario") {
         return (await supabase
           .from("scenarios")
-          .select("id, title, type, criticality, report_id, reports(id, name, workstream_id, workstreams(id, name))")
+          .select("id, title, type, criticality, report_id, deferred, reports(id, name, workstream_id, workstreams(id, name))")
           .eq("id", r.scope_id)).data ?? [];
       }
       if (r.scope_type === "workstream") {
@@ -81,7 +87,7 @@ export default function RunDetail() {
         if (!repIds.length) return [];
         return (await supabase
           .from("scenarios")
-          .select("id, title, type, criticality, report_id, reports(id, name, workstream_id, workstreams(id, name))")
+          .select("id, title, type, criticality, report_id, deferred, reports(id, name, workstream_id, workstreams(id, name))")
           .in("report_id", repIds)
           .eq("deferred", false)).data ?? [];
       }
@@ -92,27 +98,29 @@ export default function RunDetail() {
 
   const merged = useMemo(() => {
     const have = new Set((results || []).map((r: any) => r.scenario_id));
-    const stubs = isRunning ? (scopeScenarios || [])
+    const stubStatus = missingScenarioStubStatus((run as any)?.status, (run as any)?.summary);
+    // Finished or running: missing expected scenarios stay visible (pending / not_started / blocked / cancelled).
+    const stubs = (scopeScenarios || [])
       .filter((s: any) => !have.has(s.id))
       .map((s: any) => ({
         id: `pending-${s.id}`,
         scenario_id: s.id,
         run_id: id,
-        status: "pending",
+        status: stubStatus,
         criticality: s.criticality,
         severity: null,
-        analysis: null,
-        expected: null,
-        actual: null,
-        diff: null,
+        analysis: stubStatus === "pending" ? null : `Not executed (${stubStatus})`,
+        expected: stubStatus === "pending" ? null : { unexecuted: true, reason: stubStatus },
+        actual: stubStatus === "pending" ? null : { unexecuted: true, reason: stubStatus },
+        diff: stubStatus === "pending" ? null : { failure_category: stubStatus, unexecuted: true },
         healing_status: null,
         healing_proposal: null,
         screenshot_url: null,
         created_at: (run as any)?.started_at || new Date().toISOString(),
         scenarios: s,
-      })) : [];
+      }));
     return [...(results || []), ...stubs];
-  }, [results, scopeScenarios, id, run, isRunning]);
+  }, [results, scopeScenarios, id, run]);
 
   const scenarioIds = useMemo(
     () => Array.from(new Set((merged || []).map((result: any) => result.scenario_id).filter(Boolean))),
@@ -172,11 +180,38 @@ export default function RunDetail() {
   const counts = useMemo(() => {
     return countRunCases(withDerivedStatus);
   }, [withDerivedStatus]);
+  const accounted = useMemo(() => {
+    const byScenario = new Map<string, string[]>();
+    for (const row of withDerivedStatus || []) {
+      const sid = String((row as any).scenario_id || "");
+      if (!sid) continue;
+      const list = byScenario.get(sid) || [];
+      list.push(String((row as any).derivedStatus || (row as any).status || "pending"));
+      byScenario.set(sid, list);
+    }
+    const outcomes = [...byScenario.values()].map((statuses) => {
+      const mapped = statuses.map(caseOutcomeFromStatus);
+      if (mapped.some((o) => o === "fail")) return "fail" as const;
+      if (mapped.some((o) => o === "pending")) return "pending" as const;
+      if (mapped.some((o) => o === "blocked")) return "blocked" as const;
+      if (mapped.some((o) => o === "cancelled")) return "cancelled" as const;
+      if (mapped.some((o) => o === "not_started")) return "not_started" as const;
+      return "pass" as const;
+    });
+    return countAccountedCases(outcomes);
+  }, [withDerivedStatus]);
   const storedSummary = (run as any)?.summary || {};
   // Header totals are case/scenario totals. Filter combinations remain visible
   // inside each case card but do not inflate the run counters.
-  const displayedCounts = counts;
-  const displayedRunStatus = run ? presentedRunStatus(run, counts) : undefined;
+  const displayedCounts = accounted;
+  const displayedRunStatus = run
+    ? presentedRunStatus(run, {
+        pass: accounted.pass,
+        fail: accounted.fail,
+        pending: accounted.pending + accounted.not_executed,
+        total: accounted.total,
+      })
+    : undefined;
   const reportOutcomes: Record<string, any> = storedSummary.reports || {};
   const failedReportIds = Object.keys(reportOutcomes).filter((rid) => reportOutcomes[rid]?.status === "error");
   const { data: failedReportNames } = useQuery({
@@ -199,7 +234,7 @@ export default function RunDetail() {
             </h1>
             <div className="text-sm mt-1 flex flex-wrap items-center gap-1.5">
               <span className="rounded border border-border bg-secondary/40 px-2 py-0.5 text-foreground font-medium">
-                Total cases: {displayedCounts.pass + displayedCounts.fail + displayedCounts.pending}
+                Total cases: {displayedCounts.total}
               </span>
               <span className="rounded border border-emerald-500/30 bg-emerald-500/15 px-2 py-0.5 text-emerald-600 dark:text-emerald-400 font-medium">
                 {displayedCounts.pass} passed
@@ -210,6 +245,11 @@ export default function RunDetail() {
               <span className="rounded border border-slate-300 bg-slate-100 px-2 py-0.5 text-slate-600 dark:border-slate-600 dark:bg-slate-700/30 dark:text-slate-300 font-medium">
                 {displayedCounts.pending} pending
               </span>
+              {displayedCounts.not_executed > 0 && (
+                <span className="rounded border border-amber-400/50 bg-amber-100 px-2 py-0.5 text-amber-800 dark:bg-amber-400/15 dark:text-amber-200 font-medium">
+                  {displayedCounts.not_executed} not executed
+                </span>
+              )}
               <span className="rounded border border-amber-400/50 bg-amber-100 px-2 py-0.5 text-amber-800 dark:bg-amber-400/15 dark:text-amber-200 font-medium">
                 {isRunning ? "Elapsed" : "Duration"}: {formatRunDuration(
                   (run as any)?.started_at,

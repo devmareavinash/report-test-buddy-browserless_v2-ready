@@ -559,6 +559,11 @@ export const FILTER_CORE_JS = String.raw`// @@RTB_FILTER_CORE_START@@
 
 /** Swap the marked core block inside an already-assembled script (used for reference .js files). */
 export function injectFilterCore(src: string): string {
+  // Record-count templates nest @@RTB_RECORD_COUNT_FRAME_CORE@@ inside the same
+  // START/END markers. Replacing that block with generic FILTER_CORE_JS strips
+  // tryFrame/resultFrame and yields Brand empty extractions (solo keeps the raw
+  // saved script and works). Never overwrite that specialized core.
+  if (/@@RTB_RECORD_COUNT_FRAME_CORE@@/.test(src)) return src;
   const start = src.indexOf(FILTER_CORE_START);
   const end = src.indexOf(FILTER_CORE_END);
   if (start === -1 || end === -1 || end < start) return src;

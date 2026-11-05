@@ -5,8 +5,9 @@
 //
 // CAUTION: the auth server rotates refresh tokens. If the browser later
 // refreshes with the same token after the server already did, reuse detection
-// can revoke the whole session (user signed out, run loses access). Opt-in only
-// via VITE_RUN_SESSION_REFRESH=true on the frontend.
+// can revoke the whole session (user signed out, run loses access). The UI sends
+// X-Refresh-Token for agent-orchestrate by default; set VITE_RUN_SESSION_REFRESH=false
+// to disable.
 //
 // Child report orchestrations run in the same Deno process (backend/server.ts),
 // so they borrow the parent's session via the in-memory registry by run id.

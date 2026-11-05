@@ -73,6 +73,19 @@ describe("pairCombosWithResults", () => {
       ])).toBe("fail");
     });
 
+    it("treats auth_failure and partial_extraction as terminal fail", () => {
+      expect(overallStatusFromComboPairs([
+        { result: { status: "pass" } },
+        { result: { status: "auth_failure" } },
+      ])).toBe("fail");
+      expect(overallStatusFromComboPairs([
+        { result: { status: "partial_extraction" } },
+      ])).toBe("fail");
+      expect(overallStatusFromComboPairs([
+        { result: { status: "browserless_timeout" } },
+      ])).toBe("fail");
+    });
+
     it("stays pending while a configured combination has no result", () => {
       expect(overallStatusFromComboPairs([
         { result: { status: "pass" } },

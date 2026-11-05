@@ -179,6 +179,17 @@ export function pairCombosWithResults(combos: any[], results: any[]): any[] {
   });
 }
 
+const TERMINAL_FAIL_RESULT_STATUSES = new Set([
+  "fail",
+  "partial_extraction",
+  "auth_failure",
+  "browserless_timeout",
+  "cancelled",
+  "empty_extraction",
+  "error",
+  "failed",
+]);
+
 export function overallStatusFromComboPairs(
   pairs: Array<{ result: any | null }> | null | undefined,
   fallback: string = "pending",
@@ -186,7 +197,7 @@ export function overallStatusFromComboPairs(
   const statuses = (pairs || []).map((pair) =>
     String(pair?.result?.status || "pending").toLowerCase()
   );
-  if (statuses.some((status) => status === "fail")) return "fail";
+  if (statuses.some((status) => TERMINAL_FAIL_RESULT_STATUSES.has(status))) return "fail";
   if (statuses.some((status) => status === "pending")) return "pending";
   if (statuses.length && statuses.every((status) => status === "pass")) return "pass";
   return fallback === "pass" || fallback === "fail" ? fallback : "pending";

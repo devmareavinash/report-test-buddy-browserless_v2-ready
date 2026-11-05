@@ -74,8 +74,11 @@ async function authHeaders(forLongRun = false) {
       // accepts a recently expired user JWT).
     }
   }
-  // Long runs on our own server refresh the sign-in with this token (kept in memory only).
-  const refreshToken = forLongRun && import.meta.env.VITE_RUN_SESSION_REFRESH === "true"
+  // Long runs (agent-orchestrate) send the refresh token so the Deno RunSession can
+  // renew the access JWT mid-run without a service-role key. Opt out with
+  // VITE_RUN_SESSION_REFRESH=false (browser refresh-token reuse risk on VDI).
+  const runSessionRefreshEnabled = import.meta.env.VITE_RUN_SESSION_REFRESH !== "false";
+  const refreshToken = forLongRun && runSessionRefreshEnabled
     ? (data.session?.refresh_token || (await supabase.auth.getSession()).data.session?.refresh_token)
     : undefined;
   token = token || publishableKey || "";

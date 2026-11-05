@@ -397,4 +397,26 @@ describe("deriveStoredResultStatus", () => {
     expect(result.status).toBe("pass");
     expect(result.rows[0]).toMatchObject({ k: "Blink TRx", pass: true, skipped: true });
   });
+
+  it("maps terminal execution statuses to fail instead of pending", () => {
+    for (const status of ["partial_extraction", "auth_failure", "browserless_timeout", "cancelled"]) {
+      const result = deriveStoredResultRows({
+        actual: { values: { "Physician Name": "A", "Top 10 Payers - NBRx": null } },
+        expected: { values: { "Physician Name": "A", "Top 10 Payers - NBRx": { columns: ["x"], rows: [["1"]] } } },
+        diff: {
+          "Top 10 Payers - NBRx": { error: "no_value" },
+          __execution: { failure_category: status, missing_fields: ["Top 10 Payers - NBRx"] },
+        },
+        spec: {
+          kpi_tolerances: {
+            "Physician Name": { value: 0, unit: "pct", op: "eq" },
+            "Top 10 Payers - NBRx": { value: 0, unit: "pct", op: "eq" },
+          },
+        },
+        fallbackStatus: status,
+      });
+      expect(result.status).toBe("fail");
+      expect(result.rows.find((r) => r.k === "Top 10 Payers - NBRx")?.pass).toBe(false);
+    }
+  });
 });

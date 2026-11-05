@@ -6,6 +6,95 @@ import { extractFirstTableAlias, qualifyColumn } from "../_shared/sql-filter.ts"
 import { fetchCanonicalScript, scriptHasSavedCode, updateScriptRow } from "../_shared/canonical-script.ts";
 import { compareTables, summarizeTableCompare, toTableModel } from "../_shared/table-compare.ts";
 import { hasFilterCore, injectFilterCore } from "../_shared/mstr-filter-core.ts";
+import {
+  createRunCancellationGate,
+  isRunAuthExpiredError,
+  isRunCancelledError,
+  mapPool,
+  type CancellationContext,
+  type RunCancellationGate,
+} from "../_shared/run-cancellation.ts";
+import { checkBrowserlessHealth } from "../_shared/browserless-health.ts";
+import {
+  buildUnexecutedRows,
+  type UnexecutedReason,
+} from "../_shared/run-accounting.ts";
+import {
+  assessConfiguredCompleteness,
+  buildExecutionAudit,
+  classifyRuntimePayload,
+  finalizeTargetOutcome,
+  statusFromCategory,
+  type ExtractionFailureCategory,
+} from "../_shared/extraction-outcome.ts";
+
+/** Persist explicit not-executed rows so expected work cannot vanish from accounting. */
+async function persistUnexecutedScenarios(
+  sb: any,
+  runId: string,
+  scenarios: Array<{ id: string; criticality?: string | null }>,
+  reason: UnexecutedReason,
+  detail?: string | null,
+): Promise<number> {
+  if (!scenarios?.length) return 0;
+  const ids = scenarios.map((s) => s.id);
+  const { data: existing, error } = await sb
+    .from("test_results")
+    .select("scenario_id")
+    .eq("run_id", runId)
+    .in("scenario_id", ids);
+  if (error) {
+    jsonLog("unexecuted_account_query_failed", {
+      run_id: runId, error: errorDetail(error).slice(0, 300),
+    });
+    return 0;
+  }
+  const accountedIds = new Set<string>(
+    (existing || []).map((r: any) => String(r.scenario_id)).filter(Boolean),
+  );
+  const rows = buildUnexecutedRows({
+    runId, scenarios, accountedIds, reason, detail,
+  });
+  if (!rows.length) return 0;
+  const { error: insertError } = await sb.from("test_results").insert(rows);
+  if (insertError) {
+    jsonLog("unexecuted_account_insert_failed", {
+      run_id: runId, count: rows.length, error: errorDetail(insertError).slice(0, 300),
+    });
+    return 0;
+  }
+  jsonLog("unexecuted_scenarios_accounted", {
+    run_id: runId, count: rows.length, reason, detail: detail || null,
+  });
+  return rows.length;
+}
+
+function unexecutedReasonFromStop(opts: {
+  cancelled?: boolean;
+  authExpired?: boolean;
+  browserlessInfraDown?: string | null;
+}): UnexecutedReason {
+  if (opts.cancelled) return "cancelled";
+  if (opts.authExpired) return "auth_failure";
+  if (opts.browserlessInfraDown) return "browserless_timeout";
+  return "not_started";
+}
+
+function worseExtractionCategory(
+  a: ExtractionFailureCategory,
+  b: ExtractionFailureCategory,
+): ExtractionFailureCategory {
+  const rank: Record<ExtractionFailureCategory, number> = {
+    cancelled: 60,
+    browserless_timeout: 50,
+    auth_failure: 40,
+    empty_extraction: 30,
+    partial_extraction: 20,
+    fail: 10,
+    pass: 0,
+  };
+  return (rank[a] || 0) >= (rank[b] || 0) ? a : b;
+}
 
 /** LLM/legacy scripts sometimes call applyFilter without defining it. */
 function ensureApplyFilterAliases(src: string): string {
@@ -45,8 +134,18 @@ function ensureApplyFilterAliases(src: string): string {
 
 function withCurrentFilterCore(code: string): string {
   let src = String(code || "");
+  const before = src.length;
   if (hasFilterCore(src)) src = injectFilterCore(src);
-  return ensureApplyFilterAliases(src);
+  src = ensureApplyFilterAliases(src);
+  // Detect accidental wipe of record-count iframe core (Brand empties vs solo).
+  if (before > 0 && src.length + 10_000 < before) {
+    jsonLog("filter_core_inject_shrunk", {
+      before_bytes: before,
+      after_bytes: src.length,
+      has_record_count_frame: /@@RTB_RECORD_COUNT_FRAME_CORE@@/.test(String(code || "")),
+    });
+  }
+  return src;
 }
 
 // Orchestrator: scope_type ∈ {workstream, report, scenario}.
@@ -240,21 +339,6 @@ function orchestrateConcurrency(override?: unknown): number {
   return Number.isFinite(n) && n >= 1 ? Math.min(10, Math.floor(n)) : 3;
 }
 
-async function mapPool<T, R>(items: T[], concurrency: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
-  if (!items.length) return [];
-  const results: R[] = new Array(items.length);
-  let next = 0;
-  const workers = Array.from({ length: Math.min(Math.max(1, concurrency), items.length) }, async () => {
-    while (true) {
-      const index = next++;
-      if (index >= items.length) return;
-      results[index] = await fn(items[index], index);
-    }
-  });
-  await Promise.all(workers);
-  return results;
-}
-
 async function findActiveRunConflict(
   sb: any,
   scopeType: string,
@@ -397,6 +481,31 @@ function configuredStructuredKpiAlias(rawKey: string, configuredLabels: string[]
   // grid/graph key such as "tableData". With multiple configured KPIs we keep
   // the raw key rather than attaching the table to the wrong KPI.
   return configuredLabels.length === 1 ? configuredLabels[0] : rawKey;
+}
+
+/** True when a looked-up KPI is already a usable scalar (incl. 0) — not a grid. */
+function isUsableScalarKpi(value: unknown): boolean {
+  if (value == null) return false;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value === "boolean") return true;
+  if (typeof value === "string") return value.trim() !== "";
+  return false;
+}
+
+/**
+ * Record-count / KPI scrapes often also emit incidental tables (question lists,
+ * filter option inventories). Never promote those onto a configured KPI that
+ * already resolved to a scalar — that stomped "Row Count - Question 5"=0 with a
+ * question-list grid and showed Actual "No grid data" vs wrong Reference table.
+ */
+function configuredKpiOwnsScalar(
+  label: string | null | undefined,
+  map: Record<string, any> | null | undefined,
+  aliases: Record<string, string> | null | undefined,
+): boolean {
+  if (!label) return false;
+  const raw = lookupConfiguredKpiValue(map, label, aliases);
+  return isUsableScalarKpi(raw) && !isStructuredVal(raw);
 }
 
 function lookupKpiValue(map: Record<string, any> | null | undefined, name: string): any {
@@ -749,38 +858,85 @@ function looksLikeStructuredKpiLabel(label: string): boolean {
     .test(String(label || ""));
 }
 
+function hasUsableExtractionValue(value: unknown): boolean {
+  if (value == null) return false;
+  if (typeof value === "string" && value.trim() === "") return false;
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const obj = value as Record<string, unknown>;
+    if (obj.error || obj.show_data_error || obj.extract_error) return false;
+    if (obj.tableData && typeof obj.tableData === "object" && (obj.tableData as any).error) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function countUsableKpis(map: Record<string, any> | null | undefined): number {
+  if (!map || typeof map !== "object") return 0;
+  return Object.entries(map)
+    .filter(([key]) => !isExtractionNoiseKey(key))
+    .filter(([, value]) => hasUsableExtractionValue(value))
+    .length;
+}
+
+/** Full-matrix calls pass comboLabel=null; KPIs live under each combo child. */
+function countUsableKpisInPayload(payload: any, comboLabel: string | null): number {
+  const direct = countUsableKpis(pickComboKpis(payload, comboLabel));
+  if (direct > 0 || comboLabel) return direct;
+  const candidates = [
+    payload?.extracted?.result?.results,
+    payload?.extracted?.result?.kpis,
+    payload?.extracted?.result?.result,
+    payload?.extracted?.result,
+    payload?.extracted?.extracted,
+    payload?.result?.extracted,
+    payload?.result?.results,
+    payload?.result,
+    payload?.extracted,
+  ];
+  let best = 0;
+  for (const raw of candidates) {
+    const root = flattenExtractionRoot(raw);
+    if (!root || typeof root !== "object") continue;
+    for (const [key, node] of Object.entries(root)) {
+      if (isExtractionNoiseKey(key) || !node || typeof node !== "object" || Array.isArray(node)) {
+        continue;
+      }
+      best = Math.max(best, countUsableKpis(flattenNodeToKpis(node)));
+    }
+  }
+  return best;
+}
+
 function comboExtractionNeedsRetry(
   payload: any,
   comboLabel: string | null,
   opts?: { requireStructured?: boolean; configuredLabels?: string[] },
 ): boolean {
   const exec = payload?.extracted;
-  if (payload?.error || payload?.ok === false || exec?.ok === false || exec?.error) return true;
   const values = pickComboKpis(payload, comboLabel);
+  const usableCount = countUsableKpisInPayload(payload, comboLabel);
+  // Partial success (e.g. 154 KPIs + 2 empty) must NOT retry — full-matrix
+  // calls with comboLabel=null used to look "empty" and burn 3× Browserless time.
+  if (usableCount > 0) {
+    const requireStructured = opts?.requireStructured ||
+      (opts?.configuredLabels || []).some((label) => looksLikeStructuredKpiLabel(label));
+    if (requireStructured) {
+      const structured = pickComparableStructured(values) ||
+        (usableCount > 0 && !comboLabel ? { k: "_multi", v: true } : null);
+      // Multi-combo envelopes are validated per combo later; don't retry the whole matrix.
+      if (!structured && comboLabel) return true;
+    }
+    const grains = values?.grains && typeof values.grains === "object"
+      ? Object.values(values.grains)
+      : [];
+    return grains.some((grain: any) =>
+      /still looks weekly|no time periods extracted|could not parse/i.test(String(grain?.trend_error || ""))
+    );
+  }
+  if (payload?.error || payload?.ok === false || exec?.ok === false || exec?.error) return true;
   if (!values || !Object.keys(values).length) return true;
-  const useful = Object.entries(values).filter(([key]) => !isExtractionNoiseKey(key));
-  if (!useful.length || useful.every(([, value]) => value == null || String(value).trim() === "")) {
-    return true;
-  }
-  if (
-    useful.some(([, value]) =>
-      value && typeof value === "object" && !Array.isArray(value) &&
-      (value.error || value.show_data_error || value.extract_error || value.tableData?.error)
-    )
-  ) {
-    return true;
-  }
-  const requireStructured = opts?.requireStructured ||
-    (opts?.configuredLabels || []).some((label) => looksLikeStructuredKpiLabel(label));
-  if (requireStructured && !pickComparableStructured(values)) {
-    return true;
-  }
-  const grains = values.grains && typeof values.grains === "object"
-    ? Object.values(values.grains)
-    : [];
-  return grains.some((grain: any) =>
-    /still looks weekly|no time periods extracted|could not parse/i.test(String(grain?.trend_error || ""))
-  );
+  return true;
 }
 
 function swapGotoUrl(src: string, newUrl: string, oldUrl?: string): string {
@@ -960,6 +1116,48 @@ Deno.serve(async (req) => {
     if (ownsSession && session) registerRunSession(run.id, session);
     const releaseSession = () => { if (ownsSession) releaseRunSession(run.id); };
 
+    // Cancellation must use the same RunSession-backed client as inserts/finalize.
+    // getClient is invoked per status read so we never rely on a one-shot JWT.
+    const cancellation: RunCancellationGate = createRunCancellationGate(run.id, {
+      getClient: () => sb,
+      ensureAuth: session ? () => session.token() : undefined,
+      canRefresh: () => Boolean(session?.canRefresh),
+      log: (event, details) => jsonLog(event, details),
+    });
+    // Bail out immediately when a child is started against an already-cancelled parent.
+    if (existing_run_id) {
+      try {
+        await cancellation.refresh();
+      } catch (e) {
+        if (isRunAuthExpiredError(e)) {
+          jsonLog("run_auth_expired_stop", {
+            run_id: run.id,
+            checkpoint: "child_entry",
+            error: e.causeMessage.slice(0, 300),
+          });
+          return new Response(JSON.stringify({
+            run_id: run.id,
+            status: "error",
+            error: "auth_expired",
+          }), {
+            status: 401,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
+        throw e;
+      }
+      if (cancellation.isCancelled()) {
+        jsonLog("run_cancellation_detected", {
+          run_id: run.id,
+          checkpoint: "child_entry",
+          report_id: single_report_id || reportIds[0] || null,
+        });
+        return new Response(JSON.stringify({ run_id: run.id, status: "cancelled" }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+    }
+
     if (!existing_run_id && scope_type === "workstream") {
       const dispatch = async () => {
         try {
@@ -969,6 +1167,10 @@ Deno.serve(async (req) => {
           const reportConcurrency = concurrency;
           const childConcurrency = 1;
           await mapPool(reportIds, reportConcurrency, async (rid) => {
+            await cancellation.throwIfCancelled({
+              checkpoint: "before_report",
+              report_id: rid,
+            });
             try {
               jsonLog("child_dispatch_started", { run_id: run.id, report_id: rid });
               const child = await callFn("agent-orchestrate", {
@@ -985,9 +1187,42 @@ Deno.serve(async (req) => {
               }
               jsonLog("child_dispatch_completed", { run_id: run.id, report_id: rid });
             } catch (e) {
+              if (isRunCancelledError(e)) {
+                jsonLog("run_cancellation_detected", {
+                  run_id: run.id,
+                  checkpoint: "child_dispatch",
+                  report_id: rid,
+                  ...e.context,
+                });
+                return;
+              }
+              if (isRunAuthExpiredError(e)) {
+                jsonLog("run_auth_expired_stop", {
+                  run_id: run.id, report_id: rid, error: e.causeMessage.slice(0, 300),
+                });
+                return;
+              }
               jsonLog("child_dispatch_failed", {
                 run_id: run.id, report_id: rid, error: errorDetail(e).slice(0, 500),
               });
+              let skipFinalize = cancellation.isCancelled();
+              if (!skipFinalize) {
+                try {
+                  skipFinalize = await cancellation.refresh();
+                } catch (cancelErr) {
+                  if (isRunAuthExpiredError(cancelErr) || isRunCancelledError(cancelErr)) {
+                    skipFinalize = true;
+                  } else {
+                    throw cancelErr;
+                  }
+                }
+              }
+              if (skipFinalize) {
+                jsonLog("run_cancellation_skip_finalize", {
+                  run_id: run.id, report_id: rid, checkpoint: "child_dispatch_failed",
+                });
+                return;
+              }
               try {
                 await finalizeChild(sb, run.id, rid, 0, 0, true, errorDetail(e));
               } catch (finalizeError) {
@@ -996,7 +1231,116 @@ Deno.serve(async (req) => {
                 });
               }
             }
+          }, () => cancellation.isCancelled());
+          // After the report pool, any report that never finalized still has
+          // expected scenarios with zero rows — account them, then finalize.
+          try {
+            const { data: parentRow } = await sb.from("runs").select("summary, status").eq("id", run.id).maybeSingle();
+            const doneReports = new Set(Object.keys((parentRow?.summary as any)?.reports || {}));
+            let stopReason: UnexecutedReason = "not_started";
+            let stopDetail: string | null = "report_not_dispatched";
+            let cancelledAfter = cancellation.isCancelled();
+            try {
+              if (!cancelledAfter) cancelledAfter = await cancellation.refresh();
+            } catch (e) {
+              if (isRunAuthExpiredError(e)) {
+                stopReason = "auth_failure";
+                stopDetail = e.causeMessage;
+              } else if (isRunCancelledError(e)) {
+                cancelledAfter = true;
+              } else {
+                throw e;
+              }
+            }
+            if (cancelledAfter) {
+              stopReason = "cancelled";
+              stopDetail = "cancelled";
+              jsonLog("run_cancellation_detected", {
+                run_id: run.id,
+                checkpoint: "after_report_pool",
+              });
+            }
+            for (const rid of reportIds) {
+              if (doneReports.has(rid)) continue;
+              const { data: leftover } = await sb.from("scenarios")
+                .select("id, criticality")
+                .eq("report_id", rid)
+                .eq("deferred", false);
+              const n = await persistUnexecutedScenarios(
+                sb, run.id, leftover || [], stopReason, stopDetail,
+              );
+              try {
+                await finalizeChild(
+                  sb, run.id, rid, 0, n, true,
+                  stopDetail || stopReason,
+                );
+              } catch (finErr) {
+                jsonLog("workstream_unstarted_finalize_failed", {
+                  run_id: run.id, report_id: rid,
+                  error: errorDetail(finErr).slice(0, 300),
+                });
+              }
+            }
+            if (stopReason === "auth_failure" && parentRow?.status === "running") {
+              // Only mark failed if finalize_workstream_report did not already terminalize.
+              const { data: after } = await sb.from("runs").select("status").eq("id", run.id).maybeSingle();
+              if (after?.status === "running") {
+                const admin = getServiceClient();
+                await (admin || sb).from("runs").update({
+                  status: "failed",
+                  finished_at: new Date().toISOString(),
+                  summary: {
+                    ...((parentRow?.summary as any) || {}),
+                    error: "auth_expired",
+                    failure_category: "auth_failure",
+                  },
+                }).eq("id", run.id).eq("status", "running");
+              }
+            }
+          } catch (e) {
+            if (isRunAuthExpiredError(e)) {
+              jsonLog("run_auth_expired_stop", {
+                run_id: run.id,
+                checkpoint: "after_report_pool",
+                error: e.causeMessage.slice(0, 300),
+              });
+              return;
+            }
+            if (isRunCancelledError(e)) {
+              jsonLog("run_cancellation_detected", {
+                run_id: run.id,
+                checkpoint: "after_report_pool",
+              });
+              return;
+            }
+            throw e;
+          }
+        } catch (e) {
+          if (isRunCancelledError(e)) {
+            jsonLog("run_cancellation_detected", {
+              run_id: run.id,
+              checkpoint: e.context?.checkpoint || "workstream_dispatch",
+              ...e.context,
             });
+            return;
+          }
+          if (isRunAuthExpiredError(e)) {
+            jsonLog("run_auth_expired_stop", {
+              run_id: run.id,
+              checkpoint: "workstream_dispatch",
+              error: e.causeMessage.slice(0, 300),
+            });
+            try {
+              const admin = getServiceClient();
+              await (admin || sb).from("runs").update({
+                status: "failed",
+                finished_at: new Date().toISOString(),
+                summary: { error: "auth_expired", failure_category: "auth_failure" },
+              }).eq("id", run.id).eq("status", "running");
+            } catch { /* best-effort terminalize */ }
+            return;
+          }
+          throw e;
         } finally {
           releaseSession();
         }
@@ -1009,10 +1353,11 @@ Deno.serve(async (req) => {
         dispatch().catch(() => {});
       }
       if (reportIds.length === 0) {
+        // Never overwrite a user-cancelled run with completed.
         await sb.from("runs").update({
           status: "completed", finished_at: new Date().toISOString(),
           summary: { pass: 0, fail: 0, total: 0, done: 0, child_count: 0 },
-        }).eq("id", run.id);
+        }).eq("id", run.id).eq("status", "running");
       }
       return new Response(JSON.stringify({ run_id: run.id, status: "running" }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -1024,8 +1369,23 @@ Deno.serve(async (req) => {
     const work = async () => { try { await workInner(); } finally { releaseSession(); } };
     const workInner = async () => {
       let pass = 0, fail = 0;
+      /** When set, stop dispatching further Browserless work and terminalize. */
+      let browserlessInfraDown: string | null = null;
       try {
+        const health0 = await checkBrowserlessHealth({ timeoutMs: 4000 });
+        if (!health0.ok) {
+          browserlessInfraDown = health0.reason || "browserless_unhealthy";
+          jsonLog("browserless_health_failed", {
+            run_id: run.id,
+            reason: browserlessInfraDown,
+            checkpoint: "before_first_report",
+          });
+        }
         for (const reportId of reportIds) {
+          await cancellation.throwIfCancelled({
+            checkpoint: "before_report",
+            report_id: reportId,
+          });
           const { data: report } = await sb.from("reports").select("*").eq("id", reportId).maybeSingle();
           if (!report) continue;
 
@@ -1045,12 +1405,49 @@ Deno.serve(async (req) => {
           const { data: scenarios } = await scenariosQuery;
 
           const scenarioOutcomes = await mapPool(scenarios || [], concurrency, async (s) => {
+            await cancellation.throwIfCancelled({
+              checkpoint: "before_scenario",
+              report_id: reportId,
+              scenario_id: s.id,
+            });
+            if (browserlessInfraDown) {
+              await cancellation.throwIfCancelled({
+                checkpoint: "before_persist",
+                report_id: reportId,
+                scenario_id: s.id,
+              });
+              await sb.from("test_results").insert({
+                run_id: run.id,
+                scenario_id: s.id,
+                status: "browserless_timeout",
+                expected: { error: "browserless_unhealthy", reason: browserlessInfraDown },
+                actual: {
+                  error: browserlessInfraDown,
+                  execution: buildExecutionAudit({
+                    run_id: run.id,
+                    scenario_id: s.id,
+                    status: "browserless_timeout",
+                    failure_category: "browserless_timeout",
+                    error: browserlessInfraDown,
+                  }),
+                },
+                diff: { failure_category: "browserless_timeout", error: browserlessInfraDown },
+                criticality: s.criticality || "medium",
+                severity: s.criticality || "medium",
+              });
+              return { pass: 0, fail: 1 };
+            }
             let { data: script, error: scriptErr } = await fetchCanonicalScript(
               sb,
               s.id,
               "id, playwright_code, assertion_spec, sql_template_id, created_at",
             );
             if (scriptErr) {
+              await cancellation.throwIfCancelled({
+                checkpoint: "before_persist",
+                report_id: reportId,
+                scenario_id: s.id,
+              });
               await sb.from("test_results").insert({
                 run_id: run.id, scenario_id: s.id, status: "fail",
                 expected: { error: "script_lookup_failed" },
@@ -1067,6 +1464,11 @@ Deno.serve(async (req) => {
               if (gen?.script?.playwright_code) {
                 script = gen.script;
               } else {
+                await cancellation.throwIfCancelled({
+                  checkpoint: "before_persist",
+                  report_id: reportId,
+                  scenario_id: s.id,
+                });
                 await sb.from("test_results").insert({
                   run_id: run.id, scenario_id: s.id, status: "fail",
                   expected: { error: "script_generation_failed" },
@@ -1183,39 +1585,129 @@ Deno.serve(async (req) => {
             const requireStructuredExtraction = comparisonKpiLabels.some((label) =>
               looksLikeStructuredKpiLabel(label)
             ) || /graph|chart|grid|show\s*data|segment summary|overall performance/i
-              .test(`${s.title || ""} ${s.description || ""}`);
+              .test(`${s.title || ""} ${(s as any).description || ""}`);
+            const runtimeCtx = (
+              target: "main" | "reference",
+              comboLabel: string | null,
+              attempt: number,
+              checkpoint: CancellationContext["checkpoint"],
+            ): CancellationContext => ({
+              checkpoint,
+              report_id: reportId,
+              scenario_id: s.id,
+              combo: comboLabel,
+              target,
+              attempt,
+            });
             const invokeRuntimeWithRetry = async (
               body: Record<string, any>,
               target: "main" | "reference",
               comboLabel: string | null,
             ) => {
-              const maxAttempts = isPccScenario ? 1 : EXTRACTION_MAX_ATTEMPTS;
+              // Auth / Browserless timeouts: always allow a second bounded attempt.
+              // Generic empty KPI retries stay limited for long PCC scrapes.
+              const authOrTimeoutMax = 2;
+              const kpiMaxAttempts = isPccScenario ? 1 : EXTRACTION_MAX_ATTEMPTS;
+              await cancellation.throwIfCancelled(
+                runtimeCtx(target, comboLabel, 1, "before_runtime"),
+              );
               let response = await callFn("playwright-runtime", body);
-              for (let attempt = 1; attempt < maxAttempts; attempt++) {
-                const needsRetry = comboExtractionNeedsRetry(response, comboLabel, {
-                  requireStructured: requireStructuredExtraction,
-                  configuredLabels: comparisonKpiLabels,
-                });
-                if (!needsRetry) break;
+              await cancellation.throwIfCancelled(
+                runtimeCtx(target, comboLabel, 1, "after_runtime"),
+              );
+              let attempts = 1;
+
+              while (attempts < authOrTimeoutMax) {
+                const classified = classifyRuntimePayload(response, { target });
+                if (!classified.auth_failure && !classified.browserless_timeout) break;
+                if (classified.browserless_timeout) {
+                  const health = await checkBrowserlessHealth({ timeoutMs: 4000 });
+                  jsonLog("browserless_health_after_timeout", {
+                    run_id: run.id,
+                    scenario_id: s.id,
+                    combo: comboLabel,
+                    target,
+                    ok: health.ok,
+                    reason: health.reason,
+                  });
+                  if (!health.ok) {
+                    browserlessInfraDown = health.reason || "browserless_unhealthy";
+                    (response as any).__rtb_browserless_unhealthy = true;
+                    break;
+                  }
+                }
+                attempts += 1;
+                await cancellation.throwIfCancelled(
+                  runtimeCtx(target, comboLabel, attempts, "before_retry"),
+                );
                 jsonLog("combo_extraction_retry", {
                   run_id: run.id,
                   scenario_id: s.id,
                   combo: comboLabel,
                   target,
-                  attempt: attempt + 1,
-                  max_attempts: maxAttempts,
-                  reason: "runtime_or_empty_extraction",
+                  attempt: attempts,
+                  max_attempts: authOrTimeoutMax,
+                  reason: classified.auth_failure ? "auth_failure" : "browserless_timeout",
+                  error: classified.error,
                 });
                 response = await callFn("playwright-runtime", body);
+                await cancellation.throwIfCancelled(
+                  runtimeCtx(target, comboLabel, attempts, "after_runtime"),
+                );
               }
+
+              const afterAuth = classifyRuntimePayload(response, { target });
+              if (
+                !afterAuth.auth_failure &&
+                !afterAuth.browserless_timeout &&
+                !(response as any).__rtb_browserless_unhealthy
+              ) {
+                for (let attempt = attempts; attempt < kpiMaxAttempts; attempt++) {
+                  const needsRetry = comboExtractionNeedsRetry(response, comboLabel, {
+                    requireStructured: requireStructuredExtraction,
+                    configuredLabels: comparisonKpiLabels,
+                  });
+                  if (!needsRetry) break;
+                  attempts = attempt + 1;
+                  await cancellation.throwIfCancelled(
+                    runtimeCtx(target, comboLabel, attempts, "before_retry"),
+                  );
+                  jsonLog("combo_extraction_retry", {
+                    run_id: run.id,
+                    scenario_id: s.id,
+                    combo: comboLabel,
+                    target,
+                    attempt: attempts,
+                    max_attempts: kpiMaxAttempts,
+                    reason: "runtime_or_empty_extraction",
+                  });
+                  response = await callFn("playwright-runtime", body);
+                  await cancellation.throwIfCancelled(
+                    runtimeCtx(target, comboLabel, attempts, "after_runtime"),
+                  );
+                }
+              }
+
+              (response as any).__rtb_attempts = attempts;
               return response;
             };
             const isolatedRunResponses = new Map<string, any>();
             const isolatedRefResponses = new Map<string, any>();
             let runResp: any;
             let refRespRaw: any;
-            if (hasCombos) {
+            // Solo Scenario "Run headless" injects the full matrix in one Browserless
+            // call. Per-combo isolation was added for long PCC matrices, but for
+            // normal row-count/KPI cases it caused Brand empties (useful_key_count=0)
+            // while the same script succeeded solo. Match solo unless PCC / large.
+            const isolateCombos = hasCombos && (isPccScenario || combos.length > 8);
+            if (hasCombos && isolateCombos) {
               const isolated = await mapPool(combos, 1, async (combo) => {
+                await cancellation.throwIfCancelled({
+                  checkpoint: "before_combo",
+                  report_id: reportId,
+                  scenario_id: s.id,
+                  combo: combo.label,
+                });
                 const mainBody = {
                   mode: "headless",
                   scenario_id: s.id,
@@ -1225,6 +1717,13 @@ Deno.serve(async (req) => {
                 const mainResponse = await invokeRuntimeWithRetry(mainBody, "main", combo.label);
                 let referenceResponse: any = null;
                 if (isRef && !refError && refCode) {
+                  await cancellation.throwIfCancelled({
+                    checkpoint: "before_reference",
+                    report_id: reportId,
+                    scenario_id: s.id,
+                    combo: combo.label,
+                    target: "reference",
+                  });
                   const referenceBody = {
                     mode: "headless",
                     scenario_id: s.id,
@@ -1235,24 +1734,52 @@ Deno.serve(async (req) => {
                   referenceResponse = await invokeRuntimeWithRetry(referenceBody, "reference", combo.label);
                 }
                 return { label: String(combo.label || ""), mainResponse, referenceResponse };
-              });
+              }, () => cancellation.isCancelled());
               for (const item of isolated) {
+                if (!item) continue;
                 isolatedRunResponses.set(item.label, item.mainResponse);
                 if (item.referenceResponse) isolatedRefResponses.set(item.label, item.referenceResponse);
               }
+              await cancellation.throwIfCancelled({
+                checkpoint: "after_pool",
+                report_id: reportId,
+                scenario_id: s.id,
+              });
               runResp = { ok: true, extracted: { result: { results: {} } } };
               refRespRaw = null;
             } else {
+              const fullMatrix = hasCombos
+                ? combos.map((c) => ({ label: c.label, filters: c.filters || {} }))
+                : undefined;
+              jsonLog("combo_matrix_mode", {
+                run_id: run.id,
+                scenario_id: s.id,
+                mode: hasCombos ? "full_matrix_like_solo" : "no_matrix",
+                combo_count: hasCombos ? combos.length : 0,
+                isolate: false,
+              });
               [runResp, refRespRaw] = await Promise.all([
                 invokeRuntimeWithRetry({
-                  mode: "headless", scenario_id: s.id, code: executableCode,
+                  mode: "headless",
+                  scenario_id: s.id,
+                  code: executableCode,
+                  ...(fullMatrix ? { filter_combinations: fullMatrix } : {}),
                 }, "main", null),
                 (isRef && !refError && refCode)
                   ? invokeRuntimeWithRetry({
-                      mode: "headless", scenario_id: s.id, code: refCode, target: "reference",
+                      mode: "headless",
+                      scenario_id: s.id,
+                      code: refCode,
+                      target: "reference",
+                      ...(fullMatrix ? { filter_combinations: fullMatrix } : {}),
                     }, "reference", null)
                   : Promise.resolve(null),
               ]);
+              await cancellation.throwIfCancelled({
+                checkpoint: "after_runtime",
+                report_id: reportId,
+                scenario_id: s.id,
+              });
             }
             const runExec = runResp?.extracted;
             if (
@@ -1261,18 +1788,57 @@ Deno.serve(async (req) => {
               runExec?.ok === false ||
               runExec?.error
             ) {
+              await cancellation.throwIfCancelled({
+                checkpoint: "before_persist",
+                report_id: reportId,
+                scenario_id: s.id,
+              });
+              const partialScraped = pickComboKpis(runResp, null) || {};
+              const runtimeClass = classifyRuntimePayload(runResp, { target: "main" });
+              const completeness = assessConfiguredCompleteness(
+                comparisonKpiLabels,
+                partialScraped,
+                kpiAliases,
+              );
+              const outcome = finalizeTargetOutcome(runtimeClass, completeness);
+              const scrapeError =
+                outcome.error ||
+                runResp?.error ||
+                runResp?.message ||
+                runExec?.error ||
+                runExec?.message ||
+                "scrape failed";
+              const persistStatus = statusFromCategory(outcome.category, false);
+              const attemptCount = Number((runResp as any)?.__rtb_attempts) ||
+                Number((runResp as any)?.auth_session_attempts) || 1;
               await sb.from("test_results").insert({
-                run_id: run.id, scenario_id: s.id, status: "fail",
+                run_id: run.id,
+                scenario_id: s.id,
+                status: persistStatus,
                 expected: { source: "scrape" },
                 actual: {
-                  error:
-                    runResp?.error ||
-                    runResp?.message ||
-                    runExec?.error ||
-                    runExec?.message ||
-                    "scrape failed",
+                  error: scrapeError,
+                  values: partialScraped,
+                  execution: buildExecutionAudit({
+                    run_id: run.id,
+                    scenario_id: s.id,
+                    target: "main",
+                    status: persistStatus,
+                    attempt_count: attemptCount,
+                    missing_fields: outcome.missing_fields,
+                    failure_category: outcome.category,
+                    error: scrapeError,
+                    url: runtimeClass.url,
+                  }),
                 },
-                diff: null, criticality: s.criticality || "medium", severity: s.criticality || "medium",
+                diff: {
+                  failure_category: outcome.category,
+                  missing_fields: outcome.missing_fields,
+                  extracted_fields: outcome.extracted_fields,
+                  error: scrapeError,
+                },
+                criticality: s.criticality || "medium",
+                severity: s.criticality || "medium",
                 screenshot_url: runResp?.screenshot_url || null,
               });
               return { pass: 0, fail: 1 };
@@ -1300,27 +1866,78 @@ Deno.serve(async (req) => {
             }
 
             const comboOutcomes = await mapPool(combos, Math.min(concurrency, 8), async (combo) => {
+              await cancellation.throwIfCancelled({
+                checkpoint: "before_combo",
+                report_id: reportId,
+                scenario_id: s.id,
+                combo: combo.label,
+              });
               const comboRunResp = isolatedRunResponses.get(String(combo.label || "")) || runResp;
               const comboExec = comboRunResp?.extracted;
+              if ((comboRunResp as any)?.__rtb_browserless_unhealthy) {
+                browserlessInfraDown = browserlessInfraDown || "browserless_unhealthy";
+              }
               if (
                 comboRunResp?.error ||
                 comboRunResp?.ok === false ||
                 comboExec?.ok === false ||
                 comboExec?.error
               ) {
+                // Preserve any KPI fields that survived alongside ok:false / error
+                // (scripts that catch per-KPI failures instead of throwing).
+                const partialScraped = pickComboKpis(comboRunResp, combo.label) || {};
+                const runtimeClass = classifyRuntimePayload(comboRunResp, { target: "main" });
+                const completeness = assessConfiguredCompleteness(
+                  comparisonKpiLabels,
+                  partialScraped,
+                  kpiAliases,
+                );
+                const outcome = finalizeTargetOutcome(runtimeClass, completeness);
                 const comboError =
+                  outcome.error ||
                   comboRunResp?.error ||
                   comboRunResp?.message ||
                   comboExec?.error ||
                   comboExec?.message ||
                   "scrape failed";
+                const persistStatus = statusFromCategory(outcome.category, false);
+                const attemptCount = Number((comboRunResp as any)?.__rtb_attempts) ||
+                  Number((comboRunResp as any)?.auth_session_attempts) || 1;
+                await cancellation.throwIfCancelled({
+                  checkpoint: "before_persist",
+                  report_id: reportId,
+                  scenario_id: s.id,
+                  combo: combo.label,
+                });
                 const { error: insertError } = await sb.from("test_results").insert({
                   run_id: run.id,
                   scenario_id: s.id,
-                  status: "fail",
+                  status: persistStatus,
                   expected: { source: "scrape", filter: combo.label },
-                  actual: { filter: combo.label, error: comboError, filters_applied: combo.filters || null },
-                  diff: null,
+                  actual: {
+                    filter: combo.label,
+                    error: comboError,
+                    values: partialScraped,
+                    filters_applied: combo.filters || null,
+                    execution: buildExecutionAudit({
+                      run_id: run.id,
+                      scenario_id: s.id,
+                      combo: combo.label,
+                      target: "main",
+                      status: persistStatus,
+                      attempt_count: attemptCount,
+                      missing_fields: outcome.missing_fields,
+                      failure_category: outcome.category,
+                      error: comboError,
+                      url: runtimeClass.url,
+                    }),
+                  },
+                  diff: {
+                    failure_category: outcome.category,
+                    missing_fields: outcome.missing_fields,
+                    extracted_fields: outcome.extracted_fields,
+                    error: comboError,
+                  },
                   criticality: s.criticality || "medium",
                   severity: s.criticality || "medium",
                   screenshot_url: comboRunResp?.screenshot_url || null,
@@ -1385,13 +2002,25 @@ Deno.serve(async (req) => {
                     : (looksLikeDateValue(raw) ? String(raw).trim() : preserveConfiguredScalar(raw, lbl));
                 }
                 const refGrid = pickStructured(refScraped);
-                if (refGrid && expectedMap[refGrid.k] == null) expectedMap[refGrid.k] = refGrid.v;
+                if (refGrid && expectedMap[refGrid.k] == null) {
+                  const alias = configuredStructuredKpiAlias(refGrid.k, comparisonKpiLabels);
+                  // Keep incidental grids off scalar-owned configured KPIs.
+                  if (!configuredKpiOwnsScalar(alias, expectedMap, kpiAliases)) {
+                    expectedMap[refGrid.k] = refGrid.v;
+                  }
+                }
               } else if (sqlTplId) {
                 const { where, pairs, missing } = hasCombos
                   ? buildWhere(combo.filters || {}, keyMap || [])
                   : { where: "", pairs: [] as { be: string; value: string }[], missing: [] as string[] };
                 if (missing.length) {
                   const message = `Missing FE-to-BE filter mapping for: ${missing.join(", ")}`;
+                  await cancellation.throwIfCancelled({
+                    checkpoint: "before_persist",
+                    report_id: reportId,
+                    scenario_id: s.id,
+                    combo: combo.label,
+                  });
                   const { error: mappingInsertError } = await sb.from("test_results").insert({
                     run_id: run.id,
                     scenario_id: s.id,
@@ -1495,6 +2124,11 @@ Deno.serve(async (req) => {
               const structuredLabel = mainGrid
                 ? configuredStructuredKpiAlias(mainGrid.k, comparisonKpiLabels)
                 : null;
+              const skipIncidentalStructuredPromotion = !!(
+                structuredLabel &&
+                (configuredKpiOwnsScalar(structuredLabel, scraped, kpiAliases) ||
+                  configuredKpiOwnsScalar(structuredLabel, expectedMap, kpiAliases))
+              );
               const structuredSourceKeys: Record<string, string> = {};
 
               if (isTrend) {
@@ -1526,7 +2160,12 @@ Deno.serve(async (req) => {
                   error: comboPass ? null : (scraped.trend_error || "gap_in_periods"),
                 };
               } else {
-              if (!hasMultipleStructuredKpis && mainGrid && structuredLabel) {
+              if (
+                !hasMultipleStructuredKpis &&
+                mainGrid &&
+                structuredLabel &&
+                !skipIncidentalStructuredPromotion
+              ) {
                 actualMap[structuredLabel] = mainGrid.v;
                 structuredSourceKeys[structuredLabel] = mainGrid.k;
                 if (expGrid) {
@@ -1534,7 +2173,12 @@ Deno.serve(async (req) => {
                   if (expGrid.k !== structuredLabel) delete expectedMap[expGrid.k];
                 }
               }
-              if (!hasMultipleStructuredKpis && mainGrid && expGrid) {
+              if (
+                !hasMultipleStructuredKpis &&
+                mainGrid &&
+                expGrid &&
+                !skipIncidentalStructuredPromotion
+              ) {
                 // Grid / graph Show Data: compare cell by cell so the configured
                 // comparator + tolerance apply. JSON.stringify equality ignored both
                 // and failed the whole visual on any single differing cell.
@@ -1574,7 +2218,13 @@ Deno.serve(async (req) => {
                   diffMap[structuredLabel || mainGrid.k] = { structured: true, pass: gridPass, cellwise: false };
                 }
                 if (!gridPass) comboPass = false;
-              } else if (!hasMultipleStructuredKpis && mainGrid && (isRef || sqlTplId) && !expGrid) {
+              } else if (
+                !hasMultipleStructuredKpis &&
+                mainGrid &&
+                (isRef || sqlTplId) &&
+                !expGrid &&
+                !skipIncidentalStructuredPromotion
+              ) {
                 comboPass = false;
                 diffMap[structuredLabel || mainGrid.k] = { structured: true, error: "no_expected_grid" };
               }
@@ -1783,7 +2433,77 @@ Deno.serve(async (req) => {
               }
               }
 
-              const status = comboPass ? "pass" : "fail";
+              // Completeness gate: configured KPIs must be extracted or explicitly failed.
+              const mainRuntime = classifyRuntimePayload(comboRunResp, { target: "main" });
+              const mainCompleteness = assessConfiguredCompleteness(
+                labels,
+                actualMap,
+                kpiAliases,
+              );
+              let mainOutcome = finalizeTargetOutcome(mainRuntime, mainCompleteness);
+              for (const missing of mainOutcome.missing_fields) {
+                if (actualMap[missing] == null) {
+                  diffMap[missing] = { ...(diffMap[missing] || {}), error: "no_value" };
+                }
+              }
+
+              let refOutcome: ReturnType<typeof finalizeTargetOutcome> | null = null;
+              if (isRef) {
+                const comboRefResp = isolatedRefResponses.get(String(combo.label || "")) || refResp;
+                const refRuntime = classifyRuntimePayload(
+                  comboRefResp || { error: refError || sqlMeta?.error || "reference scrape failed" },
+                  { target: "reference" },
+                );
+                const refCompleteness = assessConfiguredCompleteness(
+                  labels,
+                  expectedMap,
+                  kpiAliases,
+                );
+                refOutcome = finalizeTargetOutcome(refRuntime, refCompleteness);
+                for (const missing of refOutcome.missing_fields) {
+                  if (expectedMap[missing] == null) {
+                    diffMap[missing] = {
+                      ...(diffMap[missing] || {}),
+                      error: "no_expected_value",
+                    };
+                  }
+                }
+                if (refOutcome.category !== "pass") comboPass = false;
+              }
+
+              if (mainOutcome.category !== "pass") comboPass = false;
+
+              let failureCategory: ExtractionFailureCategory = comboPass
+                ? "pass"
+                : worseExtractionCategory(
+                  mainOutcome.category === "pass" ? "fail" : mainOutcome.category,
+                  refOutcome && refOutcome.category !== "pass" ? refOutcome.category : "fail",
+                );
+              if (comboPass) failureCategory = "pass";
+              else if (mainOutcome.category === "pass" && (!refOutcome || refOutcome.category === "pass")) {
+                failureCategory = "fail";
+              } else {
+                failureCategory = worseExtractionCategory(
+                  mainOutcome.category,
+                  refOutcome?.category || "pass",
+                );
+                if (failureCategory === "pass") failureCategory = "fail";
+              }
+
+              const status = statusFromCategory(failureCategory, comboPass);
+              const attemptCount = Number((comboRunResp as any)?.__rtb_attempts) ||
+                Number((comboRunResp as any)?.auth_session_attempts) || 1;
+              const missingAll = Array.from(new Set([
+                ...mainOutcome.missing_fields,
+                ...(refOutcome?.missing_fields || []),
+              ]));
+              diffMap.__execution = {
+                failure_category: failureCategory,
+                missing_fields: missingAll,
+                main: mainOutcome,
+                reference: refOutcome,
+                attempt_count: attemptCount,
+              };
               const worstDiff = Object.values(diffMap)
                 .map((d: any) => (typeof d?.pct === "number" ? d.pct : null))
                 .filter((x): x is number => x != null)
@@ -1810,6 +2530,12 @@ Deno.serve(async (req) => {
                   tolerancesSnapshot[lbl] = { value: 0, unit: "pct", op: "eq" };
                 }
               }
+              await cancellation.throwIfCancelled({
+                checkpoint: "before_persist",
+                report_id: reportId,
+                scenario_id: s.id,
+                combo: combo.label,
+              });
               const { data: tr, error: trError } = await sb.from("test_results").insert({
                 run_id: run.id, scenario_id: s.id, status,
                 expected: { source: sqlMeta.source, filter: combo.label, where_clause: sqlMeta.where_clause, values: expectedMap, row: sqlRow, sql: sqlMeta },
@@ -1821,6 +2547,18 @@ Deno.serve(async (req) => {
                   structured_source_keys: Object.keys(structuredSourceKeys).length
                     ? structuredSourceKeys
                     : null,
+                  execution: buildExecutionAudit({
+                    run_id: run.id,
+                    scenario_id: s.id,
+                    combo: combo.label,
+                    target: "compare",
+                    status,
+                    attempt_count: attemptCount,
+                    missing_fields: missingAll,
+                    failure_category: failureCategory,
+                    error: mainOutcome.error || refOutcome?.error || null,
+                    url: mainRuntime.url || null,
+                  }),
                 },
                 diff: diffMap,
                 criticality: crit,
@@ -1833,39 +2571,229 @@ Deno.serve(async (req) => {
               }
 
               if (!comboPass && tr?.id) {
-                callFn("agent-analyze", { test_result_id: tr.id }).catch(() => {});
+                let skipAnalyze = false;
+                try {
+                  skipAnalyze = await cancellation.refresh();
+                } catch (e) {
+                  if (isRunAuthExpiredError(e)) throw e;
+                  if (isRunCancelledError(e)) skipAnalyze = true;
+                  else throw e;
+                }
+                if (skipAnalyze) {
+                  jsonLog("run_cancellation_skip_analyze", {
+                    run_id: run.id,
+                    scenario_id: s.id,
+                    combo: combo.label,
+                    test_result_id: tr.id,
+                    checkpoint: "before_analyze",
+                  });
+                } else {
+                  callFn("agent-analyze", { test_result_id: tr.id }).catch(() => {});
+                }
               }
               return { pass: comboPass ? 1 : 0, fail: comboPass ? 0 : 1 };
-            });
+            }, () => cancellation.isCancelled());
             let localPass = 0, localFail = 0;
             for (const o of comboOutcomes) {
+              if (!o) continue;
               localPass += o.pass;
               localFail += o.fail;
             }
+            await cancellation.throwIfCancelled({
+              checkpoint: "after_pool",
+              report_id: reportId,
+              scenario_id: s.id,
+            });
             return { pass: localPass, fail: localFail };
-          });
+          }, () => cancellation.isCancelled());
           for (const o of scenarioOutcomes) {
+            if (!o) continue;
             pass += o.pass;
             fail += o.fail;
           }
+          // Reconcile before cancel check: mapPool stop leaves unclaimed scenarios
+          // with no rows — account them explicitly (cancel / infra / incomplete).
+          {
+            let cancelledNow = cancellation.isCancelled();
+            try {
+              if (!cancelledNow) cancelledNow = await cancellation.refresh();
+            } catch (refreshErr) {
+              if (isRunAuthExpiredError(refreshErr)) {
+                await persistUnexecutedScenarios(
+                  sb, run.id, scenarios || [], "auth_failure", refreshErr.causeMessage,
+                );
+                throw refreshErr;
+              }
+              if (!isRunCancelledError(refreshErr)) throw refreshErr;
+              cancelledNow = true;
+            }
+            const reason = unexecutedReasonFromStop({
+              cancelled: cancelledNow,
+              browserlessInfraDown,
+            });
+            const unexec = await persistUnexecutedScenarios(
+              sb,
+              run.id,
+              scenarios || [],
+              reason,
+              browserlessInfraDown || (cancelledNow ? "cancelled" : "report_incomplete"),
+            );
+            // Unexecuted rows count as fail for child pass/fail rollup (not fabricated pass).
+            fail += unexec;
+          }
+          await cancellation.throwIfCancelled({
+            checkpoint: "after_pool",
+            report_id: reportId,
+          });
         }
 
+        await cancellation.throwIfCancelled({
+          checkpoint: "before_finalize",
+          report_id: single_report_id || reportIds[0] || null,
+        });
         if (existing_run_id) {
-          await finalizeChild(sb, run.id, single_report_id || reportIds[0], pass, fail, false);
+          const incomplete = Boolean(browserlessInfraDown);
+          await finalizeChild(
+            sb,
+            run.id,
+            single_report_id || reportIds[0],
+            pass,
+            fail,
+            incomplete,
+            incomplete ? (browserlessInfraDown || "browserless_unhealthy") : undefined,
+          );
         } else {
+          // Preserve cancelled — never overwrite with completed.
+          const incomplete = Boolean(browserlessInfraDown);
           await sb.from("runs").update({
-            status: "completed", finished_at: new Date().toISOString(),
-            summary: { pass, fail, total: pass + fail },
-          }).eq("id", run.id);
+            status: incomplete || fail > 0 ? "failed" : "completed",
+            finished_at: new Date().toISOString(),
+            summary: {
+              pass,
+              fail,
+              total: pass + fail,
+              ...(incomplete
+                ? { error: browserlessInfraDown || "browserless_unhealthy", failure_category: "browserless_timeout" }
+                : {}),
+            },
+          }).eq("id", run.id).eq("status", "running");
         }
       } catch (e) {
+        if (isRunCancelledError(e)) {
+          cancellation.markCancelled();
+          jsonLog("run_cancellation_detected", {
+            run_id: run.id,
+            checkpoint: e.context?.checkpoint || "work_inner",
+            report_id: e.context?.report_id ?? single_report_id ?? reportIds[0] ?? null,
+            scenario_id: e.context?.scenario_id ?? null,
+            combo: e.context?.combo ?? null,
+            target: e.context?.target ?? null,
+            attempt: e.context?.attempt ?? null,
+          });
+          // Account remaining scenarios for the in-flight report before leaving cancelled.
+          try {
+            const rid = e.context?.report_id ?? single_report_id ?? reportIds[0];
+            if (rid) {
+              const { data: leftover } = await sb.from("scenarios")
+                .select("id, criticality")
+                .eq("report_id", rid)
+                .eq("deferred", false);
+              await persistUnexecutedScenarios(sb, run.id, leftover || [], "cancelled", "cancelled");
+              if (existing_run_id) {
+                await finalizeChild(sb, run.id, rid, pass, fail, true, "cancelled");
+              }
+            }
+          } catch (accountErr) {
+            jsonLog("cancel_unexecuted_account_failed", {
+              run_id: run.id,
+              error: errorDetail(accountErr).slice(0, 300),
+            });
+          }
+          // Leave runs.status = "cancelled" when user cancelled; do not flip to failed.
+          return;
+        }
+        if (isRunAuthExpiredError(e)) {
+          jsonLog("run_auth_expired_stop", {
+            run_id: run.id,
+            error: e.causeMessage.slice(0, 300),
+            can_refresh: Boolean(session?.canRefresh),
+          });
+          try {
+            const rid = single_report_id || reportIds[0];
+            if (rid) {
+              const { data: leftover } = await sb.from("scenarios")
+                .select("id, criticality")
+                .eq("report_id", rid)
+                .eq("deferred", false);
+              await persistUnexecutedScenarios(
+                sb, run.id, leftover || [], "auth_failure", e.causeMessage,
+              );
+            }
+            if (existing_run_id && rid) {
+              // Child of Brand: never wipe coordinator summary — finalize this report only.
+              await finalizeChild(
+                sb, run.id, rid, pass, fail, true, "auth_expired",
+              );
+            } else {
+              const admin = getServiceClient();
+              const finisher = admin || sb;
+              await finisher.from("runs").update({
+                status: "failed",
+                finished_at: new Date().toISOString(),
+                summary: {
+                  pass,
+                  fail,
+                  total: pass + fail,
+                  error: "auth_expired",
+                  failure_category: "auth_failure",
+                },
+              }).eq("id", run.id).eq("status", "running");
+            }
+          } catch (finErr) {
+            jsonLog("run_auth_expired_finalize_failed", {
+              run_id: run.id,
+              error: String((finErr as any)?.message || finErr).slice(0, 300),
+            });
+          }
+          return;
+        }
+        if (cancellation.isCancelled()) {
+          jsonLog("run_cancellation_skip_finalize", {
+            run_id: run.id,
+            checkpoint: "work_inner_error",
+            error: errorDetail(e).slice(0, 500),
+          });
+          return;
+        }
+        // refresh() may throw RunAuthExpiredError — handle before generic finalize.
+        try {
+          if (await cancellation.refresh()) {
+            jsonLog("run_cancellation_skip_finalize", {
+              run_id: run.id,
+              checkpoint: "work_inner_error",
+              error: errorDetail(e).slice(0, 500),
+            });
+            return;
+          }
+        } catch (cancelErr) {
+          if (isRunCancelledError(cancelErr) || isRunAuthExpiredError(cancelErr)) {
+            jsonLog("run_cancellation_skip_finalize", {
+              run_id: run.id,
+              checkpoint: "work_inner_error",
+              error: errorDetail(cancelErr).slice(0, 500),
+            });
+            return;
+          }
+          throw cancelErr;
+        }
         if (existing_run_id) {
           await finalizeChild(sb, run.id, single_report_id || reportIds[0], pass, fail, true, String((e as any)?.message || e));
         } else {
+          // Preserve cancelled — never overwrite with failed.
           await sb.from("runs").update({
             status: "failed", finished_at: new Date().toISOString(),
             summary: { pass, fail, total: pass + fail, error: String(e) },
-          }).eq("id", run.id);
+          }).eq("id", run.id).eq("status", "running");
         }
       }
     };
@@ -1877,7 +2805,8 @@ Deno.serve(async (req) => {
     const isEdge = typeof EdgeRuntime !== "undefined";
     if (existing_run_id && !isEdge) {
       await work();
-      return new Response(JSON.stringify({ run_id: run.id, status: "completed", concurrency }), {
+      const childStatus = cancellation.isCancelled() ? "cancelled" : "completed";
+      return new Response(JSON.stringify({ run_id: run.id, status: childStatus, concurrency }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
