@@ -13,6 +13,7 @@ import { StoredResultTable } from "@/components/StoredResultTable";
 import { fetchCanonicalScript } from "@/lib/canonicalScript";
 import { configuredKpiNames, deriveStoredResultStatus } from "@/lib/kpi-values";
 import {
+  aggregateComboExecutionAudits,
   formatExtractionStatusLabel,
   resolveValidationDisplayStatus,
 } from "@/lib/extraction-status-label";
@@ -167,17 +168,23 @@ export function RunScenarioCard({
           <ScenarioKpiTolerancesReadOnly scenarioId={scenarioId} scenarioType={scenarioType} results={results} />
 
           {(() => {
-            const exec =
-              (latest?.actual && typeof latest.actual === "object" && (latest.actual as any).execution) ||
-              (latest?.diff && typeof latest.diff === "object" && (latest.diff as any).__execution) ||
-              null;
-            if (!exec || typeof exec !== "object") return null;
-            const category = String(exec.failure_category || exec.status || "").trim();
-            const missing = Array.isArray(exec.missing_fields) ? exec.missing_fields.filter(Boolean) : [];
-            const attempts = exec.attempt_count != null ? Number(exec.attempt_count) : null;
+            // Footer must reflect ALL combos on this card. Using results[0] alone
+            // showed Extraction/Validation PASS when combo A passed and combo B failed.
+            const aggregated = aggregateComboExecutionAudits(
+              resultsWithDerived.map((r: any) =>
+                (r?.actual && typeof r.actual === "object" && r.actual.execution) ||
+                (r?.diff && typeof r.diff === "object" && r.diff.__execution) ||
+                null,
+              ),
+            );
+            if (!aggregated) return null;
+            const category = aggregated.category;
+            const missing = aggregated.missing_fields;
+            const attempts = aggregated.attempt_count;
             if (!category && !missing.length) return null;
             const extractionLabel = formatExtractionStatusLabel(category);
-            const validationLabel = resolveValidationDisplayStatus(category, latestDerivedStatus);
+            // Validation follows overall scenario outcome (any combo fail → FAIL).
+            const validationLabel = resolveValidationDisplayStatus(category, overallStatus);
             const validationChipStatus =
               validationLabel === "PASS" ? "pass" : validationLabel === "PENDING" ? "pending" : "fail";
             return (

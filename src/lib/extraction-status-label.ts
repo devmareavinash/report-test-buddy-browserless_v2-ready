@@ -14,6 +14,80 @@ const EXTRACTION_LABELS: Record<string, string> = {
   empty_extraction: "FAILED",
 };
 
+/** Higher = worse (for multi-combo footers on Brand run cards). */
+const EXTRACTION_CATEGORY_RANK: Record<string, number> = {
+  pass: 0,
+  fail: 10,
+  failed: 10,
+  partial_extraction: 20,
+  empty_extraction: 30,
+  auth_failure: 40,
+  browserless_timeout: 50,
+  cancelled: 60,
+};
+
+/** Pick the worst extraction category across combo rows. */
+export function worseExtractionCategory(
+  a: string | null | undefined,
+  b: string | null | undefined,
+): string {
+  const ak = String(a || "").trim().toLowerCase();
+  const bk = String(b || "").trim().toLowerCase();
+  if (!ak) return bk;
+  if (!bk) return ak;
+  const ar = EXTRACTION_CATEGORY_RANK[ak] ?? 15;
+  const br = EXTRACTION_CATEGORY_RANK[bk] ?? 15;
+  return br >= ar ? bk : ak;
+}
+
+export type ComboExecutionAudit = {
+  failure_category?: string | null;
+  status?: string | null;
+  attempt_count?: number | null;
+  missing_fields?: unknown;
+};
+
+/**
+ * Aggregate per-combo execution audits so a scenario footer cannot show PASS
+ * when another combo on the same card failed.
+ */
+export function aggregateComboExecutionAudits(
+  audits: Array<ComboExecutionAudit | null | undefined>,
+): {
+  category: string;
+  attempt_count: number | null;
+  missing_fields: string[];
+} | null {
+  const usable = (audits || []).filter((a): a is ComboExecutionAudit => !!a && typeof a === "object");
+  if (!usable.length) return null;
+
+  let category = "";
+  let attempt_count: number | null = null;
+  const missing = new Set<string>();
+
+  for (const exec of usable) {
+    const cat = String(exec.failure_category || exec.status || "").trim();
+    if (cat) category = worseExtractionCategory(category, cat);
+    const attempts = exec.attempt_count != null ? Number(exec.attempt_count) : NaN;
+    if (Number.isFinite(attempts)) {
+      attempt_count = attempt_count == null ? attempts : Math.max(attempt_count, attempts);
+    }
+    if (Array.isArray(exec.missing_fields)) {
+      for (const field of exec.missing_fields) {
+        const text = String(field || "").trim();
+        if (text) missing.add(text);
+      }
+    }
+  }
+
+  if (!category && !missing.size) return null;
+  return {
+    category,
+    attempt_count,
+    missing_fields: Array.from(missing),
+  };
+}
+
 /** Map stored extraction category → UI label (no DB mutation). */
 export function formatExtractionStatusLabel(category: string | null | undefined): string {
   const key = String(category || "").trim().toLowerCase();

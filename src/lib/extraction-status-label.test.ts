@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  aggregateComboExecutionAudits,
   formatExtractionStatusLabel,
   formatExtractionStatusLine,
   formatValidationStatusLine,
   resolveValidationDisplayStatus,
+  worseExtractionCategory,
 } from "./extraction-status-label";
 
 describe("extraction-status-label", () => {
@@ -58,5 +60,18 @@ describe("extraction-status-label", () => {
     expect(formatExtractionStatusLabel("cancelled")).toBe("CANCELLED");
     expect(resolveValidationDisplayStatus("cancelled", "pass")).toBe("FAIL");
     expect(formatValidationStatusLine("cancelled", "pass")).toBe("Validation Status: FAIL");
+  });
+
+  it("aggregates multi-combo audits so one fail cannot hide behind a pass", () => {
+    expect(worseExtractionCategory("pass", "fail")).toBe("fail");
+    expect(worseExtractionCategory("fail", "empty_extraction")).toBe("empty_extraction");
+    const agg = aggregateComboExecutionAudits([
+      { failure_category: "pass", attempt_count: 1, missing_fields: [] },
+      { failure_category: "fail", attempt_count: 2, missing_fields: ["grid"] },
+    ]);
+    expect(agg?.category).toBe("fail");
+    expect(agg?.attempt_count).toBe(2);
+    expect(agg?.missing_fields).toEqual(["grid"]);
+    expect(resolveValidationDisplayStatus(agg?.category, "fail")).toBe("FAIL");
   });
 });
