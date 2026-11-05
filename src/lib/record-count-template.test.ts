@@ -44,7 +44,7 @@ describe("record-count extraction contract", () => {
     const reference = readFileSync(referencePath, "utf8");
     const orchestrator = readFileSync(orchestratorPath, "utf8");
 
-    expect(reference).toContain("RECORD_COUNT_TEMPLATE_VERSION: 2026-10-05.4");
+    expect(reference).toContain("RECORD_COUNT_TEMPLATE_VERSION: 2026-10-27.3");
     expect(orchestrator).toContain("if (!scriptHasSavedCode(script))");
     expect(orchestrator).not.toContain("isStaleRecordCountScript");
     expect(orchestrator).not.toContain("needsRecordCountTemplate");
@@ -71,7 +71,7 @@ describe("record-count extraction contract", () => {
   it("isolates and retries every filter combination without changing playwright-runtime", () => {
     const orchestrator = readFileSync(orchestratorPath, "utf8");
 
-    expect(orchestrator).toContain("if (hasCombos)");
+    expect(orchestrator).toContain("hasCombos ?");
     expect(orchestrator).toContain("isolatedRunResponses");
     expect(orchestrator).toContain("isolatedRefResponses");
     expect(orchestrator).toContain("filter_combinations: [{ label: combo.label, filters: combo.filters || {} }]");
@@ -111,7 +111,8 @@ describe("record-count extraction contract", () => {
     const orchestrator = readFileSync(orchestratorPath, "utf8");
 
     expect(orchestrator).not.toContain("function pccExtractionRetryReason");
-    expect(orchestrator).toContain("!isPccScenario && comboExtractionNeedsRetry(response, comboLabel)");
+    expect(orchestrator).toContain("isPccScenario ? 1 : EXTRACTION_MAX_ATTEMPTS");
+    expect(orchestrator).toContain("comboExtractionNeedsRetry(response, comboLabel");
     expect(orchestrator).toContain("invokeRuntimeWithRetry");
   });
 
