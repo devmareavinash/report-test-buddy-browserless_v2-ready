@@ -43,7 +43,7 @@ RUN sed -i 's/\r$//' ./docker-entrypoint.sh && chmod +x ./docker-entrypoint.sh
 RUN set -e; \
     FILES=$(find functions -name '*.ts' ! -name '*.test.ts' | sort); \
     echo "Caching $(echo $FILES | wc -w) files in one resolution..."; \
-    deno cache --unsafely-ignore-certificate-errors --no-check $FILES server.ts
+    deno cache --lock=deno.lock --unsafely-ignore-certificate-errors --no-check $FILES server.ts
 
 EXPOSE 8000
 ENV PORT=8000
