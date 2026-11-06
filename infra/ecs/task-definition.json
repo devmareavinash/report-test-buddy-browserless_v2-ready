@@ -2,8 +2,8 @@
   "family": "rtb",
   "networkMode": "awsvpc",
   "requiresCompatibilities": ["FARGATE"],
-  "cpu": "16384",
-  "memory": "65536",
+  "cpu": "2048",
+  "memory": "8192",
   "executionRoleArn": "arn:aws:iam::717998086494:role/ecsTaskExecutionRole",
   "taskRoleArn": "arn:aws:iam::717998086494:role/ecsTaskExecutionRole",
   "containerDefinitions": [
@@ -51,7 +51,6 @@
         { "name": "SNOWFLAKE_SSO_URL", "value": "http://127.0.0.1:8002" },
         { "name": "LOCAL_FUNCTIONS_URL", "value": "http://127.0.0.1:8000/functions/v1" },
         { "name": "ORCHESTRATE_CONCURRENCY", "value": "3" },
-        { "name": "MAX_ACTIVE_ORCHESTRATE_RUNS", "value": "2" },
         { "name": "PORT", "value": "8000" }
       ],
       "secrets": [
@@ -89,8 +88,8 @@
       "essential": true,
       "portMappings": [{ "containerPort": 3000, "protocol": "tcp" }],
       "environment": [
-        { "name": "CONCURRENT", "value": "12" },
-        { "name": "QUEUED", "value": "20" },
+        { "name": "CONCURRENT", "value": "10" },
+        { "name": "QUEUED", "value": "10" },
         { "name": "TIMEOUT", "value": "420000" },
         { "name": "CORS", "value": "true" },
         { "name": "DEFAULT_LAUNCH_ARGS", "value": "[\"--disable-dev-shm-usage\",\"--ignore-certificate-errors\",\"--window-size=1920,1080\",\"--force-device-scale-factor=1\"]" }
