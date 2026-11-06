@@ -29,7 +29,12 @@ import {
 import { compareTables, summarizeTableCompare } from "@/lib/tableCompare";
 import { attachTrendFields, trendStatusFromValues } from "@/lib/trend-payload";
 import { fetchCanonicalScript, persistCanonicalScript } from "@/lib/canonicalScript";
-import { labelFromFilterMap, pairCombosWithResults } from "@/lib/latestTestResults";
+import {
+  labelFromFilterMap,
+  loneChildSatisfiesComboLabel,
+  overallStatusFromComboPairs,
+  pairCombosWithResults,
+} from "@/lib/latestTestResults";
 import { ScriptAgentChat } from "@/components/ScriptAgentChat";
 import { summarizeRunFailureForChat } from "@/lib/script-agent-proposal";
 import { MessageSquare } from "lucide-react";
@@ -1077,10 +1082,19 @@ export default function ScenarioDetail() {
         ? aliasConfiguredKpis(kpiMapFromStored(row.expected) || {}, kpiTolerances)
         : null;
       const filtersApplied = row?.actual?.filters_applied || null;
-      if (hasStoredActual || Object.keys(actualValues).length) {
+      // Always reserve the combo label when a stored row exists — even if values
+      // are empty. Omitting a failed combo left only the PASS sibling in the
+      // rebuilt payload, so FilterComparisonTable / pickComboBlock stole that
+      // sibling's KPIs and Latest Result showed PASS while Runs correctly showed
+      // "Reference value was not extracted" for the same timestamp.
+      if (row) {
+        pwResult[label] = { ...actualValues, filters_applied: filtersApplied };
+      } else if (hasStoredActual || Object.keys(actualValues).length) {
         pwResult[label] = { ...actualValues, filters_applied: filtersApplied };
       }
-      if (expectedValues && Object.keys(expectedValues).length) {
+      if (row && isReferenceMatch) {
+        refResult[label] = { ...(expectedValues || {}) };
+      } else if (expectedValues && Object.keys(expectedValues).length) {
         if (isReferenceMatch) {
           refResult[label] = { ...expectedValues };
         } else {
@@ -1159,23 +1173,34 @@ export default function ScenarioDetail() {
     }
     return undefined;
   })();
+  // Stored Latest Result must follow persisted per-combo rows (same source as Runs).
+  // Live FilterComparisonTable recompute can invent PASS for an empty failed combo
+  // by borrowing a sibling's KPIs — never let that override a stored FAIL.
+  const storedComboOverall: "pass" | "fail" | "pending" | null = (() => {
+    if (hasManual || !combos?.length || !latestPerComboResults.length) return null;
+    return overallStatusFromComboPairs(pairCombosWithResults(combos, latestPerComboResults));
+  })();
   // Live KPI/grid comparison wins when available (including pending); saved DB is fallback.
   const tableOverall =
     tableLiveOverall === "pass" || tableLiveOverall === "fail" || tableLiveOverall === "pending"
       ? tableLiveOverall
       : null;
   const displayedStatus: "pass" | "fail" | "pending" = (() => {
+    if (!hasManual && storedComboOverall === "fail") return "fail";
     if (tableOverall) return tableOverall;
     if (hasManual) return computedStatus;
+    if (storedComboOverall) return storedComboOverall;
     if (computedStatus !== "pending") return computedStatus;
     return persistedStatus || computedStatus;
   })();
   const syncLiveOverall: "pass" | "fail" | "pending" =
-    tableOverall && tableOverall !== "pending"
-      ? tableOverall
-      : computedStatus !== "pending"
-        ? computedStatus
-        : displayedStatus;
+    !hasManual && storedComboOverall === "fail"
+      ? "fail"
+      : tableOverall && tableOverall !== "pending"
+        ? tableOverall
+        : computedStatus !== "pending"
+          ? computedStatus
+          : displayedStatus;
   const storedSource = latest?.expected?.source || latest?.actual?.source;
 
   // Tolerances that were stored alongside the latest run (per-run snapshot).
@@ -3113,7 +3138,15 @@ function pickComboBlock(root: any, label: string, idx: number, comboId?: string)
     if (!v || typeof v !== "object" || Array.isArray(v)) return false;
     return Object.keys(extractKpisFromBlock(v)).length > 0;
   });
-  if (children.length === 1) return children[0][1];
+  // Only unwrap a lone child when it is the requested combo (or no label was
+  // given). Returning the only sibling for a *different* label invents KPI /
+  // reference values on Latest Result while Runs (per test_result row) correctly
+  // shows "Reference value was not extracted".
+  if (children.length === 1) {
+    const [onlyKey, onlyVal] = children[0];
+    if (loneChildSatisfiesComboLabel(onlyKey, label)) return onlyVal;
+    return null;
+  }
   // Several combo-shaped siblings and this label missed — do not return the whole
   // root. That merges other combos' KPIs and invents reference values on Latest
   // while Runs (per test_result row) correctly shows "not extracted".
@@ -4084,14 +4117,15 @@ function FilterComparisonTable({
     const pwBlock = comboBlockOverrides?.[c.id] ?? blockFor(pwRoot, label, idx, c.id);
     const refBlock = blockFor(refRoot, label, idx, c.id);
     let kpis = extractKpisFromBlock(pwBlock);
-    if (!Object.keys(kpis).length) {
-      // Whole-run fallback merges every combo's KPIs — only safe when the payload
-      // is a flat (non-combo) map, not when this combo simply has no block.
+    if (!Object.keys(kpis).length && combos.length <= 1) {
+      // Whole-run fallback merges every combo's KPIs — only safe for a single
+      // combo / flat payload. With 2+ configured combos it steals a sibling's
+      // PASS values onto a failed empty combo (Latest PASS vs Runs FAIL).
       const pwChildren = countComboShapedChildren(pickResultRoot(runResult));
       if (pwChildren <= 1) kpis = extractKpisFromRun(runResult) || {};
     }
     let refKpis = refBlock ? extractKpisFromBlock(refBlock) : null;
-    if (!refKpis || !Object.keys(refKpis).length) {
+    if ((!refKpis || !Object.keys(refKpis).length) && combos.length <= 1) {
       const refChildren = countComboShapedChildren(pickResultRoot(refRunResult));
       if (refChildren <= 1) refKpis = extractKpisFromRun(refRunResult);
     }

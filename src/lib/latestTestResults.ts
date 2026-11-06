@@ -190,6 +190,21 @@ const TERMINAL_FAIL_RESULT_STATUSES = new Set([
   "failed",
 ]);
 
+/**
+ * A lone combo-shaped child may satisfy a requested label only when the keys
+ * match (or the request has no label). Otherwise Latest Result steals a PASS
+ * sibling onto a failed empty combo while Runs correctly shows not-extracted.
+ */
+export function loneChildSatisfiesComboLabel(
+  childKey: string,
+  requestedLabel: string | null | undefined,
+): boolean {
+  const want = String(requestedLabel ?? "").trim().toLowerCase().replace(/[–—]/g, "-").replace(/\s+/g, " ");
+  if (!want) return true;
+  const have = String(childKey ?? "").trim().toLowerCase().replace(/[–—]/g, "-").replace(/\s+/g, " ");
+  return have === want;
+}
+
 export function overallStatusFromComboPairs(
   pairs: Array<{ result: any | null }> | null | undefined,
   fallback: string = "pending",

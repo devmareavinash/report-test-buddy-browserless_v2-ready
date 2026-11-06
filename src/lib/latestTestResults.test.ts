@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { displayComboLabel, overallStatusFromComboPairs, pairCombosWithResults } from "./latestTestResults";
+import {
+  displayComboLabel,
+  loneChildSatisfiesComboLabel,
+  overallStatusFromComboPairs,
+  pairCombosWithResults,
+} from "./latestTestResults";
 
 describe("pairCombosWithResults", () => {
   it("keeps configured combinations visible when only one combination has a result", () => {
@@ -63,6 +68,23 @@ describe("pairCombosWithResults", () => {
       },
       0,
     )).toBe("Total / Total / Total / R4W");
+  });
+
+  describe("loneChildSatisfiesComboLabel", () => {
+    it("rejects a lone PASS sibling when the requested combo label differs", () => {
+      expect(loneChildSatisfiesComboLabel(
+        "Total / Portfolio / Nubeqa / Total / YTD",
+        "Total / Prostate / Xofigo / Total / YTD",
+      )).toBe(false);
+    });
+
+    it("allows the lone child when labels match or the request has no label", () => {
+      expect(loneChildSatisfiesComboLabel(
+        "Total / Portfolio / Nubeqa / Total / YTD",
+        "Total / Portfolio / Nubeqa / Total / YTD",
+      )).toBe(true);
+      expect(loneChildSatisfiesComboLabel("only-combo", "")).toBe(true);
+    });
   });
 
   describe("overallStatusFromComboPairs", () => {
