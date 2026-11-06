@@ -15,6 +15,12 @@ import {
 } from "../_shared/run-cancellation.ts";
 import { checkBrowserlessHealth } from "../_shared/browserless-health.ts";
 import {
+  browserlessCapacityMessage,
+  maxActiveOrchestrateRuns,
+  pickBrowserlessCapacityConflict,
+  pickBrowserlessCapacityLoser,
+} from "../_shared/orchestrate-capacity.ts";
+import {
   buildUnexecutedRows,
   type UnexecutedReason,
 } from "../_shared/run-accounting.ts";
@@ -287,12 +293,7 @@ function orchestrateConcurrency(override?: unknown): number {
   return Number.isFinite(n) && n >= 1 ? Math.min(10, Math.floor(n)) : 3;
 }
 
-async function findActiveRunConflict(
-  sb: any,
-  scopeType: string,
-  scopeId: string,
-  excludeRunId?: string,
-) {
+async function listActiveOrchestrateRuns(sb: any) {
   const { data: active, error: activeError } = await sb
     .from("runs")
     .select("id, scope_type, scope_id, started_at")
@@ -301,7 +302,42 @@ async function findActiveRunConflict(
     .order("started_at", { ascending: true })
     .limit(1000);
   if (activeError) throw activeError;
-  const candidates = (active || []).filter((run: any) => run.id !== excludeRunId);
+  return active || [];
+}
+
+/**
+ * Shared Browserless pool guard — blocks Prostate+Lynkuet (etc.) from overlapping
+ * when MAX_ACTIVE_ORCHESTRATE_RUNS is reached (default 1).
+ */
+async function findBrowserlessCapacityConflict(sb: any, excludeRunId?: string) {
+  const maxActive = maxActiveOrchestrateRuns(Deno.env.get("MAX_ACTIVE_ORCHESTRATE_RUNS"));
+  const active = await listActiveOrchestrateRuns(sb);
+  return {
+    maxActive,
+    conflict: pickBrowserlessCapacityConflict(active, { maxActive, excludeRunId }),
+  };
+}
+
+function browserlessBusyResponse(conflict: { id: string }, maxActive: number) {
+  return new Response(JSON.stringify({
+    error: "BROWSERLESS_AT_CAPACITY",
+    message: browserlessCapacityMessage(conflict.id, maxActive),
+    active_run_id: conflict.id,
+    max_active_orchestrate_runs: maxActive,
+  }), {
+    status: 409,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
+
+async function findActiveRunConflict(
+  sb: any,
+  scopeType: string,
+  scopeId: string,
+  excludeRunId?: string,
+) {
+  const active = await listActiveOrchestrateRuns(sb);
+  const candidates = active.filter((run: any) => run.id !== excludeRunId);
   if (!candidates.length) return null;
 
   let reportId: string | null = null;
@@ -1048,6 +1084,10 @@ Deno.serve(async (req) => {
       const initialSummary = scope_type === "workstream"
         ? { pass: 0, fail: 0, total: 0, done: 0, child_count: reportIds.length, concurrency }
         : { concurrency };
+      const capacity = await findBrowserlessCapacityConflict(sb);
+      if (capacity.conflict) {
+        return browserlessBusyResponse(capacity.conflict, capacity.maxActive);
+      }
       const existingConflict = await findActiveRunConflict(sb, scope_type, scope_id);
       if (existingConflict) {
         return new Response(JSON.stringify({
@@ -1077,6 +1117,24 @@ Deno.serve(async (req) => {
       // Both concurrent callers pause before work; the later run cancels itself
       // if another overlapping run became visible.
       await new Promise((resolve) => setTimeout(resolve, 150));
+      // Winner election: keep the oldest maxActive runs. Cancelling whenever
+      // "others >= max" made simultaneous starters all exit and left zero runs.
+      const maxActive = maxActiveOrchestrateRuns(Deno.env.get("MAX_ACTIVE_ORCHESTRATE_RUNS"));
+      const activeAfterInsert = await listActiveOrchestrateRuns(sb);
+      const capacityLoserVersus = pickBrowserlessCapacityLoser(activeAfterInsert, run.id, { maxActive });
+      if (capacityLoserVersus) {
+        await sb.from("runs").update({
+          status: "cancelled",
+          finished_at: new Date().toISOString(),
+          summary: {
+            ...initialSummary,
+            error: "browserless_at_capacity",
+            active_run_id: capacityLoserVersus.id,
+            max_active_orchestrate_runs: maxActive,
+          },
+        }).eq("id", run.id);
+        return browserlessBusyResponse(capacityLoserVersus, maxActive);
+      }
       const racedConflict = await findActiveRunConflict(sb, scope_type, scope_id, run.id);
       if (racedConflict) {
         const winner = [run, racedConflict].sort((a: any, b: any) => {

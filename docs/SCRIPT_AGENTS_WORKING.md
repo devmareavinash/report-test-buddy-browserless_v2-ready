@@ -247,7 +247,7 @@ Target: Browserless OSS `/function` (Playwright-compatible `page`).
 
 **Combos:** playwright-runtime injects all requested filter combinations. Generate-time validation uses **only the first combo** to keep latency bounded.
 
-**Concurrency (orchestrate):** UI 1/2/3/5/8 “parallel screens”; server cap 10. Main + reference scrapes can run in parallel. Filter combos **inside one scenario** stay sequential (one browser). Browserless `CONCURRENT=10`. On Fargate 2 vCPU prefer 2–3; locally 3 is typical.
+**Concurrency (orchestrate):** UI 1/2/3/5/8 “parallel screens”; server cap 10. Main + reference scrapes can run in parallel. Filter combos **inside one scenario** stay sequential (one browser). Shared Browserless is capped by `MAX_ACTIVE_ORCHESTRATE_RUNS` (default 1; AWS task allows 2 after 4 vCPU / 16 GB). Browserless `CONCURRENT` should stay at or below task capacity (AWS: 6). Locally `CONCURRENT=3` is typical.
 
 ---
 

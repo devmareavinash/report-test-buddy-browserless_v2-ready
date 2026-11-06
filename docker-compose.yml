@@ -11,6 +11,8 @@ services:
         VITE_SUPABASE_PUBLISHABLE_KEY: ${VITE_SUPABASE_PUBLISHABLE_KEY}
         VITE_SUPABASE_PROJECT_ID: ${VITE_SUPABASE_PROJECT_ID}
         VITE_USE_LOCAL_BACKEND: "true"
+        # Match backend MAX_ACTIVE_ORCHESTRATE_RUNS (local default 1).
+        VITE_MAX_ACTIVE_ORCHESTRATE_RUNS: ${VITE_MAX_ACTIVE_ORCHESTRATE_RUNS:-1}
         HTTP_PROXY: ${HTTP_PROXY:-http://10.185.190.10:8080}
         HTTPS_PROXY: ${HTTPS_PROXY:-http://10.185.190.10:8080}
         http_proxy: ${HTTP_PROXY:-http://10.185.190.10:8080}
@@ -54,6 +56,8 @@ services:
       BROWSERLESS_TOKEN: ${BROWSERLESS_TOKEN:-local-dev-token}
       BROWSERLESS_OSS: "true"
       ORCHESTRATE_CONCURRENCY: ${ORCHESTRATE_CONCURRENCY:-3}
+      # Local Docker Desktop cannot host two heavy brands; keep at 1 unless you raise BROWSERLESS_CONCURRENT.
+      MAX_ACTIVE_ORCHESTRATE_RUNS: ${MAX_ACTIVE_ORCHESTRATE_RUNS:-1}
       # Must be host.docker.internal — do NOT use .env's 127.0.0.1 (that is for native Deno).
       # Inside the backend container, 127.0.0.1 is the container itself.
       SNOWFLAKE_SSO_URL: http://snowflake-sso:8002

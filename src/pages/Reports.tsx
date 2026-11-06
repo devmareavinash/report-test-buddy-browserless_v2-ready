@@ -267,7 +267,15 @@ export default function Reports() {
                       <Button
                         size="sm"
                         variant="outline"
-                        disabled={run.isPending && run.variables?.scope_id === w.id}
+                        disabled={
+                          (run.isPending && run.variables?.scope_id === w.id) ||
+                          !!executionLocks.browserlessAtCapacity
+                        }
+                        title={
+                          executionLocks.browserlessAtCapacity
+                            ? "Browserless is at capacity — wait for another brand/run to finish"
+                            : "Run report"
+                        }
                         onClick={() => run.mutate({ scope_type: "workstream", scope_id: w.id })}
                       >
                         {(run.isPending && run.variables?.scope_id === w.id)

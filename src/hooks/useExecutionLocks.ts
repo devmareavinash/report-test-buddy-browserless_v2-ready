@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
+import { maxActiveOrchestrateRuns } from "@/lib/orchestrateCapacity";
 
 type ActiveRun = {
   id: string;
@@ -84,16 +85,25 @@ export function useExecutionLocks() {
     data ? Array.from(data.reportWorkstream.values()) : [],
   );
 
+  // Shared Browserless: when active orchestrate runs hit the cap, block starting
+  // more brands. Do NOT fold this into isWorkstreamRunning — that drives the
+  // Cancel button and would show Cancel on idle brands.
+  const activeCount = (data?.activeRuns || []).length;
+  const browserlessAtCapacity = activeCount >= maxActiveOrchestrateRuns();
+
   return {
     ...query,
+    browserlessAtCapacity,
     isScenarioRunning: (scenarioId: string, reportId?: string | null, workstreamId?: string | null) =>
       activeScenarioIds.has(scenarioId) ||
       (!!reportId && activeReportIds.has(reportId)) ||
-      (!!workstreamId && activeWorkstreamIds.has(workstreamId)),
+      (!!workstreamId && activeWorkstreamIds.has(workstreamId)) ||
+      browserlessAtCapacity,
     isReportRunning: (reportId: string, workstreamId?: string | null) =>
       activeReportIds.has(reportId) ||
       activeScenarioReportIds.has(reportId) ||
-      (!!workstreamId && activeWorkstreamIds.has(workstreamId)),
+      (!!workstreamId && activeWorkstreamIds.has(workstreamId)) ||
+      browserlessAtCapacity,
     isWorkstreamRunning: (workstreamId: string) =>
       activeWorkstreamIds.has(workstreamId) ||
       activeDescendantWorkstreamIds.has(workstreamId),
