@@ -1,10 +1,11 @@
+import { deriveExecutionOutcome, executionErrors, outcomeStatus } from "../../supabase/functions/_shared/execution-status";
 import { compareTables } from "./tableCompare";
 import { pickTrendView } from "./trend-payload";
 
 /** Shared unwrap + noise filter for stored test_results actual/expected. */
 
 export const KPI_VALUE_NOISE = new Set([
-  "error", "message", "filter", "filters", "filters_applied", "source", "where_clause",
+  "comboid", "combinationid", "requestedfilters", "executionstatus", "filterverification", "createdat", "runid", "resultid", "error", "message", "filter", "filters", "filters_applied", "source", "where_clause",
   "sql", "row", "metric", "value", "values", "ok", "note", "screenshot",
   "tabledata", "showdata", "showdatadebug", "showdataerror", "showdataopen",
   "extractvia", "firstcol0", "selectedgrain", "timegrainclick", "grainretries",
@@ -18,7 +19,6 @@ export const KPI_VALUE_NOISE = new Set([
   "dossierready", "timegrainretry", "via", "role", "nth", "selector", "locator",
   "snapshot", "clicked", "opened", "option", "clickedtext", "jobid",
   "provider", "screenshotb64", "liveurl", "requestedmode", "fallbackreason",
-  "execution", "failurecategory", "missingfields", "attemptcount",
 ]);
 
 export function normKpiKey(k: string) {
@@ -365,7 +365,7 @@ export function storedResultKpiNames(actual: any, expected: any, spec: any): str
   const configuredHasStoredValue = configured.some((k) =>
     lookupStoredKpiValue(actualMap, k) !== undefined || lookupStoredKpiValue(expectedMap, k) !== undefined
   );
-  if (configured.length && configuredHasStoredValue) return configured;
+  if (configured.length) return configured;
   const fallback = Array.from(new Set(available)).filter((k) => !isKpiValueNoise(k));
   const hasLegacyCountPair =
     lookupStoredKpiValue(actualMap, "Count") !== undefined &&
@@ -386,26 +386,7 @@ export function overallFromStoredKpiRows(rows: Array<{ pass: boolean | null | un
 }
 
 function toStoredStatus(status: any): StoredResultStatus {
-  const s = String(status || "").toLowerCase();
-  if (s === "pass") return "pass";
-  if (s === "pending") return "pending";
-  // Terminal execution categories must never collapse to pending in Latest Result.
-  if (
-    s === "fail" ||
-    s === "partial_extraction" ||
-    s === "auth_failure" ||
-    s === "browserless_timeout" ||
-    s === "cancelled" ||
-    s === "empty_extraction" ||
-    s === "error" ||
-    s === "failed" ||
-    s === "not_started" ||
-    s === "blocked" ||
-    s === "infrastructure_blocked"
-  ) {
-    return "fail";
-  }
-  return "pending";
+  return status === "pass" || status === "fail" || status === "pending" ? status : "pending";
 }
 
 export function deriveStoredResultRows({
@@ -427,7 +408,12 @@ export function deriveStoredResultRows({
   status: StoredResultStatus;
   derived: boolean;
 } {
-  if (firstPayloadError(actual) || firstPayloadError(expected)) {
+  // A payload error always fails the result, but the values that were
+  // extracted are still shown alongside the error.
+  const payloadError = !!(firstPayloadError(actual) || firstPayloadError(expected) || executionErrors(actual).length || executionErrors(expected).length);
+  const contractStatus = (comparison: StoredResultStatus) => outcomeStatus(deriveExecutionOutcome({ status: fallbackStatus, actual, expected }, comparison));
+  if (payloadError) fallbackStatus = "fail";
+  if (payloadError && String(scenarioType || "").toLowerCase() === "trend") {
     return { rows: [], status: "fail", derived: true };
   }
   if (String(scenarioType || "").toLowerCase() === "trend") {
@@ -440,7 +426,7 @@ export function deriveStoredResultRows({
       storedDiff,
     );
     if (!trend?.grains.length) {
-      return { rows: [], status: toStoredStatus(fallbackStatus), derived: false };
+      return { rows: [], status: contractStatus(toStoredStatus(fallbackStatus)), derived: false };
     }
     const statuses = trend.grains.map((grain) => {
       const failed =
@@ -457,7 +443,7 @@ export function deriveStoredResultRows({
         : statuses.every((value) => value === "pass")
         ? "pass"
         : "pending";
-    return { rows: [], status, derived: true };
+    return { rows: [], status: contractStatus(status), derived: true };
   }
   const actualMap = unwrapStoredValues(actual);
   const expectedMap = unwrapStoredValues(expected);
@@ -467,17 +453,17 @@ export function deriveStoredResultRows({
   let rows = names.map((k) => {
     let a = lookupStoredKpiValue(actualMap, k);
     let e = lookupStoredKpiValue(expectedMap, k);
-    if (a == null && isStoredTableValue(actual?.values?.tableData || actual?.tableData)) {
+    if (names.length === 1 && a == null && isStoredTableValue(actual?.values?.tableData || actual?.tableData)) {
       a = actual?.values?.tableData || actual?.tableData;
     }
-    if (e == null && isStoredTableValue(expected?.values?.tableData || expected?.tableData)) {
+    if (names.length === 1 && e == null && isStoredTableValue(expected?.values?.tableData || expected?.tableData)) {
       e = expected?.values?.tableData || expected?.tableData;
     }
     const aN = toNum(a);
     const eN = toNum(e);
     const both = Number.isFinite(aN) && Number.isFinite(eN);
     const diff = both ? aN - eN : null;
-    const deltaPct = both && eN !== 0 ? (diff! / Math.abs(eN)) * 100 : null;
+    const deltaPct = both && eN !== 0 ? ((diff ?? 0) / Math.abs(eN)) * 100 : null;
     const tol = resolveKpiTol(tols, k);
     const diffEntry = storedDiff && typeof storedDiff === "object"
       ? lookupStoredKpiValue(storedDiff, k)
@@ -496,7 +482,7 @@ export function deriveStoredResultRows({
       : evalStoredKpiValue(a, e, tol);
     return { k, a, e, diff, deltaPct, pass, error, skipped: diffEntry?.skipped === true };
   });
-  if (!rows.length) return { rows, status: toStoredStatus(fallbackStatus), derived: false };
+  if (!rows.length) return { rows, status: contractStatus(payloadError ? "fail" : toStoredStatus(fallbackStatus)), derived: payloadError };
   const persistedStatus = toStoredStatus(fallbackStatus);
   const hadUnresolvedRows = rows.some((row) => row.pass == null);
   // Once a result has completed, no configured KPI may remain pending. This
@@ -520,8 +506,8 @@ export function deriveStoredResultRows({
   const calculatedStatus = overallFromStoredKpiRows(rows);
   return {
     rows,
-    status: calculatedStatus,
-    derived: !(persistedStatus === "fail" && hadUnresolvedRows),
+    status: contractStatus(payloadError ? "fail" : calculatedStatus),
+    derived: payloadError || !(persistedStatus === "fail" && hadUnresolvedRows),
   };
 }
 

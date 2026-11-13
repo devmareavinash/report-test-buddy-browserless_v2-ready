@@ -189,6 +189,10 @@ export function assembleDateScript(opts: {
  * Runtime: Browserless /chromium/function — export default async ({ page }) => { ... }
  */
 export default async ({ page }) => {
+  // Phase timing (durations only): login, load, filters, data_ready, extract.
+  const __tm = { login: 0, load: 0, filters: 0, data_ready: 0, extract: 0 };
+  let __tmMark = Date.now();
+  const __tmLap = k => { const n = Date.now(); __tm[k] += n - __tmMark; __tmMark = n; };
 
   // === AUTO-INJECTED SESSION-AWARE AUTH CHECK (do not remove) ===
   const __sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -633,9 +637,11 @@ ${FILTER_CORE_JS}
   const filterCombinations = (typeof __filterCombinations !== 'undefined' && Array.isArray(__filterCombinations) && __filterCombinations.length > 0)
     ? __filterCombinations : [];
 
+  __tmLap('login');
   await waitForDossierReady();
   await runNav();
   await waitForDashboard();
+  __tmLap('load');
 
   if (filterCombinations.length === 0) {
     const out = { navigation: navDebug };
@@ -643,42 +649,44 @@ ${FILTER_CORE_JS}
       const raw = await extractRefreshDate(k);
       out[k] = (raw && raw.value) ? raw.value : null;
     }
+    __tmLap('extract');
+    out.timings = __tm;
     return out;
   }
 
   const results = {};
+  const results_by_id = {};
   for (let i = 0; i < filterCombinations.length; i++) {
-    const { label = String(i), filters = {} } = filterCombinations[i];
+    const { id, label = String(i), filters = {} } = filterCombinations[i];
     if (i > 0) {
       await page.goto(reportUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
       await waitForDossierReady();
       await runNav();
       await waitForDashboard();
+      __tmLap('load');
     }
 
-    const debug = {};
     const GEO_ORDER = ['Team', 'Brand', 'Area', 'Region', 'Territory', 'Time Bucket'];
-    const allKeys = Object.keys(filters);
-    const geoKeys = GEO_ORDER.filter(k => allKeys.includes(k));
-    const otherKeys = allKeys.filter(k => !GEO_ORDER.includes(k));
-    for (const key of geoKeys) {
-      debug[key] = await selectByLabel(key, filters[key]);
-    }
-    for (const key of otherKeys) {
-      debug[key] = await selectByLabel(key, filters[key]);
-    }
-    await closeAnyOpenDropdown();
-    await waitForLoadingToFinish(15000);
+    const verification = await applyFiltersVerified(filters, GEO_ORDER);
+    __tmLap('filters');
     await waitForDashboard();
-
-    const row = { filters_applied: debug };
+    __tmLap('data_ready');
+    const row = { combo_id: id || null, requested_filters: filters, filters_applied: verification.final_state || null, filter_verification: verification };
+    if (!verification.ok) {
+      row.ok = false; row.error = verification.error;
+      if (id) results_by_id[id] = row;
+      if (filterCombinations.filter(c => c.label === label).length === 1) results[label] = row;
+      continue;
+    }
     for (const k of DATE_LABELS) {
       const raw = await extractRefreshDate(k);
       row[k] = (raw && raw.value) ? raw.value : null;
     }
-    results[label] = row;
+    __tmLap('extract');
+    if (id) results_by_id[id] = row;
+    if (filterCombinations.filter(c => c.label === label).length === 1) results[label] = row;
   }
-  return { navigation: navDebug, results };
+  return { navigation: navDebug, results, results_by_id, timings: __tm };
 };
 `;
 }

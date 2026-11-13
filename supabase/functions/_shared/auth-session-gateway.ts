@@ -37,11 +37,12 @@ async function resolveCredentialProfileId(
   if (!scenarioId) return null;
   try {
     const sb = getSupabaseForRequest(req);
-    const { data: script } = await fetchCanonicalScript(
+    const { data: scriptRow } = await fetchCanonicalScript(
       sb,
       scenarioId,
       "credential_profile_id, reference_credential_profile_id",
     );
+    const script = scriptRow as { credential_profile_id?: string | null; reference_credential_profile_id?: string | null } | null;
     const { data: scenario } = await sb.from("scenarios")
       .select("reports(credential_profile_id, reference_credential_profile_id)")
       .eq("id", scenarioId)

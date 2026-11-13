@@ -14,7 +14,7 @@ export type UnexecutedReason =
 
 export type UnexecutedSpec = {
   runId: string;
-  scenarios: Array<{ id: string; criticality?: string | null }>;
+  scenarios: Array<{ id: string; criticality?: string | null; combo_id?: string; label?: string; filters?: Record<string, any> }>;
   /** scenario_ids that already have at least one test_results row */
   accountedIds: Set<string>;
   reason: UnexecutedReason;
@@ -26,7 +26,7 @@ export function pickUnexecutedStatus(reason: UnexecutedReason): string {
   if (reason === "auth_failure") return "auth_failure";
   if (reason === "browserless_timeout") return "browserless_timeout";
   if (reason === "blocked") return "browserless_timeout"; // infra-class blocked
-  return "cancelled"; // not_started → persisted as cancelled+not_executed category
+  return "pending"; // Missing work must not masquerade as deliberate cancellation.
 }
 
 export function buildUnexecutedRows(spec: UnexecutedSpec): Array<Record<string, unknown>> {
@@ -38,13 +38,14 @@ export function buildUnexecutedRows(spec: UnexecutedSpec): Array<Record<string, 
   const detail = spec.detail || failureCategory;
   const rows: Array<Record<string, unknown>> = [];
   for (const s of spec.scenarios) {
-    if (spec.accountedIds.has(s.id)) continue;
+    if (spec.accountedIds.has(`${s.id}:${s.combo_id || "__single__"}`) || (!s.combo_id && spec.accountedIds.has(s.id))) continue;
     rows.push({
       run_id: spec.runId,
       scenario_id: s.id,
       status,
-      expected: { error: detail, reason: failureCategory, unexecuted: true },
+      expected: { combo_id: s.combo_id || null, filter: s.label || null, error: detail, reason: failureCategory, unexecuted: true },
       actual: {
+        combo_id: s.combo_id || null, requested_filters: s.filters || {},
         error: detail,
         execution: {
           status,

@@ -8,6 +8,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { StatusChip } from "@/components/StatusChip";
 import { Link } from "react-router-dom";
+import { collectPages } from "@/lib/paginatedQuery";
 import { fetchFilterMatrixByScenarioIds, fetchLatestRunResultsByScenarioIds, overallStatusFromComboPairs, pairCombosWithResults } from "@/lib/latestTestResults";
 import { Button } from "@/components/ui/button";
 import { Download } from "lucide-react";
@@ -107,10 +108,9 @@ export default function Tests() {
   const { data, isLoading } = useQuery({
     queryKey: ["tests-overview"],
     queryFn: async () => {
-      const scenarios = (await supabase
-        .from("scenarios")
+      const scenarios: any[] = await collectPages((start, end) => supabase.from("scenarios")
         .select("id, title, status, criticality, type, report_id, reports(id, name, workstream_id, workstreams(id, name))")
-        .limit(1000)).data ?? [];
+        .order("id").range(start, end));
       const ids = scenarios.map((s: any) => s.id);
       const latestByScenario = await fetchLatestRunResultsByScenarioIds(
         ids,

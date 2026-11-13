@@ -6,6 +6,7 @@
 //
 // This is what runs inside the backend Docker image.
 
+
 const handlers = new Map<string, (req: Request) => Response | Promise<Response>>();
 let currentName = "";
 
@@ -31,6 +32,7 @@ const FUNCTIONS = [
   "script-agent-chat",
   "bootstrap-admin",
   "playwright-runtime",
+  "headless-trace",
   "run-warehouse-sql",
   "schedule-tick",
   "test-warehouse-connectivity",
@@ -56,6 +58,7 @@ async function resolveFunctionsDir(): Promise<URL> {
 }
 
 const functionsDir = await resolveFunctionsDir();
+const { executionHealth } = await import(new URL("_shared/backend-health.ts", functionsDir).href);
 
 for (const name of FUNCTIONS) {
   currentName = name;
@@ -70,7 +73,7 @@ currentName = "";
 
 // Agent chat needs extra npm packages that a corporate proxy may block; it must
 // not stop test execution from starting.
-const OPTIONAL = new Set(["script-agent-chat"]);
+const OPTIONAL = new Set(["script-agent-chat", "headless-trace"]);
 const missingRequired = FUNCTIONS.filter((n) => !handlers.has(n) && !OPTIONAL.has(n));
 if (missingRequired.length) {
   throw new Error(
@@ -86,24 +89,12 @@ for (const n of OPTIONAL) {
 {
   const pw = handlers.get("playwright-runtime");
   if (pw) {
-    const gatewayCandidates = [
-      new URL("../supabase/functions/_shared/auth-session-gateway.ts", import.meta.url),
-      new URL("./functions/_shared/auth-session-gateway.ts", import.meta.url),
-    ];
-    let wrapped = false;
-    for (const candidate of gatewayCandidates) {
-      try {
-        const { withPlaywrightAuthSession } = await import(candidate.href);
-        handlers.set("playwright-runtime", withPlaywrightAuthSession(pw));
-        console.log("[wrapped] playwright-runtime auth-session reuse");
-        wrapped = true;
-        break;
-      } catch {
-        /* try next path (local repo vs Docker FUNCTIONS_DIR layout) */
-      }
-    }
-    if (!wrapped) {
-      console.warn("[warning] auth-session gateway unavailable — playwright-runtime runs without session reuse");
+    try {
+      const { withPlaywrightAuthSession } = await import(new URL("_shared/auth-session-gateway.ts", functionsDir).href);
+      handlers.set("playwright-runtime", withPlaywrightAuthSession(pw));
+      console.log("[wrapped] playwright-runtime auth-session reuse");
+    } catch (e) {
+      console.warn("[warning] auth-session gateway unavailable — playwright-runtime runs without session reuse:", e);
     }
   }
 }
@@ -118,13 +109,9 @@ Deno.serve({ port: PORT }, async (req) => {
   const url = new URL(req.url);
 
   if (url.pathname === "/healthz") {
-    const ready = handlers.size === FUNCTIONS.length;
-    return new Response(JSON.stringify({
-      ok: ready,
-      loaded_functions: handlers.size,
-      expected_functions: FUNCTIONS.length,
-    }), {
-      status: ready ? 200 : 503,
+    const health = executionHealth(FUNCTIONS, new Set(handlers.keys()), OPTIONAL);
+    return new Response(JSON.stringify(health), {
+      status: health.ok ? 200 : 503,
       headers: { "content-type": "application/json" },
     });
   }

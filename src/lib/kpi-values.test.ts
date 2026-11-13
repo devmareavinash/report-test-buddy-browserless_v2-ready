@@ -1,422 +1,538 @@
-import { describe, expect, it } from "vitest";
-import { configuredKpiNames, deriveStoredResultRows, deriveStoredResultStatus, isKpiValueNoise, lookupStoredKpiValue, resolveKpiTol, storedKpiSpec, storedKpiTolerances, toStoredTableModel, unwrapStoredValues } from "./kpi-values";
+import { deriveExecutionOutcome, executionErrors, outcomeStatus } from "../../supabase/functions/_shared/execution-status";
+import { compareTables } from "./tableCompare";
+import { pickTrendView } from "./trend-payload";
 
-describe("lookupStoredKpiValue", () => {
-  it("uses a legacy Row Count KPI when the configured KPI is Count", () => {
-    const values = {
-      "Row Count - View My HCO List": 3174,
-    };
+/** Shared unwrap + noise filter for stored test_results actual/expected. */
 
-    expect(lookupStoredKpiValue(values, "Count")).toBe(3174);
-  });
+export const KPI_VALUE_NOISE = new Set([
+  "comboid", "combinationid", "requestedfilters", "executionstatus", "filterverification", "createdat", "runid", "resultid", "error", "message", "filter", "filters", "filters_applied", "source", "where_clause",
+  "sql", "row", "metric", "value", "values", "ok", "note", "screenshot",
+  "tabledata", "showdata", "showdatadebug", "showdataerror", "showdataopen",
+  "extractvia", "firstcol0", "selectedgrain", "timegrainclick", "grainretries",
+  "headers", "periods", "missing", "unparsedperiods", "consecutive", "trenderror",
+  "timegrain", "grains", "navigation", "tabledatarejected",
+  // Keep this aligned with KPI_META_KEYS in ScenarioDetail.tsx. When the two drift,
+  // the Runs page renders bookkeeping fields (time_bucket, area, region, ...) as
+  // phantom KPI rows that sit at "pending" and drag the overall result to fail,
+  // while the Latest result tab -- which filters them -- shows pass.
+  "timebucket", "area", "region", "territory", "charttitle", "mstrerrordismissed",
+  "dossierready", "timegrainretry", "via", "role", "nth", "selector", "locator",
+  "snapshot", "clicked", "opened", "option", "clickedtext", "jobid",
+  "provider", "screenshotb64", "liveurl", "requestedmode", "fallbackreason",
+]);
 
-  it("does not guess when multiple legacy row-count KPIs are present", () => {
-    const values = {
-      "Row Count - A": 10,
-      "Row Count - B": 20,
-    };
+export function normKpiKey(k: string) {
+  return String(k || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
 
-    expect(lookupStoredKpiValue(values, "Count")).toBeUndefined();
-  });
+export function isKpiValueNoise(k: string) {
+  const raw = String(k || "");
+  if (!raw || raw.startsWith("__")) return true;
+  const normalized = normKpiKey(raw);
+  if (KPI_VALUE_NOISE.has(normalized)) return true;
+  // Playwright extractors often append readiness/debug metadata to the KPI
+  // name itself (for example "Row Count - ..._grid_ready"). It is runtime
+  // bookkeeping, never a second KPI.
+  return normalized.endsWith("gridready");
+}
 
-  it("filters KPI-suffixed grid readiness metadata", () => {
-    const key = "Row Count - Which accounts are purchasing Kerendia for first time?_grid_ready";
+export function unwrapStoredValues(side: any): Record<string, any> {
+  if (!side || typeof side !== "object") return {};
+  const raw = (side.values && typeof side.values === "object" && !Array.isArray(side.values))
+    ? side.values
+    : side;
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (isKpiValueNoise(k)) continue;
+    out[k] = v;
+  }
+  return out;
+}
 
-    expect(isKpiValueNoise(key)).toBe(true);
-    expect(unwrapStoredValues({
-      values: {
-        "Row Count - Which accounts are purchasing Kerendia for first time?": 7,
-        [key]: true,
-      },
-    })).toEqual({
-      "Row Count - Which accounts are purchasing Kerendia for first time?": 7,
-    });
-  });
+export function lookupStoredKpiValue(map: Record<string, any>, name: string): any {
+  if (map[name] !== undefined) return map[name];
+  const want = normKpiKey(name);
+  const exact = Object.keys(map).find((key) => normKpiKey(key) === want);
+  if (exact) return map[exact];
+  if (want === "count") {
+    const rowCounts = Object.keys(map).filter((key) =>
+      /^rowcount/.test(normKpiKey(key))
+    );
+    if (rowCounts.length === 1) return map[rowCounts[0]];
+  }
+  return undefined;
+}
 
-  it("matches KPI names while ignoring case and punctuation", () => {
-    expect(lookupStoredKpiValue({ nbrx_total: 42 }, "NBRx Total")).toBe(42);
-  });
-});
+export function configuredKpiNames(spec: any): string[] {
+  if (!spec || typeof spec !== "object") return [];
+  if (Array.isArray(spec.kpis)) {
+    const configured = spec.kpis
+      .map((k: any) => String(k?.label || k?.name || k || "").trim())
+      .filter((k: string) => k && !isKpiValueNoise(k));
+    if (configured.length) return configured;
+  }
+  const tols = spec.kpi_tolerances && typeof spec.kpi_tolerances === "object"
+    ? Object.keys(spec.kpi_tolerances).filter((k) => k && !isKpiValueNoise(k))
+    : [];
+  if (tols.length) return tols;
+  return [];
+}
 
-describe("stored KPI tolerances", () => {
-  it("shows a structured result under its configured KPI alias", () => {
-    const table = { columns: ["Metric", "Value"], rows: [["TRx", 42]] };
-    const result = deriveStoredResultRows({
-      actual: {
-        values: { "Segment Summary": table },
-        structured_source_keys: { "Segment Summary": "tableData" },
-        tolerances_snapshot: {
-          "Segment Summary": { value: 0, unit: "pct", op: "eq" },
-        },
-      },
-      expected: { values: { "Segment Summary": table } },
-      fallbackStatus: "fail",
-    });
+function cleanKpiTolerances(tols: any): Record<string, any> {
+  if (!tols || typeof tols !== "object" || Array.isArray(tols)) return {};
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(tols)) {
+    if (!k || isKpiValueNoise(k)) continue;
+    out[k] = v;
+  }
+  return out;
+}
 
-    expect(result.rows.map((row) => row.k)).toEqual(["Segment Summary"]);
-    expect(result.status).toBe("pass");
-  });
+export function storedKpiTolerances(actual: any, spec: any): Record<string, any> {
+  const snapshot = cleanKpiTolerances(actual?.tolerances_snapshot);
+  if (Object.keys(snapshot).length) return snapshot;
+  return cleanKpiTolerances(spec?.kpi_tolerances);
+}
 
-  it("prefers the saved run snapshot over current scenario tolerances", () => {
-    const actual = {
-      tolerances_snapshot: {
-        "Old KPI": { value: 5, unit: "pct", op: "lte" },
-      },
-    };
-    const spec = {
-      kpi_tolerances: {
-        "New KPI": { value: 1, unit: "abs", op: "gte" },
-      },
-    };
+export function storedKpiSpec(actual: any, spec: any): any {
+  return {
+    ...(spec && typeof spec === "object" ? spec : {}),
+    kpi_tolerances: storedKpiTolerances(actual, spec),
+  };
+}
 
-    expect(storedKpiTolerances(actual, spec)).toEqual(actual.tolerances_snapshot);
-    expect(configuredKpiNames(storedKpiSpec(actual, spec))).toEqual(["Old KPI"]);
-  });
+export type KpiCompareOp = "eq" | "lte" | "gte" | "gt" | "lt";
 
-  it("falls back to current scenario tolerances when no snapshot exists", () => {
-    const spec = {
-      kpi_tolerances: {
-        "Current KPI": { value: 2, unit: "pct", op: "eq" },
-      },
-    };
+function toNum(v: any): number {
+  if (v === null || v === undefined) return NaN;
+  if (typeof v === "number") return v;
+  const n = Number(String(v).replace(/[,\s%$]/g, ""));
+  return Number.isFinite(n) ? n : NaN;
+}
 
-    expect(storedKpiTolerances({}, spec)).toEqual(spec.kpi_tolerances);
-    expect(configuredKpiNames(storedKpiSpec({}, spec))).toEqual(["Current KPI"]);
-  });
+/** Legacy helper for callers that intentionally need one shared condition. */
+export function getGlobalCompareOp(tols: Record<string, any> | undefined): KpiCompareOp {
+  for (const v of Object.values(tols || {})) {
+    const op = v && typeof v === "object" ? v.op : undefined;
+    if (op === "lte" || op === "gte" || op === "gt" || op === "lt" || op === "eq") return op;
+  }
+  return "eq";
+}
 
-  it("does not resurrect a removed KPI from a stale tolerance snapshot", () => {
-    const actual = {
-      tolerances_snapshot: {
-        "Refresh Date": { value: 0, unit: "pct", op: "eq" },
-        "Sales (NBRx)": { value: 0, unit: "pct", op: "eq" },
-      },
-    };
-    const spec = {
-      kpis: ["Sales (NBRx)"],
-      kpi_tolerances: {
-        "Sales (NBRx)": { value: 0, unit: "pct", op: "eq" },
-      },
-    };
+export function resolveKpiTol(tols: Record<string, any> | undefined, name: string): {
+  value: number;
+  unit: string;
+  op: KpiCompareOp;
+} {
+  const map = tols && typeof tols === "object" ? tols : {};
+  let entry = map[name];
+  if (entry == null) {
+    const want = normKpiKey(name);
+    const hit = Object.keys(map).find((k) => normKpiKey(k) === want);
+    entry = hit ? map[hit] : undefined;
+  }
+  const value = typeof entry === "number" ? entry : Number(entry?.value);
+  const op = typeof entry === "object" ? entry?.op : undefined;
+  return {
+    value: Number.isFinite(value) ? value : 0,
+    unit: (typeof entry === "object" && entry?.unit) || "pct",
+    op: op === "lte" || op === "gte" || op === "gt" || op === "lt" || op === "eq" ? op : "eq",
+  };
+}
 
-    expect(configuredKpiNames(storedKpiSpec(actual, spec))).toEqual(["Sales (NBRx)"]);
-  });
+/** Numeric KPI pass/fail matching ScenarioDetail Latest result (`evalPass`). */
+export function evalNumericKpiPass(
+  actual: any,
+  expected: any,
+  tol?: { value?: number; unit?: string; op?: string },
+): boolean | null {
+  if (actual == null || expected == null) return null;
+  const a = toNum(actual);
+  const e = toNum(expected);
+  if (!(Number.isFinite(a) && Number.isFinite(e))) return null;
+  const t = Number.isFinite(Number(tol?.value)) ? Math.abs(Number(tol.value)) : 0;
+  const op = tol?.op || "eq";
+  const allowance = tol?.unit === "abs" ? t : (e === 0 ? t : Math.abs(e) * t / 100);
+  if (op === "lte") return a <= e + allowance;
+  if (op === "gte") return a >= e - allowance;
+  if (op === "gt") return a > e + allowance;
+  if (op === "lt") return a < e - allowance;
+  return Math.abs(a - e) <= allowance;
+}
 
-  it("uses each KPI's own comparison operator", () => {
-    const tols = {
-      A: { value: 0, unit: "pct", op: "lte" },
-      B: { value: 0, unit: "pct", op: "gte" },
-    };
+const DATE_VALUE_RE = new RegExp(
+  [
+    String.raw`\d{1,2}\s*[\/.\-]\s*\d{1,2}\s*[\/.\-]\s*\d{2,4}`,
+    String.raw`[A-Za-z]{3,9}\.?\s+\d{1,2}\s*[-,]?\s*\d{2,4}`,
+    String.raw`\d{1,2}\s+[A-Za-z]{3,9}\.?\s*[-,]?\s*\d{2,4}`,
+    String.raw`\d{4}-\d{2}-\d{2}`,
+  ].join("|"),
+  "i",
+);
 
-    expect(resolveKpiTol(tols, "A").op).toBe("lte");
-    expect(resolveKpiTol(tols, "B").op).toBe("gte");
-  });
-});
+export const looksLikeStoredDateValue = (v: any): boolean =>
+  typeof v === "string" && !!v.trim() && DATE_VALUE_RE.test(v.trim());
 
-describe("deriveStoredResultStatus", () => {
-  it("derives pass from stored values even when the persisted row status is stale fail", () => {
-    expect(deriveStoredResultStatus({
-      actual: {
-        values: { Count: 3178, area: "East", time_bucket: "QTD" },
-        tolerances_snapshot: { Count: { value: 0, unit: "pct", op: "eq" } },
-      },
-      expected: { values: { Count: 3178 } },
-      fallbackStatus: "fail",
-    })).toBe("pass");
-  });
+export const normalizeStoredDateText = (v: any) =>
+  String(v ?? "").replace(/\s+/g, " ").replace(/\s*[-,]\s*/g, " ").trim().toLowerCase();
 
-  it("uses normalized and legacy row-count lookup for derived status", () => {
-    expect(deriveStoredResultStatus({
-      actual: {
-        values: { "Row Count - View My HCO List": 3026 },
-        tolerances_snapshot: { Count: { value: 0, unit: "pct", op: "eq" } },
-      },
-      expected: { values: { count: 3026 } },
-      fallbackStatus: "fail",
-    })).toBe("pass");
-  });
+const MONTH_INDEX: Record<string, number> = {
+  jan: 0, january: 0,
+  feb: 1, february: 1,
+  mar: 2, march: 2,
+  apr: 3, april: 3,
+  may: 4,
+  jun: 5, june: 5,
+  jul: 6, july: 6,
+  aug: 7, august: 7,
+  sep: 8, sept: 8, september: 8,
+  oct: 9, october: 9,
+  nov: 10, november: 10,
+  dec: 11, december: 11,
+};
 
-  it("canonicalizes legacy row-count fallback names even without a snapshot", () => {
-    expect(deriveStoredResultStatus({
-      actual: { values: { "Row Count - View My HCO List": 3026 } },
-      expected: { values: { count: 3026 } },
-      fallbackStatus: "fail",
-    })).toBe("pass");
-  });
+function utcDateValue(year: number, month: number, day: number): number | null {
+  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return null;
+  const ts = Date.UTC(year, month, day);
+  const d = new Date(ts);
+  return d.getUTCFullYear() === year && d.getUTCMonth() === month && d.getUTCDate() === day ? ts : null;
+}
 
-  it("keeps true execution errors failed", () => {
-    expect(deriveStoredResultStatus({
-      actual: { error: "missing FE-to-BE filter mapping" },
-      expected: { error: "missing_filter_mapping" },
-      fallbackStatus: "pending",
-    })).toBe("fail");
-  });
+export function parseStoredDateValue(v: any): number | null {
+  if (!looksLikeStoredDateValue(v)) return null;
+  const raw = String(v ?? "").trim();
+  const yearFirst = raw.match(/^(\d{4})\s*-\s*(\d{1,2})\s*-\s*(\d{1,2})$/);
+  if (yearFirst) return utcDateValue(Number(yearFirst[1]), Number(yearFirst[2]) - 1, Number(yearFirst[3]));
 
-  it("keeps a KPI failed when its stored diff records no extracted value", () => {
-    const result = deriveStoredResultRows({
-      actual: {
-        values: { Count: null },
-        tolerances_snapshot: {
-          Count: { value: 0, unit: "pct", op: "eq" },
-        },
-      },
-      expected: { values: { Count: null } },
-      diff: { Count: { error: "no_value" } },
-      fallbackStatus: "fail",
-    });
+  const numeric = raw.match(/^(\d{1,2})\s*[\/.\-]\s*(\d{1,2})\s*[\/.\-]\s*(\d{2,4})$/);
+  if (numeric) {
+    const [, m, d, y] = numeric;
+    return utcDateValue(Number(y.length === 2 ? `20${y}` : y), Number(m) - 1, Number(d));
+  }
 
-    expect(result.status).toBe("fail");
-    expect(result.rows).toEqual([
-      expect.objectContaining({ k: "Count", pass: false, error: "no_value" }),
-    ]);
-  });
+  const monthFirst = raw.match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2})\s*[-,]?\s*(\d{2,4})$/);
+  if (monthFirst) {
+    const month = MONTH_INDEX[monthFirst[1].toLowerCase()];
+    return utcDateValue(Number(monthFirst[3].length === 2 ? `20${monthFirst[3]}` : monthFirst[3]), month, Number(monthFirst[2]));
+  }
 
-  it("does not treat grid-readiness diagnostics as a structured KPI value", () => {
-    const diagnostics = {
-      rows: 25,
-      cells: 230,
-      frame_url: "https://example.test/report",
-      textLength: 1535,
-      fingerprint: "25|230|1535|1397|375",
-      stable_polls: 3,
-    };
-    const result = deriveStoredResultRows({
-      actual: {
-        values: { Count: null },
-        tolerances_snapshot: {
-          Count: { value: 0, unit: "pct", op: "eq" },
-        },
-      },
-      expected: { values: { Count: diagnostics } },
-      diff: { Count: { error: "no_value" } },
-      fallbackStatus: "fail",
-    });
+  const dayFirst = raw.match(/^(\d{1,2})\s+([A-Za-z]{3,9})\.?\s*[-,]?\s*(\d{2,4})$/);
+  if (dayFirst) {
+    const month = MONTH_INDEX[dayFirst[2].toLowerCase()];
+    return utcDateValue(Number(dayFirst[3].length === 2 ? `20${dayFirst[3]}` : dayFirst[3]), month, Number(dayFirst[1]));
+  }
+  return null;
+}
 
-    expect(toStoredTableModel(diagnostics)).toBeNull();
-    expect(result.rows[0]).toEqual(expect.objectContaining({
-      k: "Count",
-      a: null,
-      e: diagnostics,
-      pass: false,
-      error: "no_value",
-    }));
-  });
+export function evalStoredDatePass(
+  actual: any,
+  expected: any,
+  tol?: { value?: number; unit?: string; op?: string },
+): boolean | null {
+  const a = parseStoredDateValue(actual);
+  const e = parseStoredDateValue(expected);
+  if (a == null || e == null) {
+    return normalizeStoredDateText(actual) === normalizeStoredDateText(expected);
+  }
+  const op = tol?.op || "eq";
+  const dayMs = 24 * 60 * 60 * 1000;
+  const allowance = Number.isFinite(Number(tol?.value))
+    ? Math.abs(Number(tol?.value)) * (tol?.unit === "abs" ? dayMs : 0)
+    : 0;
+  if (op === "lte") return a <= e + allowance;
+  if (op === "gte") return a >= e - allowance;
+  if (op === "gt") return a > e + allowance;
+  if (op === "lt") return a < e - allowance;
+  return Math.abs(a - e) <= allowance;
+}
 
-  it("preserves a legacy persisted failure when KPI values and diff details are missing", () => {
-    const result = deriveStoredResultRows({
-      actual: {
-        values: { Count: null },
-        tolerances_snapshot: {
-          Count: { value: 0, unit: "pct", op: "eq" },
-        },
-      },
-      expected: { values: { Count: null } },
-      fallbackStatus: "fail",
-    });
-
-    expect(result.status).toBe("fail");
-    expect(result.derived).toBe(false);
-    expect(result.rows).toEqual([
-      expect.objectContaining({ k: "Count", pass: false }),
-    ]);
-  });
-
-  it("does not treat informational messages as errors when KPI values are present", () => {
-    expect(deriveStoredResultStatus({
-      actual: {
-        message: "scrape completed",
-        values: { Count: 12 },
-        tolerances_snapshot: { Count: { value: 0, unit: "pct", op: "eq" } },
-      },
-      expected: { values: { Count: 12 } },
-      fallbackStatus: "fail",
-    })).toBe("pass");
-  });
-
-  it("respects each KPI's own operator while deriving status", () => {
-    expect(deriveStoredResultStatus({
-      actual: {
-        values: { A: 9, B: 11 },
-        tolerances_snapshot: {
-          A: { value: 0, unit: "pct", op: "lte" },
-          B: { value: 0, unit: "pct", op: "gte" },
-        },
-      },
-      expected: { values: { A: 10, B: 10 } },
-      fallbackStatus: "fail",
-    })).toBe("pass");
-  });
-
-  it("uses comparison operators for stored date KPI values", () => {
-    expect(deriveStoredResultStatus({
-      actual: {
-        values: {
-          "Claims ME": "Jun 30 - 2026",
-          "Sales (NBRx)": "Aug 21 - 2026",
-          "Call Activity WE": "Sep 18 - 2026",
-          "Sales (NRx & TRx)": "Sep 04 - 2026",
-        },
-        tolerances_snapshot: {
-          "Claims ME": { value: 0, unit: "pct", op: "lte" },
-          "Sales (NBRx)": { value: 0, unit: "pct", op: "lte" },
-          "Call Activity WE": { value: 0, unit: "pct", op: "lte" },
-          "Sales (NRx & TRx)": { value: 0, unit: "pct", op: "lte" },
-        },
-      },
-      expected: {
-        values: {
-          "Claims ME": "Jun 30 - 2026",
-          "Sales (NBRx)": "Aug 28 - 2026",
-          "Call Activity WE": "Sep 25 - 2026",
-          "Sales (NRx & TRx)": "Sep 11 - 2026",
-        },
-      },
-      fallbackStatus: "fail",
-    })).toBe("pass");
-  });
-
-  it("fails stored date KPI values that violate comparison operators", () => {
-    expect(deriveStoredResultStatus({
-      actual: {
-        values: { "Sales (NBRx)": "Aug 28 - 2026" },
-        tolerances_snapshot: {
-          "Sales (NBRx)": { value: 0, unit: "pct", op: "lt" },
-        },
-      },
-      expected: { values: { "Sales (NBRx)": "Aug 28 - 2026" } },
-      fallbackStatus: "pass",
-    })).toBe("fail");
-  });
-
-  it("derives a passing trend status when every stored grain is consecutive", () => {
-    expect(deriveStoredResultStatus({
-      actual: {
-        values: {
-          grains: {
-            Weekly: { periods: ["06-26", "07-03"], missing: [], consecutive: true },
-            Monthly: { periods: ["Aug-26", "Sep-26"], missing: [], consecutive: true },
-            Quarterly: { periods: ["Q1-26", "Q2-26"], missing: [], consecutive: true },
-          },
-        },
-      },
-      scenarioType: "trend",
-      fallbackStatus: "pending",
-    })).toBe("pass");
-  });
-
-  it("explains a persisted failure when one reference KPI was not extracted", () => {
-    const result = deriveStoredResultRows({
-      actual: { values: { BHID: "BH12603848", "Last Call Date": "Jul 08 - 2026" } },
-      expected: { values: { BHID: "BH12603848", "Last Call Date": null } },
-      spec: {
-        kpi_tolerances: {
-          BHID: { value: 0, unit: "pct", op: "eq" },
-          "Last Call Date": { value: 0, unit: "pct", op: "eq" },
-        },
-      },
-      fallbackStatus: "fail",
-    });
-
-    expect(result.status).toBe("fail");
-    expect(result.rows.find((row) => row.k === "Last Call Date")).toMatchObject({
-      pass: false,
-      error: "no_expected_value",
-    });
-  });
-
-  it("rejects a legacy persisted pass when reference values are missing", () => {
-    const result = deriveStoredResultRows({
-      actual: { values: { City: "Travis Afb", BHOID: "BHO3057915" } },
-      expected: { values: { City: null, BHOID: null } },
-      spec: {
-        kpis: ["City", "BHOID"],
-        kpi_tolerances: {
-          City: { value: 0, unit: "pct", op: "eq" },
-          BHOID: { value: 0, unit: "pct", op: "eq" },
-        },
-      },
-      fallbackStatus: "pass",
-    });
-
-    expect(result.status).toBe("fail");
-    expect(result.rows.every((row) =>
-      row.pass === false && row.error === "no_expected_value"
-    )).toBe(true);
-  });
-
-  it("rejects a legacy persisted pass when both KPI values are missing", () => {
-    const result = deriveStoredResultRows({
-      actual: { values: { "Account Name": null } },
-      expected: { values: { "Account Name": null } },
-      spec: {
-        kpis: ["Account Name"],
-        kpi_tolerances: {
-          "Account Name": { value: 0, unit: "pct", op: "eq" },
-        },
-      },
-      fallbackStatus: "pass",
-    });
-
-    expect(result.status).toBe("fail");
-    expect(result.rows[0]).toMatchObject({ pass: false, error: "no_value" });
-  });
-
-  it("fails a blank KPI even when another KPI already makes the result fail", () => {
-    const result = deriveStoredResultRows({
-      actual: { values: { "Physician Name": null, "NBRx Total": 7 } },
-      expected: { values: { "Physician Name": null, "NBRx Total": 5 } },
-      spec: {
-        kpis: ["Physician Name", "NBRx Total"],
-        kpi_tolerances: {
-          "Physician Name": { value: 0, unit: "pct", op: "eq" },
-          "NBRx Total": { value: 0, unit: "pct", op: "eq" },
-        },
-      },
-      fallbackStatus: "fail",
-    });
-
-    expect(result.status).toBe("fail");
-    expect(result.rows.find((row) => row.k === "Physician Name")).toMatchObject({
-      pass: false,
-      error: "no_value",
-    });
-  });
-
-  it("treats a deliberately skipped blank MSTR KPI as passing", () => {
-    const result = deriveStoredResultRows({
-      actual: { values: { "Blink TRx": null } },
-      expected: { values: { "Blink TRx": null } },
-      diff: { "Blink TRx": { skipped: true, pass: true, reason: "not_present_in_mstr" } },
-      spec: {
-        kpi_tolerances: {
-          "Blink TRx": { value: 0, unit: "pct", op: "eq" },
-        },
-      },
-      fallbackStatus: "pass",
-    });
-
-    expect(result.status).toBe("pass");
-    expect(result.rows[0]).toMatchObject({ k: "Blink TRx", pass: true, skipped: true });
-  });
-
-  it("maps terminal execution statuses to fail instead of pending", () => {
-    for (const status of ["partial_extraction", "auth_failure", "browserless_timeout", "cancelled"]) {
-      const result = deriveStoredResultRows({
-        actual: { values: { "Physician Name": "A", "Top 10 Payers - NBRx": null } },
-        expected: { values: { "Physician Name": "A", "Top 10 Payers - NBRx": { columns: ["x"], rows: [["1"]] } } },
-        diff: {
-          "Top 10 Payers - NBRx": { error: "no_value" },
-          __execution: { failure_category: status, missing_fields: ["Top 10 Payers - NBRx"] },
-        },
-        spec: {
-          kpi_tolerances: {
-            "Physician Name": { value: 0, unit: "pct", op: "eq" },
-            "Top 10 Payers - NBRx": { value: 0, unit: "pct", op: "eq" },
-          },
-        },
-        fallbackStatus: status,
-      });
-      expect(result.status).toBe("fail");
-      expect(result.rows.find((r) => r.k === "Top 10 Payers - NBRx")?.pass).toBe(false);
+function recordsToTable(records: any[]): { columns: string[]; rows: any[][] } | null {
+  if (!records?.length || typeof records[0] !== "object" || Array.isArray(records[0])) return null;
+  const columns: string[] = [];
+  for (const rec of records) {
+    for (const k of Object.keys(rec || {})) {
+      const n = normKpiKey(k);
+      if (n === "via" || k.startsWith("__") || /^col\d+$/i.test(k)) continue;
+      if (!columns.includes(k)) columns.push(k);
     }
+  }
+  if (!columns.length) return null;
+  return { columns, rows: records.map((rec) => columns.map((c) => rec?.[c] ?? "")) };
+}
+
+function columnLabel(c: any, i: number) {
+  if (c == null) return `Col ${i + 1}`;
+  if (typeof c === "string" || typeof c === "number") return String(c);
+  return String(c.name || c.label || c.title || c.key || `Col ${i + 1}`);
+}
+
+export function toStoredTableModel(v: any): { columns: string[]; rows: any[][] } | null {
+  if (v == null || typeof v === "boolean" || typeof v === "number" || typeof v === "string") return null;
+  if (Array.isArray(v)) {
+    if (!v.length) return null;
+    if (typeof v[0] === "object" && v[0] && !Array.isArray(v[0])) return recordsToTable(v);
+    if (Array.isArray(v[0])) {
+      const first = v[0].map((c: any, i: number) => columnLabel(c, i));
+      return { columns: first, rows: v.slice(1) };
+    }
+    return { columns: ["Value"], rows: v.map((cell) => [cell]) };
+  }
+  if (typeof v !== "object") return null;
+  const nested = [v.data, v.grid, v.graph, v.table, v.tableData, v.tabledata, v.dataset]
+    .find((x) => x && (Array.isArray(x) || typeof x === "object"));
+  if (nested && nested !== v) {
+    const inner = toStoredTableModel(nested);
+    if (inner) return inner;
+  }
+  if (Array.isArray(v.rows)) {
+    if (v.rows[0] && typeof v.rows[0] === "object" && !Array.isArray(v.rows[0])) return recordsToTable(v.rows);
+    if (Array.isArray(v.rows[0])) {
+      const rawCols = Array.isArray(v.headers)
+        ? (v.headers as any[]).map(columnLabel)
+        : Array.isArray(v.columns) ? (v.columns as any[]).map(columnLabel) : null;
+      const keep = (rawCols || []).map((h, i) => {
+        if (i === 0 && /^col_?\d+$/i.test(h) && (v.rows || []).some((r: any) => r?.[0] && !/^[\d,.%()\s-]+$/.test(String(r[0])))) return "Metric";
+        return /^col_?\d+$/i.test(h) ? null : h;
+      });
+      const cols = keep.filter((h): h is string => !!h);
+      const idx = keep.map((h, i) => (h ? i : -1)).filter((i) => i >= 0);
+      if (cols.length) return { columns: cols, rows: (v.rows as any[][]).map((row) => idx.map((i) => row?.[i])) };
+      return toStoredTableModel(v.rows);
+    }
+  }
+  return null;
+}
+
+export function isStoredTableValue(v: any): boolean {
+  return !!toStoredTableModel(v);
+}
+
+export type StoredResultStatus = "pass" | "fail" | "pending";
+
+export type StoredResultKpiRow = {
+  k: string;
+  a: any;
+  e: any;
+  diff: number | null;
+  deltaPct: number | null;
+  pass: boolean | null;
+  error?: string | null;
+  skipped?: boolean;
+};
+
+export function evalStoredKpiValue(
+  actual: any,
+  expected: any,
+  tol?: { value?: number; unit?: string; op?: string },
+): boolean | null {
+  if (actual == null || expected == null) return null;
+  const actualTable = toStoredTableModel(actual);
+  const expectedTable = toStoredTableModel(expected);
+  if (actualTable || expectedTable) {
+    if (!actualTable || !expectedTable) return null;
+    return compareTables(
+      actualTable,
+      expectedTable,
+      { value: Number(tol?.value) || 0, unit: (tol?.unit === "abs" ? "abs" : "pct"), op: (tol?.op as any) || "eq" },
+      { skipChangeRows: true },
+    ).pass;
+  }
+  if (looksLikeStoredDateValue(actual) || looksLikeStoredDateValue(expected)) {
+    return evalStoredDatePass(actual, expected, tol);
+  }
+  const numeric = evalNumericKpiPass(actual, expected, tol);
+  if (numeric !== null) return numeric;
+  const a = toNum(actual);
+  const e = toNum(expected);
+  if (Number.isFinite(a) || Number.isFinite(e)) return null;
+  return String(actual) === String(expected);
+}
+
+export function storedResultKpiNames(actual: any, expected: any, spec: any): string[] {
+  const actualMap = unwrapStoredValues(actual);
+  const expectedMap = unwrapStoredValues(expected);
+  // Use the live case configuration to decide which KPI rows are visible.
+  // The run snapshot still supplies historical tolerance values, but it must
+  // not resurrect KPIs that have since been removed from the case.
+  const currentToleranceKpis =
+    spec?.kpi_tolerances && typeof spec.kpi_tolerances === "object"
+      ? Object.keys(spec.kpi_tolerances).filter((k) => k && !isKpiValueNoise(k))
+      : [];
+  const configured = currentToleranceKpis.length
+    ? currentToleranceKpis
+    : configuredKpiNames(spec);
+  const available = [...Object.keys(actualMap), ...Object.keys(expectedMap)].filter((k) => !isKpiValueNoise(k));
+  const configuredHasStoredValue = configured.some((k) =>
+    lookupStoredKpiValue(actualMap, k) !== undefined || lookupStoredKpiValue(expectedMap, k) !== undefined
+  );
+  if (configured.length) return configured;
+  const fallback = Array.from(new Set(available)).filter((k) => !isKpiValueNoise(k));
+  const hasLegacyCountPair =
+    lookupStoredKpiValue(actualMap, "Count") !== undefined &&
+    lookupStoredKpiValue(expectedMap, "Count") !== undefined &&
+    fallback.some((k) => normKpiKey(k) === "count" || /^rowcount/.test(normKpiKey(k)));
+  if (!hasLegacyCountPair) return fallback;
+  return ["Count", ...fallback.filter((k) => {
+    const n = normKpiKey(k);
+    return n !== "count" && !/^rowcount/.test(n);
+  })];
+}
+
+export function overallFromStoredKpiRows(rows: Array<{ pass: boolean | null | undefined }>): StoredResultStatus {
+  if (!rows.length) return "pending";
+  if (rows.some((row) => row.pass === false)) return "fail";
+  if (rows.some((row) => row.pass !== true)) return "pending";
+  return "pass";
+}
+
+function toStoredStatus(status: any): StoredResultStatus {
+  return status === "pass" || status === "fail" || status === "pending" ? status : "pending";
+}
+
+export function deriveStoredResultRows({
+  actual,
+  expected,
+  spec,
+  scenarioType,
+  diff: storedDiff,
+  fallbackStatus,
+}: {
+  actual: any;
+  expected: any;
+  spec?: any;
+  scenarioType?: string;
+  diff?: any;
+  fallbackStatus?: string | null;
+}): {
+  rows: StoredResultKpiRow[];
+  status: StoredResultStatus;
+  derived: boolean;
+} {
+  // A payload error always fails the result, but the values that were
+  // extracted are still shown alongside the error.
+  const payloadError = !!(firstPayloadError(actual) || firstPayloadError(expected) || executionErrors(actual).length || executionErrors(expected).length);
+  const contractStatus = (comparison: StoredResultStatus) => outcomeStatus(deriveExecutionOutcome({ status: fallbackStatus, actual, expected }, comparison));
+  if (payloadError) fallbackStatus = "fail";
+  if (payloadError && String(scenarioType || "").toLowerCase() === "trend") {
+    return { rows: [], status: "fail", derived: true };
+  }
+  if (String(scenarioType || "").toLowerCase() === "trend") {
+    const trend = pickTrendView(
+      actual,
+      actual?.values,
+      actual?.extracted,
+      actual?.extracted?.result,
+      expected,
+      storedDiff,
+    );
+    if (!trend?.grains.length) {
+      return { rows: [], status: contractStatus(toStoredStatus(fallbackStatus)), derived: false };
+    }
+    const statuses = trend.grains.map((grain) => {
+      const failed =
+        grain.consecutive === false ||
+        grain.score === 0 ||
+        grain.missing.length > 0 ||
+        !!grain.trend_error;
+      const passed = grain.consecutive === true || grain.score === 1;
+      return failed ? "fail" : passed ? "pass" : "pending";
+    });
+    const status: StoredResultStatus =
+      statuses.some((value) => value === "fail") || !!trend.trend_error
+        ? "fail"
+        : statuses.every((value) => value === "pass")
+        ? "pass"
+        : "pending";
+    return { rows: [], status: contractStatus(status), derived: true };
+  }
+  const actualMap = unwrapStoredValues(actual);
+  const expectedMap = unwrapStoredValues(expected);
+  const effectiveSpec = storedKpiSpec(actual, spec);
+  const tols = effectiveSpec.kpi_tolerances || {};
+  const names = storedResultKpiNames(actual, expected, spec);
+  let rows = names.map((k) => {
+    let a = lookupStoredKpiValue(actualMap, k);
+    let e = lookupStoredKpiValue(expectedMap, k);
+    if (names.length === 1 && a == null && isStoredTableValue(actual?.values?.tableData || actual?.tableData)) {
+      a = actual?.values?.tableData || actual?.tableData;
+    }
+    if (names.length === 1 && e == null && isStoredTableValue(expected?.values?.tableData || expected?.tableData)) {
+      e = expected?.values?.tableData || expected?.tableData;
+    }
+    const aN = toNum(a);
+    const eN = toNum(e);
+    const both = Number.isFinite(aN) && Number.isFinite(eN);
+    const diff = both ? aN - eN : null;
+    const deltaPct = both && eN !== 0 ? ((diff ?? 0) / Math.abs(eN)) * 100 : null;
+    const tol = resolveKpiTol(tols, k);
+    const diffEntry = storedDiff && typeof storedDiff === "object"
+      ? lookupStoredKpiValue(storedDiff, k)
+      : null;
+    const error = diffEntry && typeof diffEntry === "object" && typeof diffEntry.error === "string"
+      ? diffEntry.error
+      : null;
+    // The orchestrator records explicit KPI failures such as `no_value` in
+    // the diff map. Missing actual/expected values alone compare as pending,
+    // so preserve that execution-time failure instead of contradicting the
+    // persisted row status in Run Detail.
+    const pass = error
+      ? false
+      : diffEntry?.skipped === true
+      ? true
+      : evalStoredKpiValue(a, e, tol);
+    return { k, a, e, diff, deltaPct, pass, error, skipped: diffEntry?.skipped === true };
   });
-});
+  if (!rows.length) return { rows, status: contractStatus(payloadError ? "fail" : toStoredStatus(fallbackStatus)), derived: payloadError };
+  const persistedStatus = toStoredStatus(fallbackStatus);
+  const hadUnresolvedRows = rows.some((row) => row.pass == null);
+  // Once a result has completed, no configured KPI may remain pending. This
+  // must be applied per KPI (not only when the whole result is pending), since
+  // another failed KPI can already make the aggregate status "fail".
+  if (persistedStatus !== "pending") {
+    rows = rows.map((row) => {
+      if (row.pass != null) return row;
+      return {
+        ...row,
+        pass: false,
+        error:
+          row.a == null
+            ? "no_value"
+            : row.e == null
+              ? "no_expected_value"
+              : row.error,
+      };
+    });
+  }
+  const calculatedStatus = overallFromStoredKpiRows(rows);
+  return {
+    rows,
+    status: contractStatus(payloadError ? "fail" : calculatedStatus),
+    derived: payloadError || !(persistedStatus === "fail" && hadUnresolvedRows),
+  };
+}
+
+export function deriveStoredResultStatus(args: Parameters<typeof deriveStoredResultRows>[0]): StoredResultStatus {
+  return deriveStoredResultRows(args).status;
+}
+
+function firstPayloadError(side: any): string {
+  if (!side || typeof side !== "object") return "";
+  const e = side.error;
+  if (typeof e === "string" && e.trim()) return e.trim();
+  const message = side.message;
+  if (typeof message === "string" && message.trim() && !Object.keys(unwrapStoredValues(side)).length) {
+    return message.trim();
+  }
+  return "";
+}
+
+/** RCA text if saved; otherwise the stored run error (same fallback as Latest result history). */
+export function storedRunLog(row: { analysis?: string | null; actual?: any; expected?: any } | null | undefined): string {
+  const rca = String(row?.analysis || "").trim();
+  if (rca) return rca;
+  return firstPayloadError(row?.actual) || firstPayloadError(row?.expected) || "";
+}
+
+export function storedRunLogIsRca(row: { analysis?: string | null } | null | undefined): boolean {
+  return Boolean(String(row?.analysis || "").trim());
+}

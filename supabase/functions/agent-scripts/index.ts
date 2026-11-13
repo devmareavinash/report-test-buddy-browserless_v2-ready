@@ -999,13 +999,10 @@ the same generic loop:
   const allKeys = Object.keys(filters);
   const geoKeys = GEO_ORDER.filter(k => allKeys.includes(k));
   const otherKeys = allKeys.filter(k => !GEO_ORDER.includes(k));
-  for (const key of geoKeys) {
-    debug[key] = await selectByLabel(key, filters[key]);
-  }
-  for (const key of otherKeys) {
-    debug[key] = await selectByLabel(key, filters[key]);
-  }
-  await closeAnyOpenDropdown();
+  const verification = await applyFiltersVerified(filters, GEO_ORDER);
+  if (!verification.ok) return { ok: false, error: verification.error, requested_filters: filters, filter_verification: verification, filters_applied: verification.final_state || null };
+  // Extract only after final observed verification; persist verification.final_state.
+
 
 ═══════════════════════════════════════════════════════
 IN-REPORT NAVIGATION (tabs / screens / sub-tabs / radios)

@@ -1,3 +1,11 @@
+import { verifyFilterEvidence } from "../_shared/filter-verification.ts";
+import { createTimingCollector } from "../_shared/run-timing.ts";
+import { parse } from "npm:acorn@^8.15.0";
+import { instrumentReportTiming } from "../_shared/script-timing.ts";
+import { retryTransient } from "../_shared/transient-retry.ts";
+import { combinationId, matchCombination } from "../_shared/combination-identity.ts";
+import { deriveExecutionOutcome, outcomeCounts } from "../_shared/execution-status.ts";
+import { comboExecutionError, lookupConfiguredKpiValue, pickComboKpis, selectComboNode } from "../_shared/brand-extraction.ts";
 import { corsHeaders } from "../_shared/cors.ts";
 import { getServiceClient, getSupabaseForAccessToken, getSupabaseForRequest, requireAuth } from "../_shared/auth.ts";
 import { internalAuthSource, resolveFunctionAuth, resolveFunctionUrl } from "../_shared/internal-functions.ts";
@@ -28,6 +36,22 @@ import {
 } from "../_shared/extraction-outcome.ts";
 import { missingRequiredStructuredExtraction } from "../_shared/structured-extraction-retry.ts";
 
+async function checkedWrite(query: PromiseLike<any>, context: string) {
+  const result = await query;
+  if (result.error) throw new Error(`${context}: ${errorDetail(result.error)}`);
+  return result;
+}
+
+async function loadCompleteRows(query: (start: number, end: number) => PromiseLike<any>): Promise<any[]> {
+  const rows: any[] = [];
+  for (let start = 0; ; start += 1000) {
+    const response = await query(start, start + 999);
+    if (response.error) throw new Error(`Result accounting query failed: ${errorDetail(response.error)}`);
+    rows.push(...(response.data || []));
+    if (!response.data || response.data.length < 1000) return rows;
+  }
+}
+
 /** Persist explicit not-executed rows so expected work cannot vanish from accounting. */
 async function persistUnexecutedScenarios(
   sb: any,
@@ -38,30 +62,27 @@ async function persistUnexecutedScenarios(
 ): Promise<number> {
   if (!scenarios?.length) return 0;
   const ids = scenarios.map((s) => s.id);
-  const { data: existing, error } = await sb
-    .from("test_results")
-    .select("scenario_id")
-    .eq("run_id", runId)
-    .in("scenario_id", ids);
-  if (error) {
-    jsonLog("unexecuted_account_query_failed", {
-      run_id: runId, error: errorDetail(error).slice(0, 300),
-    });
-    return 0;
-  }
-  const accountedIds = new Set<string>(
-    (existing || []).map((r: any) => String(r.scenario_id)).filter(Boolean),
-  );
-  const rows = buildUnexecutedRows({
-    runId, scenarios, accountedIds, reason, detail,
+  const existing = await loadCompleteRows((start, end) => sb.from("test_results").select("scenario_id,actual,expected,created_at,id").eq("run_id", runId).in("scenario_id", ids).order("id").range(start, end));
+  const matrixData = await loadCompleteRows((start, end) => sb.from("scenario_filter_matrix").select("id,scenario_id,label,filters").in("scenario_id", ids).order("id").range(start, end));
+  const units = scenarios.flatMap(scenario => {
+    const matrix = matrixData.filter((combo: any) => combo.scenario_id === scenario.id);
+    return matrix.length ? matrix.map((combo: any) => ({ ...scenario, combo_id: combo.id, label: combo.label, filters: combo.filters })) : [scenario];
   });
+  const accountedIds = new Set<string>();
+  for (const unit of units) {
+    const rows = (existing || []).filter((row: any) => row.scenario_id === unit.id);
+    if (unit.combo_id ? matchCombination(units.filter((other: any) => other.id === unit.id).map((other: any) => ({ ...other, id: other.combo_id })), { ...unit, id: unit.combo_id }, rows) : rows.length) {
+      accountedIds.add(`${unit.id}:${unit.combo_id || "__single__"}`);
+    }
+  }
+  const rows = buildUnexecutedRows({ runId, scenarios: units, accountedIds, reason, detail });
   if (!rows.length) return 0;
   const { error: insertError } = await sb.from("test_results").insert(rows);
   if (insertError) {
     jsonLog("unexecuted_account_insert_failed", {
       run_id: runId, count: rows.length, error: errorDetail(insertError).slice(0, 300),
     });
-    return 0;
+    throw new Error(`Missing-work insert failed: ${errorDetail(insertError)}`);
   }
   jsonLog("unexecuted_scenarios_accounted", {
     run_id: runId, count: rows.length, reason, detail: detail || null,
@@ -195,13 +216,7 @@ async function retryFinalizationOperation<T>(
   getError: (result: T) => unknown,
   attempts = 3,
 ): Promise<T> {
-  let result!: T;
-  for (let attempt = 1; attempt <= attempts; attempt++) {
-    result = await operation();
-    if (!getError(result) || attempt === attempts) return result;
-    await new Promise((resolve) => setTimeout(resolve, attempt * 150));
-  }
-  return result;
+  return retryTransient(operation, getError, attempts);
 }
 
 async function finalizeChild(sb: any, runId: string, reportId: string, addPass: number, addFail: number, hadError: boolean, errMsg?: string) {
@@ -209,7 +224,8 @@ async function finalizeChild(sb: any, runId: string, reportId: string, addPass: 
     run_id: runId, report_id: reportId, add_pass: addPass, add_fail: addFail,
     had_error: hadError, error: errMsg?.slice(0, 500) || null,
   });
-  const { error } = await retryFinalizationOperation(
+  let rpcResult: any;
+  try { rpcResult = await retryFinalizationOperation(
     () => sb.rpc("finalize_workstream_report", {
       p_run_id: runId,
       p_report_id: reportId,
@@ -219,7 +235,8 @@ async function finalizeChild(sb: any, runId: string, reportId: string, addPass: 
       p_error_message: errMsg || null,
     }),
     (result: any) => result?.error,
-  );
+  ); } catch (error) { rpcResult = { error }; }
+  const error = rpcResult?.error;
   if (!error) {
     jsonLog("child_finalization_completed", { run_id: runId, report_id: reportId, method: "rpc" });
     return;
@@ -264,9 +281,11 @@ async function finalizeChild(sb: any, runId: string, reportId: string, addPass: 
       patch.status = failedReports > 0 ? "failed" : "completed";
       patch.finished_at = new Date().toISOString();
     }
-    const { data: updated, error: updateError } = await sb
-      .from("runs").update(patch).eq("id", runId).eq("status", "running")
-      .filter("summary", "eq", JSON.stringify(summary)).select("id").maybeSingle();
+    const { data: updated, error: updateError } = await retryFinalizationOperation(
+      () => sb.from("runs").update(patch).eq("id", runId).eq("status", "running")
+        .filter("summary", "eq", JSON.stringify(summary)).select("id").maybeSingle(),
+      (result: any) => result?.error,
+    );
     if (updateError) throw new Error(`Failed to finalize workstream report: ${errorDetail(updateError)} (RPC: ${rpcError})`);
     if (updated) {
       jsonLog("child_finalization_completed", {
@@ -470,19 +489,6 @@ function lookupKpiValue(map: Record<string, any> | null | undefined, name: strin
   return undefined;
 }
 
-function lookupConfiguredKpiValue(
-  map: Record<string, any> | null | undefined,
-  name: string,
-  aliases: Record<string, string> | null | undefined,
-): any {
-  const rawName = aliases && typeof aliases === "object" ? aliases[name] : null;
-  if (rawName) {
-    const aliased = lookupKpiValue(map, rawName);
-    if (aliased !== undefined) return aliased;
-  }
-  return lookupKpiValue(map, name);
-}
-
 function lookupKpiTol(tols: Record<string, any> | null | undefined, name: string): any {
   if (!tols || typeof tols !== "object") return undefined;
   if ((tols as any)[name] !== undefined) return (tols as any)[name];
@@ -586,6 +592,7 @@ function isExtractionNoiseKey(k: string): boolean {
 
 function isStructuredVal(v: any): boolean {
   if (v == null || typeof v === "boolean") return false;
+  if (toTableModel(v)) return true;
   if (Array.isArray(v)) return v.length > 0;
   if (typeof v !== "object") return false;
   return Object.entries(v).some(([k, nested]) => {
@@ -679,53 +686,7 @@ function flattenExtractionRoot(c: any): any {
 }
 
 function flattenNodeToKpis(node: any): Record<string, any> {
-  const flat: Record<string, any> = {};
-  if (!node || typeof node !== "object") return flat;
-  // Prefer nested kpis/values envelopes when present.
-  const preferred = [node.kpis, node.values, node.result].find((v) =>
-    v && typeof v === "object" && !Array.isArray(v)
-  );
-  const source = preferred && !isStructuredVal(preferred) ? preferred : node;
-  for (const [k, v] of Object.entries(source)) {
-    if (isExtractionNoiseKey(k)) continue;
-    if (k === "kpis" || k === "values" || k === "result" || k === "results" || k === "extracted") continue;
-    if (v && typeof v === "object") {
-      if (k === "grains" || (Array.isArray(v) && (k === "periods" || k === "missing"))) flat[k] = v;
-      else if (isStructuredVal(v)) flat[k] = v;
-      continue;
-    }
-    flat[k] = v;
-  }
-  return flat;
-}
-
-function resolveComboNode(root: any, comboLabel: string | null): any | null {
-  if (!root || typeof root !== "object") return null;
-  if (!comboLabel) return root;
-  if ((root as any)[comboLabel] && typeof (root as any)[comboLabel] === "object") {
-    return (root as any)[comboLabel];
-  }
-  if ((root as any).results?.[comboLabel] && typeof (root as any).results[comboLabel] === "object") {
-    return (root as any).results[comboLabel];
-  }
-  if ((root as any).kpis?.[comboLabel] && typeof (root as any).kpis[comboLabel] === "object") {
-    return (root as any).kpis[comboLabel];
-  }
-  const want = normComboLabel(comboLabel);
-  for (const [k, v] of Object.entries(root)) {
-    if (isExtractionNoiseKey(k) || String(k).startsWith("__")) continue;
-    if (v && typeof v === "object" && !Array.isArray(v) && normComboLabel(k) === want) return v;
-  }
-  // Single child combo envelope — brand scripts often return one unlabeled block.
-  const children = Object.entries(root).filter(([k, v]) => {
-    if (isExtractionNoiseKey(k) || String(k).startsWith("__")) return false;
-    if (!v || typeof v !== "object" || Array.isArray(v)) return false;
-    return Object.keys(flattenNodeToKpis(v)).length > 0 || isStructuredVal(v);
-  });
-  if (children.length === 1) return children[0][1];
-  // Flat KPI map with no combo nesting.
-  if (Object.keys(flattenNodeToKpis(root)).length) return root;
-  return null;
+  return pickComboKpis({ result: node }, null) || {};
 }
 
 /** "Total / AA52 - Northeast / Total / R4W" from the case's filter map (not a stale label). */
@@ -746,54 +707,17 @@ function labelFromFilterValues(filters: any): string {
   return vals.length ? vals.join(" / ") : "";
 }
 
-// Pull a combo's KPI map out of the script return payload. The script may return
-// data nested under several shapes — be liberal (aligned with ScenarioDetail).
-function pickComboKpis(payload: any, comboLabel: string | null): Record<string, any> | null {
-  const candidates = [
-    payload?.extracted?.result?.results,
-    payload?.extracted?.result?.kpis,
-    payload?.extracted?.result?.result,
-    payload?.extracted?.result,
-    payload?.extracted?.extracted,
-    payload?.result?.extracted,
-    payload?.result?.results,
-    payload?.result,
-    payload?.extracted,
-  ];
-  for (const raw of candidates) {
-    const root = flattenExtractionRoot(raw);
-    if (!root || typeof root !== "object") continue;
-    const node = resolveComboNode(root, comboLabel);
-    if (!node) continue;
-    const flat = flattenNodeToKpis(node);
-    if (Object.keys(flat).length) return flat;
-  }
-  return null;
+// Filter evidence must come from the exact combination used for KPI lookup.
+function pickComboFiltersApplied(payload: any, comboLabel: string | null): Record<string, any> | null {
+  const node = selectComboNode(payload, comboLabel);
+  return node?.filters_applied && typeof node.filters_applied === "object"
+    ? node.filters_applied : null;
 }
 
-// Extract filters_applied for a combo from the runtime payload (pickComboKpis strips it).
-function pickComboFiltersApplied(payload: any, comboLabel: string | null): Record<string, any> | null {
-  const candidates = [
-    payload?.extracted?.result?.results,
-    payload?.extracted?.result,
-    payload?.extracted?.extracted,
-    payload?.result?.extracted,
-    payload?.result,
-    payload?.extracted,
-  ];
-  for (const raw of candidates) {
-    const root = flattenExtractionRoot(raw);
-    if (!root || typeof root !== "object") continue;
-    if (comboLabel) {
-      const node = resolveComboNode(root, comboLabel);
-      if (node && typeof node === "object" && node.filters_applied && typeof node.filters_applied === "object") {
-        return node.filters_applied;
-      }
-    } else if ((root as any).filters_applied && typeof (root as any).filters_applied === "object") {
-      return (root as any).filters_applied;
-    }
-  }
-  return null;
+// Include script-level errors hidden inside a successful transport envelope.
+function classifyComboRuntime(payload: any, comboLabel: string | null, target: "main" | "reference") {
+  const error = comboExecutionError(payload, comboLabel);
+  return classifyRuntimePayload(error ? { ...payload, error } : payload, { target });
 }
 
 const EXTRACTION_MAX_ATTEMPTS = Math.max(
@@ -898,6 +822,7 @@ function comboExtractionNeedsRetry(
   comboLabel: string | null,
   opts?: { requireStructured?: boolean; configuredLabels?: string[] },
 ): boolean {
+  if (comboExecutionError(payload, comboLabel)) return true;
   const exec = payload?.extracted;
   const values = pickComboKpis(payload, comboLabel);
   const usableCount = countUsableKpisInPayload(payload, comboLabel);
@@ -991,8 +916,9 @@ Deno.serve(async (req) => {
   const getCallerAuth = async () =>
     session ? `Bearer ${await session.token()}` : (rawCaller ? `Bearer ${rawCaller}` : (SERVICE_KEY ? `Bearer ${SERVICE_KEY}` : ""));
   const callFn = makeCallFn(getCallerAuth);
-  const sb = serviceClient ?? (session
-    ? getSupabaseForAccessToken(() => session!.token())
+  const activeSession = session;
+  const sb = serviceClient ?? (activeSession
+    ? getSupabaseForAccessToken(() => activeSession.token())
     : getSupabaseForRequest(req));
   jsonLog("orchestrate_auth", {
     auth_source: serviceClient ? "service" : session?.canRefresh ? "caller_refreshing" : "caller",
@@ -1084,7 +1010,7 @@ Deno.serve(async (req) => {
           return time || String(a.id).localeCompare(String(b.id));
         })[0];
         if (winner.id !== run.id) {
-          await sb.from("runs").update({
+          await checkedWrite(sb.from("runs").update({
             status: "cancelled",
             finished_at: new Date().toISOString(),
             summary: {
@@ -1092,7 +1018,7 @@ Deno.serve(async (req) => {
               error: "overlapping execution already running",
               active_run_id: winner.id,
             },
-          }).eq("id", run.id);
+          }).eq("id", run.id), "Run update failed");
           return new Response(JSON.stringify({
             error: "RUN_ALREADY_ACTIVE",
             message: "An overlapping execution is already running.",
@@ -1348,10 +1274,10 @@ Deno.serve(async (req) => {
       }
       if (reportIds.length === 0) {
         // Never overwrite a user-cancelled run with completed.
-        await sb.from("runs").update({
+        await checkedWrite(sb.from("runs").update({
           status: "completed", finished_at: new Date().toISOString(),
           summary: { pass: 0, fail: 0, total: 0, done: 0, child_count: 0 },
-        }).eq("id", run.id).eq("status", "running");
+        }).eq("id", run.id).eq("status", "running"), "Run update failed");
       }
       return new Response(JSON.stringify({ run_id: run.id, status: "running" }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -1396,7 +1322,8 @@ Deno.serve(async (req) => {
             .eq("report_id", reportId)
             .eq("deferred", false);
           if (scope_type === "scenario") scenariosQuery = scenariosQuery.eq("id", scope_id);
-          const { data: scenarios } = await scenariosQuery;
+          const { data: scenarios, error: scenariosError } = await scenariosQuery;
+          if (scenariosError) throw new Error(`Scenario loading failed: ${errorDetail(scenariosError)}`);
 
           const scenarioOutcomes = await mapPool(scenarios || [], concurrency, async (s) => {
             await cancellation.throwIfCancelled({
@@ -1410,7 +1337,7 @@ Deno.serve(async (req) => {
                 report_id: reportId,
                 scenario_id: s.id,
               });
-              await sb.from("test_results").insert({
+              const earlyFailure = await sb.from("test_results").insert({
                 run_id: run.id,
                 scenario_id: s.id,
                 status: "browserless_timeout",
@@ -1429,6 +1356,7 @@ Deno.serve(async (req) => {
                 criticality: s.criticality || "medium",
                 severity: s.criticality || "medium",
               });
+              if (earlyFailure.error) throw new Error(`Failed to persist execution failure: ${errorDetail(earlyFailure.error)}`);
               return { pass: 0, fail: 1 };
             }
             let { data: script, error: scriptErr } = await fetchCanonicalScript(
@@ -1442,12 +1370,13 @@ Deno.serve(async (req) => {
                 report_id: reportId,
                 scenario_id: s.id,
               });
-              await sb.from("test_results").insert({
+              const earlyFailure = await sb.from("test_results").insert({
                 run_id: run.id, scenario_id: s.id, status: "fail",
                 expected: { error: "script_lookup_failed" },
                 actual: { error: scriptErr.message },
                 diff: null, criticality: s.criticality || "medium", severity: s.criticality || "medium",
               });
+              if (earlyFailure.error) throw new Error(`Failed to persist execution failure: ${errorDetail(earlyFailure.error)}`);
               return { pass: 0, fail: 1 };
             }
             // Saved scripts may contain page-specific selectors that generic
@@ -1463,12 +1392,13 @@ Deno.serve(async (req) => {
                   report_id: reportId,
                   scenario_id: s.id,
                 });
-                await sb.from("test_results").insert({
+                const earlyFailure = await sb.from("test_results").insert({
                   run_id: run.id, scenario_id: s.id, status: "fail",
                   expected: { error: "script_generation_failed" },
                   actual: { error: gen?.message || gen?.error || "agent-scripts returned no code" },
                   diff: null, criticality: s.criticality || "medium", severity: s.criticality || "medium",
                 });
+              if (earlyFailure.error) throw new Error(`Failed to persist execution failure: ${errorDetail(earlyFailure.error)}`);
                 return { pass: 0, fail: 1 };
               }
             }
@@ -1522,7 +1452,7 @@ Deno.serve(async (req) => {
               .select("id, label, filters").eq("scenario_id", s.id)
               .order("created_at", { ascending: true });
             if (single_combo_id) matrixQuery = matrixQuery.eq("id", single_combo_id);
-            const { data: matrix } = await matrixQuery;
+            const matrix = await loadCompleteRows((start, end) => matrixQuery.order("id").range(start, end));
             if (single_combo_id && !matrix?.length) {
               throw new Error(`filter combination ${single_combo_id} was not found for scenario ${s.id}`);
             }
@@ -1530,7 +1460,7 @@ Deno.serve(async (req) => {
             // Name always from current filter values so an edited combo does not
             // keep a stale stored label on the next run.
             const combos = hasCombos
-              ? matrix!.map((m: any, i: number) => {
+              ? (matrix || []).map((m: any, i: number) => {
                   const filters = m.filters || {};
                   const derived = labelFromFilterValues(filters);
                   return {
@@ -1586,6 +1516,7 @@ Deno.serve(async (req) => {
               looksLikeStructuredKpiLabel(label)
             ) || /graph|chart|grid|show\s*data|segment summary|overall performance/i
               .test(`${s.title || ""} ${(s as any).description || ""}`);
+            const scenarioTiming = createTimingCollector();
             const runtimeCtx = (
               target: "main" | "reference",
               comboLabel: string | null,
@@ -1615,7 +1546,11 @@ Deno.serve(async (req) => {
               await cancellation.throwIfCancelled(
                 runtimeCtx(target, comboLabel, 1, "before_runtime"),
               );
-              let response = await callFn("playwright-runtime", body);
+              const timedBody = { ...body, code: instrumentReportTiming(String(body.code || ""), parse) };
+              const timedCall = (attempt: number, reason: string | null) =>
+                scenarioTiming.time({ target, combo: comboLabel, attempt }, () => callFn("playwright-runtime", timedBody),
+                  (r: any) => { const c = classifyRuntimePayload(r, { target }); return c.auth_failure ? "auth_failure" : c.browserless_timeout ? "browserless_timeout" : reason; });
+              let response = await timedCall(1, null);
               await cancellation.throwIfCancelled(
                 runtimeCtx(target, comboLabel, 1, "after_runtime"),
               );
@@ -1654,7 +1589,7 @@ Deno.serve(async (req) => {
                   reason: classified.auth_failure ? "auth_failure" : "browserless_timeout",
                   error: classified.error,
                 });
-                response = await callFn("playwright-runtime", body);
+                response = await timedCall(attempts, null);
                 await cancellation.throwIfCancelled(
                   runtimeCtx(target, comboLabel, attempts, "after_runtime"),
                 );
@@ -1685,7 +1620,7 @@ Deno.serve(async (req) => {
                     max_attempts: kpiMaxAttempts,
                     reason: "runtime_or_empty_extraction",
                   });
-                  response = await callFn("playwright-runtime", body);
+                  response = await timedCall(attempts, null);
                   await cancellation.throwIfCancelled(
                     runtimeCtx(target, comboLabel, attempts, "after_runtime"),
                   );
@@ -1718,7 +1653,7 @@ Deno.serve(async (req) => {
                   mode: "headless",
                   scenario_id: s.id,
                   code: executableCode,
-                  filter_combinations: [{ label: combo.label, filters: combo.filters || {} }],
+                  filter_combinations: [{ id: combo.id, label: combo.label, filters: combo.filters || {} }],
                 };
                 const mainResponse = await invokeRuntimeWithRetry(mainBody, "main", combo.label);
                 let referenceResponse: any = null;
@@ -1735,16 +1670,16 @@ Deno.serve(async (req) => {
                     scenario_id: s.id,
                     code: refCode,
                     target: "reference",
-                    filter_combinations: [{ label: combo.label, filters: combo.filters || {} }],
+                    filter_combinations: [{ id: combo.id, label: combo.label, filters: combo.filters || {} }],
                   };
                   referenceResponse = await invokeRuntimeWithRetry(referenceBody, "reference", combo.label);
                 }
-                return { label: String(combo.label || ""), mainResponse, referenceResponse };
+                return { key: String(combo.id), mainResponse, referenceResponse };
               }, () => cancellation.isCancelled());
               for (const item of isolated) {
                 if (!item) continue;
-                isolatedRunResponses.set(item.label, item.mainResponse);
-                if (item.referenceResponse) isolatedRefResponses.set(item.label, item.referenceResponse);
+                isolatedRunResponses.set(item.key, item.mainResponse);
+                if (item.referenceResponse) isolatedRefResponses.set(item.key, item.referenceResponse);
               }
               await cancellation.throwIfCancelled({
                 checkpoint: "after_pool",
@@ -1755,7 +1690,7 @@ Deno.serve(async (req) => {
               refRespRaw = null;
             } else {
               const fullMatrix = hasCombos
-                ? combos.map((c) => ({ label: c.label, filters: c.filters || {} }))
+                ? combos.map((c) => ({ id: c.id, label: c.label, filters: c.filters || {} }))
                 : undefined;
               jsonLog("combo_matrix_mode", {
                 run_id: run.id,
@@ -1788,12 +1723,12 @@ Deno.serve(async (req) => {
               });
             }
             const runExec = runResp?.extracted;
-            if (
+            if (!hasCombos && (
               runResp?.error ||
               runResp?.ok === false ||
               runExec?.ok === false ||
               runExec?.error
-            ) {
+            )) {
               await cancellation.throwIfCancelled({
                 checkpoint: "before_persist",
                 report_id: reportId,
@@ -1817,12 +1752,13 @@ Deno.serve(async (req) => {
               const persistStatus = statusFromCategory(outcome.category, false);
               const attemptCount = Number((runResp as any)?.__rtb_attempts) ||
                 Number((runResp as any)?.auth_session_attempts) || 1;
-              await sb.from("test_results").insert({
+              const failureInsert = await sb.from("test_results").insert({
                 run_id: run.id,
                 scenario_id: s.id,
                 status: persistStatus,
                 expected: { source: "scrape" },
                 actual: {
+                  timing: scenarioTiming.snapshot(null),
                   error: scrapeError,
                   values: partialScraped,
                   execution: buildExecutionAudit({
@@ -1847,6 +1783,7 @@ Deno.serve(async (req) => {
                 severity: s.criticality || "medium",
                 screenshot_url: runResp?.screenshot_url || null,
               });
+              if (failureInsert.error) throw new Error(`Failed to persist scrape failure: ${errorDetail(failureInsert.error)}`);
               return { pass: 0, fail: 1 };
             }
 
@@ -1871,6 +1808,29 @@ Deno.serve(async (req) => {
                 "reference scrape failed";
             }
 
+            const selectedResponse = (response: any, combo: any) => {
+              const ambiguous = combos.filter(c => c.label === combo.label).length > 1;
+              let node = selectComboNode(response, combo.label, combo.id, ambiguous);
+              if (!node && combo.id == null && combo.label == null) node = selectComboNode(response, null);
+              if (!node) return { ...response, ok: false, error: 'Unresolved combination identity', extracted: { result: {} } };
+              return { ...response, extracted: { ...(response?.extracted || {}), result: { [combo.label || "__single__"]: node } } };
+            };
+            if (hasCombos && !isolateCombos && !isPccScenario) {
+              for (const combo of combos) {
+                const current = selectedResponse(runResp, combo);
+                if (comboExecutionError(current, combo.label) || comboExtractionNeedsRetry(current, combo.label, { requireStructured: requireStructuredExtraction, configuredLabels: comparisonKpiLabels })) {
+                  const retried = await invokeRuntimeWithRetry({ mode: "headless", scenario_id: s.id, code: executableCode, filter_combinations: [{ id: combo.id, label: combo.label, filters: combo.filters || {} }] }, "main", combo.label);
+                  isolatedRunResponses.set(String(combo.id), retried);
+                }
+                if (isRef && !refError && refCode) {
+                  const reference = selectedResponse(refResp, combo);
+                  if (comboExecutionError(reference, combo.label) || comboExtractionNeedsRetry(reference, combo.label, { requireStructured: requireStructuredExtraction, configuredLabels: comparisonKpiLabels })) {
+                    const retried = await invokeRuntimeWithRetry({ mode: "headless", scenario_id: s.id, code: refCode, target: "reference", filter_combinations: [{ id: combo.id, label: combo.label, filters: combo.filters || {} }] }, "reference", combo.label);
+                    isolatedRefResponses.set(String(combo.id), retried);
+                  }
+                }
+              }
+            }
             const comboOutcomes = await mapPool(combos, Math.min(concurrency, 8), async (combo) => {
               await cancellation.throwIfCancelled({
                 checkpoint: "before_combo",
@@ -1878,8 +1838,9 @@ Deno.serve(async (req) => {
                 scenario_id: s.id,
                 combo: combo.label,
               });
-              const comboRunResp = isolatedRunResponses.get(String(combo.label || "")) || runResp;
+              const comboRunResp = selectedResponse(isolatedRunResponses.get(String(combo.id)) || runResp, combo);
               const comboExec = comboRunResp?.extracted;
+              const innerComboError = comboExecutionError(comboRunResp, combo.label);
               if ((comboRunResp as any)?.__rtb_browserless_unhealthy) {
                 browserlessInfraDown = browserlessInfraDown || "browserless_unhealthy";
               }
@@ -1887,12 +1848,13 @@ Deno.serve(async (req) => {
                 comboRunResp?.error ||
                 comboRunResp?.ok === false ||
                 comboExec?.ok === false ||
-                comboExec?.error
+                comboExec?.error ||
+                innerComboError
               ) {
                 // Preserve any KPI fields that survived alongside ok:false / error
                 // (scripts that catch per-KPI failures instead of throwing).
-                const partialScraped = pickComboKpis(comboRunResp, combo.label) || {};
-                const runtimeClass = classifyRuntimePayload(comboRunResp, { target: "main" });
+                const partialScraped = pickComboKpis(comboRunResp, combo.label, comparisonKpiLabels, kpiAliases) || {};
+                const runtimeClass = classifyComboRuntime(comboRunResp, combo.label, "main");
                 const completeness = assessConfiguredCompleteness(
                   comparisonKpiLabels,
                   partialScraped,
@@ -1919,12 +1881,17 @@ Deno.serve(async (req) => {
                   run_id: run.id,
                   scenario_id: s.id,
                   status: persistStatus,
-                  expected: { source: "scrape", filter: combo.label },
+                  expected: { combo_id: combo.id, source: isRef ? "reference_script" : "scrape", filter: combo.label,
+                    values: isRef ? pickComboKpis(selectedResponse(isolatedRefResponses.get(String(combo.id)) || refResp, combo), combo.label, comparisonKpiLabels, kpiAliases) || {} : {},
+                    error: isRef ? comboExecutionError(selectedResponse(isolatedRefResponses.get(String(combo.id)) || refResp, combo), combo.label) : null },
                   actual: {
+                    timing: scenarioTiming.snapshot(combo.label),
                     filter: combo.label,
                     error: comboError,
                     values: partialScraped,
-                    filters_applied: combo.filters || null,
+                    combo_id: combo.id,
+                    requested_filters: combo.filters || {},
+                    filters_applied: pickComboFiltersApplied(comboRunResp, combo.label),
                     execution: buildExecutionAudit({
                       run_id: run.id,
                       scenario_id: s.id,
@@ -1951,9 +1918,10 @@ Deno.serve(async (req) => {
                 if (insertError) throw new Error(`Failed to persist scrape failure: ${insertError.message}`);
                 return { pass: 0, fail: 1 };
               }
-              const scraped = pickComboKpis(comboRunResp, combo.label) || {};
+              const scraped = pickComboKpis(comboRunResp, combo.label, comparisonKpiLabels, kpiAliases) || {};
               const filtersApplied =
-                pickComboFiltersApplied(comboRunResp, combo.label) || combo.filters || null;
+                pickComboFiltersApplied(comboRunResp, combo.label);
+              const filterVerification = verifyFilterEvidence(combo.filters || {}, filtersApplied);
               // Plain matrix filters (string values) mean the script envelope was
               // missing filters_applied — usually empty/unparseable extraction.
               const filtersLookUnverified = (() => {
@@ -1983,16 +1951,18 @@ Deno.serve(async (req) => {
               let sqlRow: Record<string, any> | null = null;
 
               if (isRef) {
-                const comboRefResp = isolatedRefResponses.get(String(combo.label || "")) || refResp;
+                const comboRefResp = selectedResponse(isolatedRefResponses.get(String(combo.id)) || refResp, combo);
                 const comboRefExec = comboRefResp?.extracted;
+                const referenceVerification = verifyFilterEvidence(combo.filters || {}, pickComboFiltersApplied(comboRefResp, combo.label));
                 const comboRefError =
-                  refError ||
+                  refError || (!referenceVerification.ok ? "Reference filter verification failed" : null) ||
+                  comboExecutionError(comboRefResp, combo.label) ||
                   comboRefResp?.error ||
                   (comboRefResp?.ok === false ? comboRefResp?.message || "reference scrape failed" : null) ||
                   (comboRefExec?.ok === false || comboRefExec?.error
                     ? comboRefExec?.error || comboRefExec?.message || "reference scrape failed"
                     : null);
-                const refScraped = comboRefError ? {} : (pickComboKpis(comboRefResp, combo.label) || {});
+                const refScraped = pickComboKpis(comboRefResp, combo.label, comparisonKpiLabels, kpiAliases) || {};
                 sqlMeta = {
                   source: "reference_script",
                   reference_url: (report as any)?.reference_url || null,
@@ -2440,7 +2410,7 @@ Deno.serve(async (req) => {
               }
 
               // Completeness gate: configured KPIs must be extracted or explicitly failed.
-              const mainRuntime = classifyRuntimePayload(comboRunResp, { target: "main" });
+              const mainRuntime = classifyComboRuntime(comboRunResp, combo.label, "main");
               const mainCompleteness = assessConfiguredCompleteness(
                 labels,
                 actualMap,
@@ -2455,10 +2425,11 @@ Deno.serve(async (req) => {
 
               let refOutcome: ReturnType<typeof finalizeTargetOutcome> | null = null;
               if (isRef) {
-                const comboRefResp = isolatedRefResponses.get(String(combo.label || "")) || refResp;
-                const refRuntime = classifyRuntimePayload(
+                const comboRefResp = selectedResponse(isolatedRefResponses.get(String(combo.id)) || refResp, combo);
+                const refRuntime = classifyComboRuntime(
                   comboRefResp || { error: refError || sqlMeta?.error || "reference scrape failed" },
-                  { target: "reference" },
+                  combo.label,
+                  "reference",
                 );
                 const refCompleteness = assessConfiguredCompleteness(
                   labels,
@@ -2477,7 +2448,7 @@ Deno.serve(async (req) => {
                 if (refOutcome.category !== "pass") comboPass = false;
               }
 
-              if (mainOutcome.category !== "pass") comboPass = false;
+              if (mainOutcome.category !== "pass" || !filterVerification.ok) comboPass = false;
 
               let failureCategory: ExtractionFailureCategory = comboPass
                 ? "pass"
@@ -2496,6 +2467,7 @@ Deno.serve(async (req) => {
                 if (failureCategory === "pass") failureCategory = "fail";
               }
 
+              if (!filterVerification.ok) failureCategory = "partial_extraction";
               const status = statusFromCategory(failureCategory, comboPass);
               const attemptCount = Number((comboRunResp as any)?.__rtb_attempts) ||
                 Number((comboRunResp as any)?.auth_session_attempts) || 1;
@@ -2544,8 +2516,14 @@ Deno.serve(async (req) => {
               });
               const { data: tr, error: trError } = await sb.from("test_results").insert({
                 run_id: run.id, scenario_id: s.id, status,
-                expected: { source: sqlMeta.source, filter: combo.label, where_clause: sqlMeta.where_clause, values: expectedMap, row: sqlRow, sql: sqlMeta },
+                expected: { combo_id: combo.id, error: refOutcome?.error || null, source: sqlMeta.source, filter: combo.label, where_clause: sqlMeta.where_clause, values: expectedMap, row: sqlRow, sql: sqlMeta },
                 actual: {
+                  timing: scenarioTiming.snapshot(combo.label),
+                  combo_id: combo.id,
+                  requested_filters: combo.filters || {},
+                  filter_verification: filterVerification,
+                  execution_status: failureCategory,
+                  error: !filterVerification.ok ? "Filter verification failed" : mainOutcome.error || null,
                   filter: combo.label,
                   values: actualMap,
                   filters_applied: filtersApplied,
@@ -2658,31 +2636,28 @@ Deno.serve(async (req) => {
           report_id: single_report_id || reportIds[0] || null,
         });
         if (existing_run_id) {
-          const incomplete = Boolean(browserlessInfraDown);
-          await finalizeChild(
-            sb,
-            run.id,
-            single_report_id || reportIds[0],
-            pass,
-            fail,
-            incomplete,
-            incomplete ? (browserlessInfraDown || "browserless_unhealthy") : undefined,
-          );
+          const rows = await loadCompleteRows((start, end) => sb.from("test_results").select("id,status,actual,expected,diff,scenarios!inner(report_id)").eq("run_id", run.id).eq("scenarios.report_id", single_report_id || reportIds[0]).order("id").range(start, end));
+          const counts = outcomeCounts(rows.map(row => deriveExecutionOutcome(row, row.status === "pass" ? "pass" : row.status === "pending" ? "pending" : "fail")));
+          const incomplete = Boolean(browserlessInfraDown) || counts.pending > 0;
+          if (counts.pending) throw new Error("Report has unresolved combination work; cannot finalize as completed");
+          await finalizeChild(sb, run.id, single_report_id || reportIds[0], counts.pass, counts.fail + counts.cancelled, incomplete, incomplete ? (browserlessInfraDown || "report_unresolved") : undefined);
         } else {
           // Preserve cancelled — never overwrite with completed.
           const incomplete = Boolean(browserlessInfraDown);
-          await sb.from("runs").update({
-            status: incomplete || fail > 0 ? "failed" : "completed",
-            finished_at: new Date().toISOString(),
-            summary: {
-              pass,
-              fail,
-              total: pass + fail,
-              ...(incomplete
-                ? { error: browserlessInfraDown || "browserless_unhealthy", failure_category: "browserless_timeout" }
-                : {}),
-            },
-          }).eq("id", run.id).eq("status", "running");
+          const persisted: any[] = [];
+          for (let offset = 0; ; offset += 1000) {
+            const page = await sb.from("test_results").select("id,scenario_id,actual,expected,status,diff").eq("run_id", run.id).order("id").range(offset, offset + 999);
+            if (page.error) throw new Error(`Final totals read failed: ${errorDetail(page.error)}`);
+            persisted.push(...(page.data || []));
+            if (!page.data || page.data.length < 1000) break;
+          }
+          const counts = outcomeCounts(persisted.map(row => deriveExecutionOutcome(row, row.status === "pass" ? "pass" : row.status === "pending" ? "pending" : "fail")));
+          const finalized = await retryFinalizationOperation(() => sb.from("runs").update({
+            status: counts.pending ? "running" : incomplete || counts.fail ? "failed" : counts.cancelled ? "cancelled" : "completed",
+            finished_at: counts.pending ? null : new Date().toISOString(),
+            summary: { ...counts, ...(incomplete ? { error: browserlessInfraDown || "browserless_unhealthy", failure_category: "browserless_timeout" } : {}) },
+          }).eq("id", run.id).eq("status", "running"), (result: any) => result?.error);
+          if (finalized.error) throw new Error(`Final totals update failed: ${errorDetail(finalized.error)}`);
         }
       } catch (e) {
         if (isRunCancelledError(e)) {
@@ -2796,10 +2771,10 @@ Deno.serve(async (req) => {
           await finalizeChild(sb, run.id, single_report_id || reportIds[0], pass, fail, true, String((e as any)?.message || e));
         } else {
           // Preserve cancelled — never overwrite with failed.
-          await sb.from("runs").update({
+          await checkedWrite(sb.from("runs").update({
             status: "failed", finished_at: new Date().toISOString(),
             summary: { pass, fail, total: pass + fail, error: String(e) },
-          }).eq("id", run.id).eq("status", "running");
+          }).eq("id", run.id).eq("status", "running"), "Run update failed");
         }
       }
     };

@@ -1,4 +1,40 @@
 import { supabase } from "@/integrations/supabase/client";
+import { deriveStoredResultStatus } from "./kpi-values";
+import { combinationId, filterSignature, matchCombination, rowFilters } from "../../supabase/functions/_shared/combination-identity";
+
+/**
+ * Every result row (newest first) for the given scenarios. Pages through each
+ * chunk: the Data API caps a request at 1,000 rows, and a few busy scenarios
+ * could otherwise push other scenarios' newest results out of the window.
+ */
+export async function fetchAllResultsNewestFirst(scenarioIds: string[], columns: string): Promise<any[]> {
+  const chunkSize = 40;
+  const chunks: string[][] = [];
+  const ids = [...new Set(scenarioIds)].sort();
+  for (let i = 0; i < ids.length; i += chunkSize) chunks.push(ids.slice(i, i + chunkSize));
+  const fetchChunk = async (chunk: string[]) => {
+    const rows: any[] = [];
+    for (let offset = 0; ; offset += 1000) {
+      const { data, error } = await supabase
+        .from("test_results")
+        .select(columns)
+        .in("scenario_id", chunk)
+        .order("created_at", { ascending: false })
+        .order("id", { ascending: true })
+        .range(offset, offset + 999);
+      if (error) throw new Error(`Could not load latest results: ${error.message}`);
+      rows.push(...(data || []));
+      if (!data || data.length < 1000) break;
+    }
+    return rows;
+  };
+  const out: any[] = [];
+  for (let i = 0; i < chunks.length; i += 6) {
+    const pages = await Promise.all(chunks.slice(i, i + 6).map(fetchChunk));
+    for (const rows of pages) out.push(...rows);
+  }
+  return out;
+}
 
 /** PostgREST caps a single request at 1000 rows. Fetch latest-per-scenario in chunks. */
 export async function fetchLatestTestResultsByScenarioIds(
@@ -6,20 +42,9 @@ export async function fetchLatestTestResultsByScenarioIds(
   columns: string,
 ): Promise<Map<string, any>> {
   const latest = new Map<string, any>();
-  const chunkSize = 80;
-  for (let i = 0; i < scenarioIds.length; i += chunkSize) {
-    const chunk = scenarioIds.slice(i, i + chunkSize);
-    if (!chunk.length) continue;
-    const { data } = await supabase
-      .from("test_results")
-      .select(columns)
-      .in("scenario_id", chunk)
-      .order("created_at", { ascending: false })
-      .limit(1000);
-    for (const r of data || []) {
-      const sid = (r as any).scenario_id as string;
-      if (sid && !latest.has(sid)) latest.set(sid, r);
-    }
+  for (const r of await fetchAllResultsNewestFirst(scenarioIds, columns)) {
+    const sid = (r as any).scenario_id as string;
+    if (sid && !latest.has(sid)) latest.set(sid, r);
   }
   return latest;
 }
@@ -31,6 +56,10 @@ export async function fetchLatestTestResultsByScenarioIds(
  */
 /** Combination label a test_results row belongs to ("" when the scenario has none). */
 function comboKey(r: any): string {
+  const id = combinationId(r);
+  const signature = filterSignature(rowFilters(r));
+  if (id) return `id:${id}`;
+  if (signature && signature !== "[]") return `filters:${signature}`;
   const v = r?.actual?.filter ?? r?.expected?.filter ?? r?.actual?.combo ?? r?.expected?.combo;
   const s = String(v ?? "").trim();
   return s ? s.toLowerCase() : "__single__";
@@ -41,23 +70,12 @@ export async function fetchLatestRunResultsByScenarioIds(
   columns: string,
 ): Promise<Map<string, any[]>> {
   const byScenario = new Map<string, any[]>();
-  const chunkSize = 80;
-  for (let i = 0; i < scenarioIds.length; i += chunkSize) {
-    const chunk = scenarioIds.slice(i, i + chunkSize);
-    if (!chunk.length) continue;
-    const { data } = await supabase
-      .from("test_results")
-      .select(columns)
-      .in("scenario_id", chunk)
-      .order("created_at", { ascending: false })
-      .limit(1000);
-    for (const r of data || []) {
-      const sid = (r as any).scenario_id as string;
-      if (!sid) continue;
-      const list = byScenario.get(sid);
-      if (list) list.push(r);
-      else byScenario.set(sid, [r]);
-    }
+  for (const r of await fetchAllResultsNewestFirst(scenarioIds, columns)) {
+    const sid = (r as any).scenario_id as string;
+    if (!sid) continue;
+    const list = byScenario.get(sid);
+    if (list) list.push(r);
+    else byScenario.set(sid, [r]);
   }
   // Keep the newest row PER COMBINATION, not per run. Re-running a single
   // combination from Latest result creates a new run holding just that one row,
@@ -82,12 +100,15 @@ export async function fetchFilterMatrixByScenarioIds(
   for (let i = 0; i < scenarioIds.length; i += chunkSize) {
     const chunk = scenarioIds.slice(i, i + chunkSize);
     if (!chunk.length) continue;
-    const { data } = await supabase
-      .from("scenario_filter_matrix")
-      .select("id, scenario_id, label, filters, created_at")
-      .in("scenario_id", chunk)
-      .order("created_at", { ascending: true })
-      .limit(1000);
+    const data: any[] = [];
+    for (let offset = 0; ; offset += 1000) {
+      const response = await supabase.from("scenario_filter_matrix")
+        .select("id, scenario_id, label, filters, created_at").in("scenario_id", chunk)
+        .order("created_at", { ascending: true }).order("id", { ascending: true }).range(offset, offset + 999);
+      if (response.error) throw new Error(`Could not load filter combinations: ${response.error.message}`);
+      data.push(...(response.data || []));
+      if (!response.data || response.data.length < 1000) break;
+    }
     for (const r of data || []) {
       const sid = (r as any).scenario_id as string;
       if (!sid) continue;
@@ -98,11 +119,6 @@ export async function fetchFilterMatrixByScenarioIds(
   return byScenario;
 }
 
-function isPlaceholderComboLabel(label: string): boolean {
-  return !label || /^filter #\d+$/i.test(label) || /^combo[_ ]?\d+$/i.test(label);
-}
-
-/** Build "Total / AA52 - Northeast / Total / R4W" from a filters / filters_applied map. */
 export function labelFromFilterMap(filters: any): string {
   if (!filters || typeof filters !== "object" || Array.isArray(filters)) return "";
   const vals = Object.entries(filters)
@@ -121,88 +137,18 @@ export function labelFromFilterMap(filters: any): string {
 }
 
 /**
- * Human-readable combo name for Tests execution / Runs.
- * Filter values on the case win — a stale stored label must not survive an edit.
- */
-export function displayComboLabel(combo: any, idx: number, result?: any): string {
-  const fromFilters = labelFromFilterMap(combo?.filters);
-  if (fromFilters) return fromFilters;
-
-  const fromResult = String(
-    result?.actual?.filter ?? result?.expected?.filter ?? result?.actual?.combo ?? result?.expected?.combo ?? "",
-  ).trim();
-  if (fromResult && !isPlaceholderComboLabel(fromResult)) return fromResult;
-
-  const fromApplied = labelFromFilterMap(result?.actual?.filters_applied || result?.expected?.filters_applied);
-  if (fromApplied) return fromApplied;
-
-  const explicit = String(combo?.label ?? "").trim();
-  if (explicit && !isPlaceholderComboLabel(explicit)) return explicit;
-
-  return explicit || `Filter #${idx + 1}`;
-}
-
-/**
  * Pair each CONFIGURED combination with its latest stored result.
  * The scenarios page previously showed only combinations that had a row in
  * test_results, so a scenario with four combinations displayed one. Latest
  * result renders scenario_filter_matrix, which is why the two disagreed.
  */
 export function pairCombosWithResults(combos: any[], results: any[]): any[] {
-  const norm = (v: any) => String(v ?? "").trim().toLowerCase();
-  const pool = (results || []).slice();
-  const keyOf = (r: any) =>
-    norm(r?.actual?.filter ?? r?.expected?.filter ?? r?.actual?.combo ?? r?.expected?.combo);
-  if (!combos || !combos.length) {
-    return pool.map((r, idx) => ({
-      label: displayComboLabel(null, idx, r),
-      result: r,
-    }));
-  }
-  return combos.map((c: any, idx: number) => {
-    const configuredLabel = String(c?.label || "").trim();
-    const fromFilters = labelFromFilterMap(c?.filters);
-    const aliases = [
-      configuredLabel,
-      fromFilters,
-      `combo_${idx + 1}`,
-      `Filter #${idx + 1}`,
-    ].filter(Boolean).map(norm);
-    let hit = pool.findIndex((r) => aliases.includes(keyOf(r)));
-    if (hit === -1 && combos.length === 1 && pool.length === 1) hit = 0;
-    const result = hit >= 0 ? pool.splice(hit, 1)[0] : null;
-    return {
-      label: displayComboLabel(c, idx, result),
-      comboId: c?.id ?? null,
-      result,
-    };
+  if (!combos?.length) return (results || []).map(result => ({ label: null, result, provenance: { timestamp: result.created_at, runId: result.run_id, resultId: result.id } }));
+  return combos.map((combo, idx) => {
+    const result = matchCombination(combos, combo, results || []);
+    return { label: combo.label || `Filter #${idx + 1}`, comboId: combo.id ?? null, result,
+      provenance: result ? { timestamp: result.created_at, runId: result.run_id, resultId: result.id } : null };
   });
-}
-
-const TERMINAL_FAIL_RESULT_STATUSES = new Set([
-  "fail",
-  "partial_extraction",
-  "auth_failure",
-  "browserless_timeout",
-  "cancelled",
-  "empty_extraction",
-  "error",
-  "failed",
-]);
-
-/**
- * A lone combo-shaped child may satisfy a requested label only when the keys
- * match (or the request has no label). Otherwise Latest Result steals a PASS
- * sibling onto a failed empty combo while Runs correctly shows not-extracted.
- */
-export function loneChildSatisfiesComboLabel(
-  childKey: string,
-  requestedLabel: string | null | undefined,
-): boolean {
-  const want = String(requestedLabel ?? "").trim().toLowerCase().replace(/[–—]/g, "-").replace(/\s+/g, " ");
-  if (!want) return true;
-  const have = String(childKey ?? "").trim().toLowerCase().replace(/[–—]/g, "-").replace(/\s+/g, " ");
-  return have === want;
 }
 
 export function overallStatusFromComboPairs(
@@ -210,10 +156,34 @@ export function overallStatusFromComboPairs(
   fallback: string = "pending",
 ): "pass" | "fail" | "pending" {
   const statuses = (pairs || []).map((pair) =>
-    String(pair?.result?.status || "pending").toLowerCase()
+    pair?.result ? deriveStoredResultStatus({ actual: pair.result.actual, expected: pair.result.expected, diff: pair.result.diff, fallbackStatus: pair.result.status }) : "pending"
   );
-  if (statuses.some((status) => TERMINAL_FAIL_RESULT_STATUSES.has(status))) return "fail";
+  if (statuses.some((status) => status === "fail")) return "fail";
   if (statuses.some((status) => status === "pending")) return "pending";
   if (statuses.length && statuses.every((status) => status === "pass")) return "pass";
   return fallback === "pass" || fallback === "fail" ? fallback : "pending";
+}
+
+/**
+ * One case's overall outcome from its latest result per combination, re-checked
+ * against the KPI rules. Dashboard and the Tests execution status page both use
+ * this so a screen's pass/fail counts match wherever they are shown.
+ */
+export function latestScenarioStatus(
+  rows: any[],
+  combos: any[],
+  spec: any,
+  scenarioType?: string | null,
+): "pass" | "fail" | "pending" {
+  const derived = (rows || []).map((r) => ({
+    ...r,
+    status: deriveStoredResultStatus({
+      actual: r.actual, expected: r.expected, diff: r.diff, spec,
+      scenarioType: scenarioType || undefined, fallbackStatus: r.status,
+    }),
+  }));
+  return overallStatusFromComboPairs(
+    pairCombosWithResults(combos || [], derived),
+    derived[0]?.status || "pending",
+  );
 }

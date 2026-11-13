@@ -24,8 +24,6 @@
  * Exposed to the template (drop-in replacements, same names as before):
  *      selectByLabel(label, value)        -> { ok, verified, via, error, ... }
  *      applyFiltersVerified(filters, geo) -> { ok, debug, error, final_state }
- *      applyFilter(label, value | filters, geo?)  // LLM/legacy alias
- *      applyFilters / applyFiltersInOrder         // alias -> applyFiltersVerified
  *      __rtbCheckErrorDialog(dismiss)     -> null | { error, details }
  *      __rtbReadFilter(label)             -> string | null
  *
@@ -33,7 +31,7 @@
  * template literal would eat.
  */
 
-export const FILTER_CORE_VERSION = "2.0.2";
+export const FILTER_CORE_VERSION = "2.1.0";
 
 /** Markers so non-TS artifacts (reference .js files) can have this block swapped in. */
 export const FILTER_CORE_START = "// @@RTB_FILTER_CORE_START@@";
@@ -67,9 +65,7 @@ export const FILTER_CORE_JS = String.raw`// @@RTB_FILTER_CORE_START@@
 
   function __rtbHelpersFactory(KNOWN_LABELS) {
     const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-    // Full normalized text — NOT first-token only. First-token matching made
-    // "Latest Week" == "Latest 4 Weeks" / "Latest Month" and skipped the real pick.
-    const code = s => norm(s);
+    const code = s => { const v = norm(s); const m = v.match(/^([a-z]*\d+[a-z0-9]*)\s*[-–—:]\s*\S.+$/i); return m ? 'code:' + m[1] : 'text:' + v; };
     const getDirectText = el => {
       let t = '';
       for (const n of el.childNodes) if (n.nodeType === Node.TEXT_NODE) t += n.textContent;
@@ -395,8 +391,7 @@ export const FILTER_CORE_JS = String.raw`// @@RTB_FILTER_CORE_START@@
     }, fn, args || []).catch(() => ({ error: 'evaluate failed: ' + fn }));
   };
 
-  const __rtbNorm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-  const __rtbCode = s => __rtbNorm(s);
+  const __rtbCode = s => { const v = String(s || '').replace(/\s+/g, ' ').trim().toLowerCase(); const m = v.match(/^([a-z]*\d+[a-z0-9]*)\s*[-–—:]\s*\S.+$/i); return m ? 'code:' + m[1] : 'text:' + v; };
 
   const __rtbCloseDropdown = async () => { await __rtbH('closeDropdown'); await sleep(300); };
 
@@ -511,7 +506,7 @@ export const FILTER_CORE_JS = String.raw`// @@RTB_FILTER_CORE_START@@
   };
 
   /** Apply a whole combination in geo order, aborting on the first unverified pick. */
-  const applyFiltersVerified = async (filters, geoOrder) => {
+  const applyFiltersVerified = async (filters, geoOrder, selector = selectByLabel) => {
     const order = geoOrder || ['Team', 'Brand', 'Area', 'Region', 'Territory', 'Time Bucket'];
     const debug = {};
     const allKeys = Object.keys(filters || {});
@@ -519,7 +514,7 @@ export const FILTER_CORE_JS = String.raw`// @@RTB_FILTER_CORE_START@@
     const otherKeys = allKeys.filter(k => order.indexOf(k) === -1);
 
     for (const key of geoKeys.concat(otherKeys)) {
-      const r = await selectByLabel(key, filters[key]);
+      const r = await selector(key, filters[key]);
       debug[key] = r;
       if (!r.ok) return { ok: false, debug: debug, failed_on: key, error: r.error, detail: r };
     }
@@ -532,38 +527,22 @@ export const FILTER_CORE_JS = String.raw`// @@RTB_FILTER_CORE_START@@
 
     // Final safety net: nothing drifted while later filters were applied.
     const finalState = {};
+    const evidence = [];
+    let drift = false;
     for (const key of allKeys) {
       const v = await __rtbReadFilter(key);
       finalState[key] = v;
-      if (!v || __rtbCode(v) !== __rtbCode(filters[key])) {
-        return {
-          ok: false, debug: debug, final_state: finalState,
-          error: 'FILTER_DRIFT',
-          message: 'Filter "' + key + '" drifted to "' + v + '" before extraction (expected "' + filters[key] + '")'
-        };
-      }
+      const verified = !!v && __rtbCode(v) === __rtbCode(filters[key]);
+      evidence.push({ key, requested: filters[key], observed: v || null, selection_outcome: debug[key] && debug[key].ok ? 'selected' : 'failed', verification_outcome: verified ? 'verified' : 'failed', error: verified ? null : 'FILTER_DRIFT' });
+      if (!verified) drift = true;
     }
-    return { ok: true, debug: debug, final_state: finalState };
+    if (drift) return { ok: false, debug, final_state: finalState, evidence, error: 'FILTER_DRIFT', message: 'Final observed filters do not match the requested combination' };
+    return { ok: true, debug: debug, final_state: finalState, evidence };
   };
-
-  // LLM/legacy aliases — saved scripts sometimes call these instead of the verified APIs.
-  const applyFilter = async (labelOrFilters, valueOrGeo) => {
-    if (labelOrFilters && typeof labelOrFilters === 'object' && !Array.isArray(labelOrFilters)) {
-      return applyFiltersVerified(labelOrFilters, valueOrGeo);
-    }
-    return selectByLabel(labelOrFilters, valueOrGeo);
-  };
-  const applyFilters = applyFiltersVerified;
-  const applyFiltersInOrder = applyFiltersVerified;
 // @@RTB_FILTER_CORE_END@@`;
 
 /** Swap the marked core block inside an already-assembled script (used for reference .js files). */
 export function injectFilterCore(src: string): string {
-  // Record-count templates nest @@RTB_RECORD_COUNT_FRAME_CORE@@ inside the same
-  // START/END markers. Replacing that block with generic FILTER_CORE_JS strips
-  // tryFrame/resultFrame and yields Brand empty extractions (solo keeps the raw
-  // saved script and works). Never overwrite that specialized core.
-  if (/@@RTB_RECORD_COUNT_FRAME_CORE@@/.test(src)) return src;
   const start = src.indexOf(FILTER_CORE_START);
   const end = src.indexOf(FILTER_CORE_END);
   if (start === -1 || end === -1 || end < start) return src;

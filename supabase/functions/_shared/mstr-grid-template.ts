@@ -570,25 +570,10 @@ ${FILTER_CORE_JS}
     ? __filterCombinations : [];
 
   const scrapeOnce = async (filters) => {
-    const debug = {};
     const GEO_ORDER = ['Team', 'Brand', 'Area', 'Region', 'Territory', 'Time Bucket'];
-    const allKeys = Object.keys(filters || {});
-    const geoKeys = GEO_ORDER.filter(k => allKeys.includes(k));
-    const otherKeys = allKeys.filter(k => !GEO_ORDER.includes(k));
-    for (const key of geoKeys) {
-      debug[key] = await selectByLabel(key, filters[key]);
-      await dismissGenericErrorDialog();
-      await closeAnyOpenDropdown();
-    }
-    for (const key of otherKeys) {
-      debug[key] = await selectByLabel(key, filters[key]);
-      await dismissGenericErrorDialog();
-      await closeAnyOpenDropdown();
-    }
-    await waitForLoadingToFinish(15000);
-    await waitForDashboard();
-
-    const row = { filters_applied: debug };
+    const verification = await applyFiltersVerified(filters, GEO_ORDER);
+    if (!verification.ok) return { ok: false, error: verification.error, requested_filters: filters, filter_verification: verification, filters_applied: verification.final_state || null };
+    const row = { filters_applied: verification.final_state, requested_filters: filters, filter_verification: verification };
 
     // Visit each sub-tab and extract the row count from Show Data
     for (const tab of SUB_TABS) {
@@ -628,8 +613,9 @@ ${FILTER_CORE_JS}
   }
 
   const results = {};
+  const results_by_id = {};
   for (let i = 0; i < filterCombinations.length; i++) {
-    const { label = String(i), filters = {} } = filterCombinations[i];
+    const { id, label = String(i), filters = {} } = filterCombinations[i];
     if (i > 0) {
       await page.goto(reportUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
       await waitForDossierReady();
@@ -638,9 +624,11 @@ ${FILTER_CORE_JS}
       }
       await waitForDashboard();
     }
-    results[label] = await scrapeOnce(filters);
+    const row = { ...await scrapeOnce(filters), combo_id: id || null };
+    if (id) results_by_id[id] = row;
+    if (filterCombinations.filter(c => c.label === label).length === 1) results[label] = row;
   }
-  return { navigation: navDebug, results };
+  return { navigation: navDebug, results, results_by_id };
 };
 `;
 }
@@ -2168,34 +2156,11 @@ ${FILTER_CORE_JS}
   };
 
   const scrapeOnce = async (filters) => {
-    const debug = {};
     const GEO_ORDER = ['Team', 'Brand', 'Area', 'Region', 'Territory', 'Time Bucket'];
-    const VIEW_BY_KEY = 'View By';
-    const allKeys = Object.keys(filters || {});
-    const geoKeys = GEO_ORDER.filter(k => allKeys.includes(k));
-    const otherKeys = allKeys.filter(k => !GEO_ORDER.includes(k) && k !== VIEW_BY_KEY);
-    // Apply geo filters and other filters first — each triggers a page
-    // reload inside MSTR that can reset View By back to its default.
-    for (const key of geoKeys) {
-      debug[key] = await selectByLabel(key, filters[key]);
-      await dismissGenericErrorDialog();
-      await closeAnyOpenDropdown();
-    }
-    for (const key of otherKeys) {
-      debug[key] = await selectByLabel(key, filters[key]);
-      await dismissGenericErrorDialog();
-      await closeAnyOpenDropdown();
-    }
-    await waitForLoadingToFinish(15000);
-    // Apply "View By" LAST — after all other filters have settled.
-    // MSTR resets View By when geo filters trigger page reloads, so it
-    // must be the final filter change before scraping.
-    if (allKeys.includes(VIEW_BY_KEY)) {
-      debug[VIEW_BY_KEY] = await applyViewBy(VIEW_BY_KEY, filters[VIEW_BY_KEY]);
-      await waitForLoadingToFinish(15000);
-    }
-    await waitForDashboard();
-    const row = { filters_applied: debug };
+    const ordered = GEO_ORDER.concat(Object.keys(filters || {}).filter(key => !GEO_ORDER.includes(key) && key !== 'View By'), ['View By']);
+    const verification = await applyFiltersVerified(filters, ordered, (key, value) => key === 'View By' ? applyViewBy(key, value) : selectByLabel(key, value));
+    if (!verification.ok) return { ok: false, error: verification.error, requested_filters: filters, filter_verification: verification, filters_applied: verification.final_state || null };
+    const row = { filters_applied: verification.final_state, requested_filters: filters, filter_verification: verification };
     // Primary: widget Menu → Show Data (clean multi-col table). Fallback: on-page scrape.
     // Try viz title ("Performance Trend Grid") before the shorter tab label.
     const titles = gridTitleHints();
@@ -2227,17 +2192,20 @@ ${FILTER_CORE_JS}
   }
 
   const results = {};
+  const results_by_id = {};
   for (let i = 0; i < filterCombinations.length; i++) {
-    const { label = String(i), filters = {} } = filterCombinations[i];
+    const { id, label = String(i), filters = {} } = filterCombinations[i];
     if (i > 0) {
       await page.goto(reportUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
       await waitForDossierReady();
       await runNav();
       await waitForDashboard();
     }
-    results[label] = await scrapeOnce(filters);
+    const row = { ...await scrapeOnce(filters), combo_id: id || null };
+    if (id) results_by_id[id] = row;
+    if (filterCombinations.filter(c => c.label === label).length === 1) results[label] = row;
   }
-  return { navigation: navDebug, results };
+  return { navigation: navDebug, results, results_by_id };
 };
 `;
 }

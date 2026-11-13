@@ -623,8 +623,9 @@ ${FILTER_CORE_JS}
   }
 
   const results = {};
+  const results_by_id = {};
   for (let i = 0; i < filterCombinations.length; i++) {
-    const { label = String(i), filters = {} } = filterCombinations[i];
+    const { id, label = String(i), filters = {} } = filterCombinations[i];
     if (i > 0) {
       await page.goto(reportUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
       await waitForDossierReady();
@@ -632,48 +633,23 @@ ${FILTER_CORE_JS}
       await waitForDashboard();
     }
 
-    const debug = {};
     const GEO_ORDER = ['Team', 'Brand', 'Area', 'Region', 'Territory', 'Time Bucket'];
-    const allKeys = Object.keys(filters);
-    const geoKeys = GEO_ORDER.filter(k => allKeys.includes(k));
-    const otherKeys = allKeys.filter(k => !GEO_ORDER.includes(k));
-    for (const key of geoKeys) {
-      debug[key] = await selectByLabel(key, filters[key]);
+    const verification = await applyFiltersVerified(filters, GEO_ORDER);
+    const row = { combo_id: id || null, requested_filters: filters, filters_applied: verification.final_state || null, filter_verification: verification };
+    if (!verification.ok) {
+      row.ok = false; row.error = verification.error;
+      if (id) results_by_id[id] = row;
+      if (filterCombinations.filter(c => c.label === label).length === 1) results[label] = row;
+      continue;
     }
-    for (const key of otherKeys) {
-      debug[key] = await selectByLabel(key, filters[key]);
-    }
-    await closeAnyOpenDropdown();
-    await waitForLoadingToFinish(15000);
-    await waitForDashboard();
-
-    const row = { filters_applied: debug };
     for (const k of KPI_LABELS) {
       const raw = await extractKPI(k);
       row[k] = toNum(raw && raw.value);
     }
-    // Time-bucket / cold-load miss: reload once when every configured KPI is empty.
-    const useful = KPI_LABELS.some((k) => row[k] != null && String(row[k]).trim() !== '');
-    if (!useful && KPI_LABELS.length) {
-      await page.goto(reportUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-      await waitForDossierReady();
-      await runNav();
-      await waitForDashboard();
-      for (const key of geoKeys.concat(otherKeys)) {
-        debug[key] = await selectByLabel(key, filters[key]);
-      }
-      await closeAnyOpenDropdown();
-      await waitForLoadingToFinish(15000);
-      await waitForDashboard();
-      row.filters_applied = debug;
-      for (const k of KPI_LABELS) {
-        const raw = await extractKPI(k);
-        row[k] = toNum(raw && raw.value);
-      }
-    }
-    results[label] = row;
+    if (id) results_by_id[id] = row;
+    if (filterCombinations.filter(c => c.label === label).length === 1) results[label] = row;
   }
-  return { navigation: navDebug, results };
+  return { navigation: navDebug, results, results_by_id };
 };
 `;
 }
