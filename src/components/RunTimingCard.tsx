@@ -3,7 +3,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { ChevronDown, ChevronUp, Eye } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { collectAttempts, formatMs, summarizeRunTiming, type RunTiming } from "@/lib/runTiming";
+import { collectAttempts, formatMs, formatMsLong, summarizeRunTiming, type RunTiming } from "@/lib/runTiming";
 
 type Kpi = { label: string; meaning: string; value: (t: RunTiming) => string };
 const ms = (f: (t: RunTiming) => number) => (t: RunTiming) => formatMs(f(t));
@@ -75,11 +75,18 @@ export function RunTimingCard({ run, results }: { run: any; results: any[] }) {
     <Card>
       <CardContent className="p-3 space-y-3 text-sm">
         <div className="flex items-center justify-between gap-2">
-          <div className="min-w-0 overflow-x-auto whitespace-nowrap text-xs sm:text-sm">
-            <span className="font-medium">Execution time:</span>
-            {" Tool "}<span className="font-medium">{formatMs(timing.tool_ms)}</span>
-            {" vs Report "}<span className="font-medium">{formatMs(timing.report_ms)}</span>
-            {" = Total "}<span className="font-medium">{formatMs(timing.wall_ms)}</span>
+          <div className="min-w-0 overflow-x-auto whitespace-nowrap text-xs sm:text-sm flex items-center gap-4">
+            <span className="font-medium text-blue-600 dark:text-blue-400">
+              Total Execution Time - {formatMsLong(timing.wall_ms)}
+            </span>
+            <span className="inline-flex items-center gap-1.5 text-muted-foreground">
+              <span className="h-2.5 w-2.5 shrink-0 rounded-sm bg-accent" aria-hidden />
+              Tool Time - <span className="font-medium text-foreground">{formatMsLong(timing.tool_ms)}</span>
+            </span>
+            <span className="inline-flex items-center gap-1.5 text-muted-foreground">
+              <span className="h-2.5 w-2.5 shrink-0 rounded-sm bg-primary" aria-hidden />
+              Report Time - <span className="font-medium text-foreground">{formatMsLong(timing.report_ms)}</span>
+            </span>
           </div>
           <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => setOpen(!open)} aria-label={open ? "Hide timing details" : "Show timing details"} aria-expanded={open} title={open ? "Hide timing details" : "Show timing details"}>
             {open ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
@@ -87,8 +94,8 @@ export function RunTimingCard({ run, results }: { run: any; results: any[] }) {
         </div>
         {open && <>
         <div className="flex h-2 w-full overflow-hidden rounded bg-muted">
-          <div className="bg-accent" style={{ width: `${pct(timing.tool_ms)}%` }} />
-          <div className="bg-primary" style={{ width: `${pct(timing.report_ms)}%` }} />
+          <div className="bg-accent" style={{ width: `${pct(timing.tool_ms)}%` }} title="Tool time" />
+          <div className="bg-primary" style={{ width: `${pct(timing.report_ms)}%` }} title="Report time" />
         </div>
         <TooltipProvider delayDuration={100}>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">

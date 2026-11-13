@@ -122,4 +122,14 @@ export const PHASES = [
     const m = Math.floor(s / 60);
     return m < 60 ? `${m}m ${s % 60}s` : `${Math.floor(m / 60)}h ${m % 60}m`;
   }
+
+  /** Longer labels for the summary strip, e.g. "30 min 20 sec". */
+  export function formatMsLong(ms: number): string {
+    const s = Math.round(ms / 1000);
+    if (s < 60) return `${s} sec`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m} min ${s % 60} sec`;
+    const h = Math.floor(m / 60);
+    return `${h} hr ${m % 60} min ${s % 60} sec`;
+  }
   
