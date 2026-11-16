@@ -18,7 +18,12 @@ export function buildSyncRows(runId: string, scenarioId: string, combos: any[], 
       ? { ...(incoming?.expectedEvidence || {}), ...identity, values: incoming?.expectedMap || {} }
       : previous?.expected || {};
     const diff = actualUpdated || expectedUpdated ? null : previous?.diff ?? null;
-    const status = deriveStoredResultStatus({ actual, expected, diff, spec: { kpi_tolerances: snapshot }, fallbackStatus: actualUpdated || expectedUpdated ? incoming?.status || "pending" : previous?.status || "pending" });
+    // A fresh comparison must not inherit a pending aggregate from a one-sided
+    // live preview. Side-level execution states still retain their precedence.
+    const fallbackStatus = actualUpdated || expectedUpdated
+      ? (incoming?.status === "pending" ? undefined : incoming?.status)
+      : previous?.status || "pending";
+    const status = deriveStoredResultStatus({ actual, expected, diff, spec: { kpi_tolerances: snapshot }, fallbackStatus });
     return [{ run_id: runId, scenario_id: scenarioId, actual, expected, status, diff, analysis: "Updated from explicit Sync" }];
   });
 }

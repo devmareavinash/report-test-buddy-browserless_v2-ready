@@ -1949,11 +1949,14 @@ Deno.serve(async (req) => {
               let expectedMap: Record<string, any> = {};
               let sqlMeta: any = { source: isRef ? "reference_script" : (sqlTplId ? "warehouse" : "none") };
               let sqlRow: Record<string, any> | null = null;
+              // Reference values only count when its own filters were read back.
+              let refFilterVerificationOk = true;
 
               if (isRef) {
                 const comboRefResp = selectedResponse(isolatedRefResponses.get(String(combo.id)) || refResp, combo);
                 const comboRefExec = comboRefResp?.extracted;
                 const referenceVerification = verifyFilterEvidence(combo.filters || {}, pickComboFiltersApplied(comboRefResp, combo.label));
+                refFilterVerificationOk = referenceVerification.ok;
                 const comboRefError =
                   refError || (!referenceVerification.ok ? "Reference filter verification failed" : null) ||
                   comboExecutionError(comboRefResp, combo.label) ||
@@ -2448,7 +2451,7 @@ Deno.serve(async (req) => {
                 if (refOutcome.category !== "pass") comboPass = false;
               }
 
-              if (mainOutcome.category !== "pass" || !filterVerification.ok) comboPass = false;
+              if (mainOutcome.category !== "pass" || !filterVerification.ok || !refFilterVerificationOk) comboPass = false;
 
               let failureCategory: ExtractionFailureCategory = comboPass
                 ? "pass"
@@ -2467,7 +2470,7 @@ Deno.serve(async (req) => {
                 if (failureCategory === "pass") failureCategory = "fail";
               }
 
-              if (!filterVerification.ok) failureCategory = "partial_extraction";
+              if (!filterVerification.ok || !refFilterVerificationOk) failureCategory = "partial_extraction";
               const status = statusFromCategory(failureCategory, comboPass);
               const attemptCount = Number((comboRunResp as any)?.__rtb_attempts) ||
                 Number((comboRunResp as any)?.auth_session_attempts) || 1;

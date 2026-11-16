@@ -33,6 +33,7 @@ import { matchCombination } from "../../supabase/functions/_shared/combination-i
 import { deriveExecutionOutcome, executionErrors, outcomeStatus } from "../../supabase/functions/_shared/execution-status";
 import { syncScenarioResults, summarizeResultRows } from "@/lib/resultSync";
 import { collectPages } from "@/lib/paginatedQuery";
+import { createManualExecutionTarget, requireSavedRun } from "@/lib/manualExecutionTarget";
 import { fetchAllResultsNewestFirst, fetchFilterMatrixByScenarioIds, pairCombosWithResults } from "@/lib/latestTestResults";
 import { ScriptAgentChat } from "@/components/ScriptAgentChat";
 import { MessageSquare } from "lucide-react";
@@ -126,6 +127,16 @@ export default function ScenarioDetail() {
   const [refRunError, setRefRunError] = useState<string | null>(null);
   const [refRunResult, setRefRunResultState] = useState<any>(null);
   // Latest Expected payload for saves started before it finished (state would be stale in that closure).
+  const actualSaveTarget = useRef<ReturnType<typeof createManualExecutionTarget> | null>(null);
+  const captureActualRun = () => {
+    const active = actualSaveTarget.current;
+    if (active?.scenarioId === id) return active.savedRun;
+    return supabase.from("test_results").select("run_id").eq("scenario_id", id || "")
+      .order("created_at", { ascending: false }).limit(1).then(({ data, error }) => {
+        if (error) throw error;
+        return data?.[0]?.run_id || null;
+      });
+  };
   const refRunResultRef = useRef<any>(null);
   const setRefRunResult = (value: any) => { refRunResultRef.current = value; setRefRunResultState(value); };
   const [refRunning, setRefRunning] = useState<null | "headed" | "headless">(null);
@@ -464,6 +475,9 @@ export default function ScenarioDetail() {
   };
 
   const runMode = async (mode: "headed" | "headless") => {
+    if (!id) return;
+    const saveTarget = createManualExecutionTarget(id);
+    actualSaveTarget.current = saveTarget;
     setHeadlessSteps([]);
     setRunError(null); setRunResult(null); setLiveUrl(null); setRunning(mode);
     try {
@@ -493,7 +507,7 @@ export default function ScenarioDetail() {
           setRunResult(data);
           toast.info(data.fallback_reason || "Live debug is unavailable; ran headless instead.");
           setDetailTab("result");
-          void persistManualHeadlessRun({
+          const savedRunId = await persistManualHeadlessRun({
             scenarioId: id!,
             reportId: (scenario as any)?.reports?.id,
             payload: data,
@@ -505,10 +519,10 @@ export default function ScenarioDetail() {
             sqlByCombo: comboResults,
             sqlResult,
             isReferenceMatch,
-          }).then((ok) => {
-            if (ok) invalidateLatestStatusViews(qc, id!, (scenario as any)?.reports?.id);
-            else toast.error("Run finished but latest status was not saved");
           });
+          saveTarget.complete(savedRunId || null);
+          if (savedRunId) invalidateLatestStatusViews(qc, id, (scenario as any)?.reports?.id);
+          else toast.error("Run finished but latest status was not saved");
         }
         else setRunError("Runtime did not return a live_url");
       } else {
@@ -517,7 +531,7 @@ export default function ScenarioDetail() {
         if (kpis) toast.success(`Extracted ${Object.keys(kpis).length} KPIs`);
         else toast.success("Headless run finished");
         setDetailTab("result");
-        void persistManualHeadlessRun({
+        const savedRunId = await persistManualHeadlessRun({
           scenarioId: id!,
           reportId: (scenario as any)?.reports?.id,
           payload: data,
@@ -529,14 +543,15 @@ export default function ScenarioDetail() {
           sqlByCombo: comboResults,
           sqlResult,
           isReferenceMatch,
-        }).then((ok) => {
-          if (ok) invalidateLatestStatusViews(qc, id!, (scenario as any)?.reports?.id);
-          else toast.error("Run finished but latest status was not saved");
         });
+          saveTarget.complete(savedRunId || null);
+          if (savedRunId) invalidateLatestStatusViews(qc, id, (scenario as any)?.reports?.id);
+          else toast.error("Run finished but latest status was not saved");
       }
     } catch (e: any) {
       setRunError(String(e?.message || e));
     } finally {
+      saveTarget.complete(null);
       setRunning(null);
     }
   };
@@ -581,7 +596,9 @@ export default function ScenarioDetail() {
   };
 
   const autoHeal = async () => {
-    if (autoHealing) return;
+    if (autoHealing || !id) return;
+    const saveTarget = createManualExecutionTarget(id);
+    actualSaveTarget.current = saveTarget;
     setAutoHealing(true);
     setAutoHealLog([]);
     setHealProposal(null);
@@ -608,7 +625,7 @@ export default function ScenarioDetail() {
           toast.success(`Auto-heal converged after ${attempt} attempt(s)`);
           setRunError(null);
           setDetailTab("result");
-          void persistManualHeadlessRun({
+          const savedRunId = await persistManualHeadlessRun({
             scenarioId: id!,
             reportId: (scenario as any)?.reports?.id,
             payload: runData,
@@ -620,10 +637,10 @@ export default function ScenarioDetail() {
             sqlByCombo: comboResults,
             sqlResult,
             isReferenceMatch,
-          }).then((ok) => {
-            if (ok) invalidateLatestStatusViews(qc, id!, (scenario as any)?.reports?.id);
-            else toast.error("Run finished but latest status was not saved");
           });
+          saveTarget.complete(savedRunId || null);
+          if (savedRunId) invalidateLatestStatusViews(qc, id, (scenario as any)?.reports?.id);
+          else toast.error("Run finished but latest status was not saved");
           return;
         }
         setRunError(errMsg || "Run failed");
@@ -679,6 +696,7 @@ export default function ScenarioDetail() {
       log(`Error: ${e?.message || e}`);
       toast.error(e?.message || "Auto-heal failed");
     } finally {
+      saveTarget.complete(null);
       setAutoHealing(false);
       qc.invalidateQueries({ queryKey: ["script", id] });
     }
@@ -721,7 +739,8 @@ export default function ScenarioDetail() {
   };
 
   const runRefMode = async (mode: "headed" | "headless") => {
-    const refStartedAt = new Date().toISOString();
+    const targetRun = Promise.resolve(captureActualRun());
+    void targetRun.catch(() => {});
     setReferenceSteps([]);
     setRefRunError(null); setRefRunResult(null); setRefLiveUrl(null); setRefRunning(mode);
     try {
@@ -745,32 +764,33 @@ export default function ScenarioDetail() {
       if (mode === "headed") {
         if (data?.live_url) setRefLiveUrl(data.live_url);
         else if (data?.requested_mode === "headed" && data?.mode === "headless") {
-          setRefRunResult(data);
           toast.info(data.fallback_reason || "Live debug is unavailable; ran headless instead.");
-        } else setRefRunError("Runtime did not return a live_url");
-      } else {
+        } else { setRefRunError("Runtime did not return a live_url"); return; }
+      }
+      if (mode === "headless" || (data?.requested_mode === "headed" && data?.mode === "headless")) {
         setRefRunResult(data);
         const kpis = extractKpisFromRun(data);
         toast.success(kpis ? `Reference: extracted ${Object.keys(kpis).length} KPIs` : "Reference run finished");
         setDetailTab("result");
-        void persistReferenceHeadlessRun({
-          scenarioId: id!,
-          payload: data,
-          combos: combos || [],
-          tolerances: kpiTolerances,
-          startedAt: refStartedAt,
-        }).then((ok) => {
-          if (ok) invalidateLatestStatusViews(qc, id!, (scenario as any)?.reports?.id);
+        const targetRunId = await requireSavedRun(targetRun);
+        const ok = await persistReferenceHeadlessRun({
+          scenarioId: id || "", payload: data, combos: combos || [],
+          tolerances: kpiTolerances, targetRunId,
         });
+        if (!ok) throw new Error("Reference finished but its matching Actual result could not be updated.");
+        invalidateLatestStatusViews(qc, id || "", (scenario as any)?.reports?.id);
       }
     } catch (e: any) {
       setRefRunError(String(e?.message || e));
+      toast.error(String(e?.message || e));
     } finally {
       setRefRunning(null);
     }
   };
 
   const runSql = async () => {
+    const targetRun = Promise.resolve(captureActualRun());
+    void targetRun.catch(() => {});
     setSqlRunning(true); setSqlResult(null);
     try {
       const { data, error } = await invokeFunction("run-warehouse-sql", { sql_template_id: tplId || null, scenario_id: id, limit: 5 });
@@ -779,6 +799,7 @@ export default function ScenarioDetail() {
       if (data?.ok) {
         toast.success(`${data.source === "snowflake" ? "Snowflake" : "Mock"}: ${data.row_count} row(s)`);
         const persisted = await persistWarehouseExpected({
+          targetRunId: await requireSavedRun(targetRun),
           scenarioId: id!,
           reportId: (scenario as any)?.reports?.id,
           combos: combos || [],
@@ -786,6 +807,7 @@ export default function ScenarioDetail() {
           sqlResult: data,
           tolerances: kpiTolerances,
         });
+        if (!persisted) throw new Error("Expected values could not be saved to the intended Actual result.");
         if (persisted) {
           await invalidateLatestStatusViews(qc, id!, (scenario as any)?.reports?.id);
         }
@@ -849,6 +871,8 @@ export default function ScenarioDetail() {
       toast.error(msg);
       return;
     }
+    const targetRun = Promise.resolve(captureActualRun());
+    void targetRun.catch(() => {});
     setComboRunning(combo.id);
     try {
       const { data, error } = await invokeFunction("run-warehouse-sql", {
@@ -864,6 +888,7 @@ export default function ScenarioDetail() {
       if (data?.ok) {
         toast.success(`${combo.label || "Combination"}: ${data.row_count} row(s)`);
         const persisted = await persistWarehouseExpected({
+          targetRunId: await requireSavedRun(targetRun),
           scenarioId: id!,
           reportId: (scenario as any)?.reports?.id,
           combos: combos || [],
@@ -871,6 +896,7 @@ export default function ScenarioDetail() {
           sqlResult: data,
           tolerances: kpiTolerances,
         });
+        if (!persisted) throw new Error("Expected values could not be saved to the intended Actual result.");
         if (persisted) {
           await invalidateLatestStatusViews(qc, id!, (scenario as any)?.reports?.id);
         }
@@ -3083,7 +3109,7 @@ async function persistManualHeadlessRun(opts: {
   sqlByCombo?: Record<string, any>;
   sqlResult?: any;
   isReferenceMatch?: boolean;
-}): Promise<boolean> {
+}): Promise<string | false> {
   const {
     scenarioId, reportId, payload, combos, criticality,
     referencePayload, storedRows, tolerances, sqlByCombo, sqlResult, isReferenceMatch,
@@ -3183,98 +3209,27 @@ async function persistManualHeadlessRun(opts: {
   const rollup = summarizeResultRows(rows);
   const finalized = await supabase.from("runs").update({ status: rollup.status, summary: { source: "headless", ...rollup.summary }, finished_at: rollup.status === "running" ? null : new Date().toISOString() }).eq("id", run.id);
   if (finalized.error) throw finalized.error;
-  return true;
+  return String(run.id);
 }
 
 async function persistWarehouseExpected(opts: {
   scenarioId: string;
+  targetRunId: string;
   reportId?: string;
   combos: any[];
   sqlByCombo?: Record<string, any>;
   sqlResult?: any;
   tolerances?: Record<string, Tolerance>;
 }): Promise<boolean> {
-  const { scenarioId, reportId, combos, sqlByCombo, sqlResult, tolerances } = opts;
+  const { scenarioId, reportId, combos, sqlByCombo, sqlResult, tolerances, targetRunId } = opts;
   if (!scenarioId) return false;
-  const { data: recent } = await supabase
-    .from("test_results")
-    .select("id, run_id, expected, actual, status")
-    .eq("scenario_id", scenarioId)
-    .order("created_at", { ascending: false })
-    .limit(25);
-  const latestRunId = recent?.[0]?.run_id;
-  let runRows = latestRunId ? (recent || []).filter((r: any) => r.run_id === latestRunId) : [];
+  const latestRunId = targetRunId;
+  if (!latestRunId) return false;
+  let runRows = latestRunId ? await collectPages<any>((start, end) => supabase.from("test_results")
+    .select("id, run_id, expected, actual, status").eq("scenario_id", scenarioId)
+    .eq("run_id", latestRunId).order("id").range(start, end)) : [];
 
-  if (!runRows.length) {
-    if (!reportId) return false;
-    const { data: run, error: runErr } = await supabase.from("runs").insert({
-      scope_type: "scenario",
-      scope_id: scenarioId,
-      trigger_source: "manual",
-      status: "pending",
-      summary: { source: "warehouse_sql", pass: 0, fail: 0, pending: 0, total: 0 },
-    }).select("id").single();
-    if (runErr || !run) return false;
-    const inserts: any[] = [];
-    if (combos?.length) {
-      for (let i = 0; i < combos.length; i++) {
-        const c = combos[i];
-        const label = comboPersistLabel(c, i);
-        const sqlRes = sqlByCombo?.[c.id] || (sqlResult?.ok ? sqlResult : null);
-        const configuredKeys = Object.keys(tolerances || {}).filter((key) => !isKpiNoiseKey(key));
-        const expectedValues = expectedFromSql(
-          sqlRes,
-          configuredKeys.length ? configuredKeys : Object.keys(sqlRes?.rows?.[0] || {}),
-        );
-        if (!Object.keys(expectedValues).length && sqlRes?.ok && sqlRes.scalar != null) {
-          const col = sqlRes.columns?.[0] || "value";
-          expectedValues[col] = sqlRes.scalar;
-        }
-        inserts.push({
-          run_id: run.id,
-          scenario_id: scenarioId,
-          status: "pending",
-          expected: { source: "warehouse_sql", filter: label, values: expectedValues },
-          actual: { filter: label, values: {}, source: "manual_headless" },
-          diff: null,
-        });
-      }
-    } else {
-      const sqlRes = sqlResult?.ok ? sqlResult : null;
-      const configuredKeys = Object.keys(tolerances || {}).filter((key) => !isKpiNoiseKey(key));
-      const expectedValues = expectedFromSql(
-        sqlRes,
-        configuredKeys.length ? configuredKeys : Object.keys(sqlRes?.rows?.[0] || {}),
-      );
-      if (!Object.keys(expectedValues).length && sqlRes?.ok && sqlRes.scalar != null) {
-        const col = sqlRes.columns?.[0] || "value";
-        expectedValues[col] = sqlRes.scalar;
-      }
-      inserts.push({
-        run_id: run.id,
-        scenario_id: scenarioId,
-        status: "pending",
-        expected: { source: "warehouse_sql", values: expectedValues },
-        actual: { values: {}, source: "manual_headless" },
-        diff: null,
-      });
-    }
-    if (!inserts.length) return false;
-    const { error: insErr } = await supabase.from("test_results").insert(inserts);
-    if (!insErr) {
-      await supabase.from("runs").update({
-        status: "pending",
-        summary: {
-          source: "warehouse_sql",
-          pass: 0,
-          fail: 0,
-          pending: inserts.length,
-          total: inserts.length,
-        },
-      }).eq("id", run.id);
-    }
-    return !insErr;
-  }
+  if (!runRows.length) return false;
 
   let updated = 0;
   const targets = combos?.length ? combos : [null];
@@ -3303,10 +3258,12 @@ async function persistWarehouseExpected(opts: {
       expectedValues[actualKeys[0]] = sqlRes.scalar;
     }
     if (!Object.keys(expectedValues).length) continue;
-    const status = statusFromKpis(actualValues, expectedValues, tolerances);
+    const expected = { combo_id: prevExpected.combo_id || c?.id, requested_filters: prevExpected.requested_filters || c?.filters || {}, source: "warehouse_sql", filter: label || prevExpected.filter, values: expectedValues };
+    const status = outcomeStatus(deriveExecutionOutcome({ ...existing, status: existing.status === "pending" ? undefined : existing.status, expected }, statusFromKpis(actualValues, expectedValues, tolerances)));
     const { error } = await supabase.from("test_results").update({
       status,
-      expected: { ...prevExpected, source: "warehouse_sql", filter: label || prevExpected.filter, values: expectedValues },
+      expected,
+      diff: null,
       analysis: "Updated from warehouse SQL",
     }).eq("id", existing.id);
     if (error) throw error;
@@ -3315,7 +3272,9 @@ async function persistWarehouseExpected(opts: {
   if (updated && latestRunId) {
     const allRows = await collectPages<any>((start, end) => supabase.from("test_results").select("id,actual,expected,diff,status").eq("run_id", latestRunId).order("id").range(start, end));
     const rollup = summarizeResultRows(allRows);
-    const update = await supabase.from("runs").update({ status: rollup.status, summary: rollup.summary }).eq("id", latestRunId);
+    const { data: run, error: runError } = await supabase.from("runs").select("summary").eq("id", latestRunId).maybeSingle();
+    if (runError) throw runError;
+    const update = await supabase.from("runs").update({ status: rollup.status, summary: { ...(run?.summary as any || {}), ...rollup.summary }, finished_at: rollup.status === "running" ? null : new Date().toISOString() }).eq("id", latestRunId);
     if (update.error) throw update.error;
   }
   return updated > 0;
@@ -3323,29 +3282,19 @@ async function persistWarehouseExpected(opts: {
 
 async function persistReferenceHeadlessRun(opts: {
   scenarioId: string;
+  targetRunId: string;
   payload: any;
   combos: any[];
   tolerances?: Record<string, Tolerance>;
-  startedAt?: string;
 }): Promise<boolean> {
-  const { scenarioId, payload, combos, tolerances, startedAt } = opts;
+  const { scenarioId, payload, combos, tolerances, targetRunId } = opts;
   if (!scenarioId || !payload) return false;
-  // Only patch the latest run. Updating all recent rows rewrote past history
-  // statuses whenever a new reference run failed (e.g. FAIL badge on an older
-  // row whose analysis still said "live comparison passed").
-  const { data: recent } = await supabase
-    .from("test_results")
-    .select("id, run_id, expected, actual, status, created_at")
-    .eq("scenario_id", scenarioId)
-    .order("created_at", { ascending: false })
-    .limit(25);
-  if (!recent?.length) return false;
-  // A result saved before this Expected run started belongs to an older run; the
-  // Actual save still in progress picks these values up instead.
-  if (startedAt && Date.parse(String(recent[0]?.created_at || "")) < Date.parse(startedAt)) return false;
-  const latestRunId = recent[0]?.run_id;
+  const latestRunId = targetRunId;
+  if (!latestRunId) return false;
   const runRows = latestRunId
-    ? recent.filter((r: any) => r.run_id === latestRunId)
+    ? await collectPages<any>((start, end) => supabase.from("test_results")
+      .select("id, run_id, expected, actual, status, created_at")
+      .eq("scenario_id", scenarioId).eq("run_id", latestRunId).order("id").range(start, end))
     : [];
   if (!runRows.length) return false;
 
@@ -3371,17 +3320,27 @@ async function persistReferenceHeadlessRun(opts: {
     if (!values || !Object.keys(values).length) continue;
     const prevExpected = (row.expected && typeof row.expected === "object") ? row.expected : {};
     const actualValues = kpiMapFromStored(row.actual) || {};
-    const status = outcomeStatus(deriveExecutionOutcome(row, statusFromKpis(actualValues, values, tolerances)));
+    const expected = {
+      combo_id: matchingCombo?.id || prevExpected.combo_id,
+      requested_filters: matchingCombo?.filters || prevExpected.requested_filters || {},
+      source: "reference_script",
+      timing: payload?.__run_timing || null,
+      filter: matchingCombo?.label || prevExpected.filter || null,
+      values,
+      extracted: payload?.extracted ?? null,
+    };
+    // Pending comparison status is replaced by the new comparison, not used as
+    // execution evidence. Actual errors/cancellation and side-level states stay.
+    const status = outcomeStatus(deriveExecutionOutcome({
+      ...row,
+      status: row.status === "pending" ? undefined : row.status,
+      expected,
+    }, statusFromKpis(actualValues, values, tolerances)));
     const { error } = await supabase.from("test_results").update({
-      expected: {
-        ...prevExpected,
-        source: "reference_script",
-        timing: payload?.__run_timing || null,
-        filter: matchingCombo?.label || prevExpected.filter || null,
-        values,
-        extracted: payload?.extracted ?? null,
-      },
+      expected,
       status,
+      diff: null,
+      analysis: "Updated from Reference script",
     }).eq("id", row.id);
     if (error) throw error;
     updated += 1;
@@ -3389,7 +3348,9 @@ async function persistReferenceHeadlessRun(opts: {
   if (updated && latestRunId) {
     const allRows = await collectPages<any>((start, end) => supabase.from("test_results").select("id,actual,expected,diff,status").eq("run_id", latestRunId).order("id").range(start, end));
     const rollup = summarizeResultRows(allRows);
-    const update = await supabase.from("runs").update({ status: rollup.status, summary: rollup.summary, finished_at: rollup.status === "running" ? null : new Date().toISOString() }).eq("id", latestRunId);
+    const { data: run, error: runError } = await supabase.from("runs").select("summary").eq("id", latestRunId).maybeSingle();
+    if (runError) throw runError;
+    const update = await supabase.from("runs").update({ status: rollup.status, summary: { ...(run?.summary as any || {}), ...rollup.summary }, finished_at: rollup.status === "running" ? null : new Date().toISOString() }).eq("id", latestRunId);
     if (update.error) throw update.error;
   }
   return updated > 0;

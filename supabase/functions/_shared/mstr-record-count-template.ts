@@ -1,8 +1,8 @@
 import { normalizeReportUrl } from "./mstr-overview-template.ts";
+import recordCountReference from "./references/browserless-record-count.ts";
 
-async function loadRecordCountReference(): Promise<string> {
-  const url = new URL("./references/browserless-record-count.js", import.meta.url);
-  return await Deno.readTextFile(url);
+function loadRecordCountReference(): string {
+  return recordCountReference;
 }
 
 export function sanitizeRecordCountNavSteps(
@@ -48,7 +48,7 @@ export async function assembleRecordCountScript(opts: {
   subTabs: string[];
   kpiPrefix?: string;
 }): Promise<string> {
-  let src = await loadRecordCountReference();
+  let src = loadRecordCountReference();
   const reportUrl = normalizeReportUrl(opts.reportUrl);
   const subTabs = (opts.subTabs || [])
     .map((s) => String(s || "").trim())

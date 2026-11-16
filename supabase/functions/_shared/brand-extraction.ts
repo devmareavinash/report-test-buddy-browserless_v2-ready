@@ -32,6 +32,8 @@ export function selectComboNode(payload: unknown, label: string | null, comboId?
       }
       return null;
     }
+    // Single (no-filter) runs are keyed "__single__" by isolated retries.
+    if (label === null && !comboId && isMap(node.__single__)) return node.__single__;
     if (label !== null && isMap(node[label])) return node[label];
     if (label !== null) {
       const normalizedLabel = label.toLowerCase().replace(/[–—]/g, "-").replace(/\s+/g, " ").trim();

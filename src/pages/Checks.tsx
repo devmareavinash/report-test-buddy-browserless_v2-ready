@@ -72,14 +72,14 @@ export default function Checks() {
                 className="block border border-border rounded-md p-3 hover:bg-secondary/40"
               >
                 <div className="flex items-center gap-2">
-                  <StatusChip status={r.criticality || r.severity || r.status} />
+                  <StatusChip status={r.status} />
                   <span className="text-sm font-medium">{r.scenarios?.title || "(deleted scenario)"}</span>
                   <span className="text-xs text-muted-foreground mono ml-auto">
                     {r.scenarios?.reports?.workstreams?.name} / {r.scenarios?.reports?.name}
                   </span>
                 </div>
                 <div className="text-xs text-muted-foreground mt-1">
-                  expected <span className="mono">{JSON.stringify(r.expected?.value)}</span> · actual <span className="mono">{JSON.stringify(r.actual?.value)}</span>
+                  expected <span className="mono">{JSON.stringify(r.expected?.values ?? r.expected?.value)}</span> · actual <span className="mono">{JSON.stringify(r.actual?.values ?? r.actual?.value)}</span>
                 </div>
                 {r.analysis && <div className="text-xs mt-1">{r.analysis}</div>}
               </Link>

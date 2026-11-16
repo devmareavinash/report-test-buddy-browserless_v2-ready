@@ -2158,7 +2158,31 @@ ${FILTER_CORE_JS}
   const scrapeOnce = async (filters) => {
     const GEO_ORDER = ['Team', 'Brand', 'Area', 'Region', 'Territory', 'Time Bucket'];
     const ordered = GEO_ORDER.concat(Object.keys(filters || {}).filter(key => !GEO_ORDER.includes(key) && key !== 'View By'), ['View By']);
-    const verification = await applyFiltersVerified(filters, ordered, (key, value) => key === 'View By' ? applyViewBy(key, value) : selectByLabel(key, value));
+    // When View By is coarser than a geography level (e.g. Area), MSTR hides
+    // the lower prompts. A hidden lower level requested as "Total" is skipped
+    // and recorded as such, instead of failing with "No selector bound".
+    const GEO_LEVELS = ['Area', 'Region', 'Territory'];
+    const viewLevel = GEO_LEVELS.indexOf(String((filters || {})['View By'] || '').trim());
+    const hiddenTotals = [];
+    if (viewLevel !== -1) {
+      for (const key of GEO_LEVELS.slice(viewLevel + 1)) {
+        if (!(key in (filters || {})) || !/^total$/i.test(String(filters[key] || '').trim())) continue;
+        const shown = await __rtbReadFilter(key);
+        if (!shown) hiddenTotals.push(key);
+      }
+    }
+    const applied = { ...(filters || {}) };
+    for (const key of hiddenTotals) delete applied[key];
+    const verification = await applyFiltersVerified(applied, ordered, (key, value) => key === 'View By' ? applyViewBy(key, value) : selectByLabel(key, value));
+    if (verification.ok && hiddenTotals.length) {
+      verification.final_state = { ...(verification.final_state || {}) };
+      verification.evidence = verification.evidence || [];
+      for (const key of hiddenTotals) {
+        verification.final_state[key] = filters[key];
+        verification.evidence.push({ key, requested: filters[key], observed: filters[key], selection_outcome: 'hidden_below_view_level', verification_outcome: 'verified', error: null });
+      }
+      verification.hidden_below_view_level = hiddenTotals;
+    }
     if (!verification.ok) return { ok: false, error: verification.error, requested_filters: filters, filter_verification: verification, filters_applied: verification.final_state || null };
     const row = { filters_applied: verification.final_state, requested_filters: filters, filter_verification: verification };
     // Primary: widget Menu → Show Data (clean multi-col table). Fallback: on-page scrape.

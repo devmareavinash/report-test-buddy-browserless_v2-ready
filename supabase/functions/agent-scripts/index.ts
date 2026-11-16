@@ -54,6 +54,15 @@ import { runGenerateValidationLoop } from "../_shared/script-gen-validate-loop.t
 import { ScriptAgentSessionLog } from "../_shared/script-agent-log.ts";
 import { fetchCanonicalScript, insertScriptRow, updateScriptRow } from "../_shared/canonical-script.ts";
 
+async function mergeScriptSpec(
+  sb: any, id: string, patch: Record<string, unknown>, remove: string[] = [], fields: Record<string, unknown> = {},
+) {
+  const { data, error } = await sb.rpc("merge_script_spec", { p_id: id, p_patch: patch, p_remove: remove, p_fields: fields });
+  const row = Array.isArray(data) ? data[0] : data;
+  if (!error && !row) return { data: null, error: { message: "Script row not found or not editable" } };
+  return { data: row, error };
+}
+
 async function persistGeneratedScript(
   sb: ReturnType<typeof getSupabaseForRequest>,
   opts: {
@@ -81,7 +90,13 @@ async function persistGeneratedScript(
       __reference_generated_at: new Date().toISOString(),
     };
     if (existing) {
-      const { data, error } = await updateScriptRow(sb, existing.id, { assertion_spec: nextSpec });
+      // Merge only the reference keys in the database so a concurrent main
+      // script save for the same screen is not overwritten.
+      const { data, error } = await mergeScriptSpec(sb, existing.id, {
+        __reference_playwright_code: playwright_code,
+        __reference_generated_by: generatedBy,
+        __reference_generated_at: nextSpec.__reference_generated_at,
+      });
       if (error) throw new Error(`Failed to save reference script: ${error.message}`);
       return data;
     }
@@ -113,9 +128,18 @@ async function persistGeneratedScript(
         }
         : {}),
     };
-    const update: any = { playwright_code, debug_status: "draft", assertion_spec: nextSpec };
-    if (mainShouldUseReferenceSource && credId) update.credential_profile_id = credId;
-    const { data, error } = await updateScriptRow(sb, existing.id, update);
+    const fields: any = { playwright_code, debug_status: "draft" };
+    if (mainShouldUseReferenceSource && credId) fields.credential_profile_id = credId;
+    // Merge only main-script keys so a concurrent reference save survives.
+    const patch: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(nextSpec)) {
+      if (v !== undefined && (k.startsWith("__") ? !k.startsWith("__reference_") : k === "kpis" || k === "kpi_tolerances")) {
+        if ((k === "kpis" || k === "kpi_tolerances") && !String(generatedBy).includes("trend_check")) continue;
+        patch[k] = v;
+      }
+    }
+    const remove = mainShouldUseReferenceSource ? [] : ["__main_uses_reference_source"];
+    const { data, error } = await mergeScriptSpec(sb, existing.id, patch, remove, fields);
     if (error) throw new Error(`Failed to save generated script: ${error.message}`);
     if (!data?.playwright_code) throw new Error("Script save returned empty playwright_code");
     return data;
