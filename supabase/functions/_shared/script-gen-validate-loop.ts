@@ -21,6 +21,8 @@ import {
 import { SCRIPT_GEN_SKILL_LLM_BLOCK } from "./script-gen-skill.ts";
 import type { ScriptAgentSessionLog } from "./script-agent-log.ts";
 import { reportExecutionRetryStop } from "./extraction-outcome.ts";
+import { prepareReportExecution } from "./report-login-safety.ts";
+import { parse } from "npm:acorn@^8.15.0";
 
 export const SCRIPT_VALIDATE_MAX_ATTEMPTS = 5;
 
@@ -51,7 +53,7 @@ export async function executeScriptValidation(opts: {
   const body: Record<string, unknown> = {
     mode: "headless",
     scenario_id: opts.scenarioId,
-    code: opts.code,
+    code: prepareReportExecution(opts.code, parse),
     target: opts.target,
   };
   // Validate against a single combo to keep generate latency bounded.
@@ -189,7 +191,7 @@ export async function runGenerateValidationLoop(opts: {
       "warn",
     );
     return {
-      playwright_code: opts.initialCode,
+      playwright_code: prepareReportExecution(opts.initialCode, parse),
       generatedBy: opts.generatedBy,
       meta: opts.meta,
       validation: {
@@ -216,7 +218,7 @@ export async function runGenerateValidationLoop(opts: {
       "warn",
     );
     return {
-      playwright_code: opts.initialCode,
+      playwright_code: prepareReportExecution(opts.initialCode, parse),
       generatedBy: opts.generatedBy,
       meta: opts.meta,
       validation: {
@@ -267,7 +269,7 @@ export async function runGenerateValidationLoop(opts: {
     code_bytes: opts.initialCode.length,
   });
 
-  let code = opts.initialCode;
+  let code = prepareReportExecution(opts.initialCode, parse);
   let generatedBy = opts.generatedBy;
   const reports: ValidationReport[] = [];
   let infraRetried = false;
@@ -414,7 +416,7 @@ export async function runGenerateValidationLoop(opts: {
         attempt: attempt + 1,
       });
       if (repaired) {
-        code = repaired;
+        code = prepareReportExecution(repaired, parse);
         generatedBy = `skill:repair:${attempt}`;
         await log?.log("script-validate", "repair_ok", "Repair agent returned updated script", {
           attempt,

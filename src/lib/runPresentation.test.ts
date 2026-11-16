@@ -22,10 +22,10 @@ describe("consistent run presentation", () => {
     expect(matchesRunOutcome(run, counts, "pass")).toBe(true);
     expect(matchesRunOutcome(run, counts, "fail")).toBe(false);
   });
-  it("keeps a genuine mismatch failed across counts, badge and filters", () => {
+  it("keeps comparison mismatches in counts while lifecycle stays completed", () => {
     const counts = countRunCases(deriveRunResults([{ ...row, actual: { values: { ...values, Target: { columns: ["Option", "Present"], rows: [["Different", 1]] } } } }], specs));
     expect(counts.fail).toBe(1);
-    expect(presentedRunStatus(run, counts)).toBe("failed");
+    expect(presentedRunStatus(run, counts)).toBe("completed");
     expect(matchesRunOutcome(run, counts, "fail")).toBe(true);
     expect(matchesRunOutcome(run, counts, "pass")).toBe(false);
   });

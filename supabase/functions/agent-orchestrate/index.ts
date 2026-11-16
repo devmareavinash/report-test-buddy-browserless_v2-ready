@@ -2,6 +2,7 @@ import { verifyFilterEvidence } from "../_shared/filter-verification.ts";
 import { createTimingCollector } from "../_shared/run-timing.ts";
 import { parse } from "npm:acorn@^8.15.0";
 import { instrumentReportTiming } from "../_shared/script-timing.ts";
+import { prepareReportExecution } from "../_shared/report-login-safety.ts";
 import { retryTransient } from "../_shared/transient-retry.ts";
 import { combinationId, matchCombination } from "../_shared/combination-identity.ts";
 import { deriveExecutionOutcome, outcomeCounts } from "../_shared/execution-status.ts";
@@ -1555,7 +1556,7 @@ Deno.serve(async (req) => {
               await cancellation.throwIfCancelled(
                 runtimeCtx(target, comboLabel, 1, "before_runtime"),
               );
-              const timedBody = { ...body, code: instrumentReportTiming(String(body.code || ""), parse) };
+              const timedBody = { ...body, code: instrumentReportTiming(prepareReportExecution(String(body.code || ""), parse), parse) };
               const timedCall = async (attempt: number, reason: string | null) => {
                 const stopped = stoppedReportLogins.get(loginKey);
                 if (stopped) return { ...stopped, __rtb_login_blocked: true };

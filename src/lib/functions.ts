@@ -1,4 +1,6 @@
 import { supabase } from "@/integrations/supabase/client";
+import { parse } from "acorn";
+import { prepareReportExecution } from "../../supabase/functions/_shared/report-login-safety";
 
 type InvokeResult<T = any> = { data: T | null; error: Error | null };
 
@@ -92,12 +94,23 @@ async function authHeaders(forLongRun = false) {
 }
 
 export async function invokeFunction<T = any>(name: string, body: any): Promise<InvokeResult<T>> {
-  if (!shouldUseLocalBackend(name)) {
-    const { data, error } = await supabase.functions.invoke(name, { body });
-    return { data: (data as T) ?? null, error: error ? new Error(error.message) : null };
-  }
-
   try {
+    if (name === "playwright-runtime" && typeof body?.code === "string") {
+      body = { ...body, code: prepareReportExecution(body.code, parse) };
+    }
+    if (!shouldUseLocalBackend(name)) {
+      const { data, error } = await supabase.functions.invoke(name, { body });
+      if (!error) return { data: (data as T) ?? null, error: null };
+      // HTTP failures carry the useful service diagnostic in their response.
+      // Return it through the same handled-error contract as self-hosted calls.
+      let payload: any = data ?? null;
+      const context = error.context;
+      if (context instanceof Response) {
+        try { payload = await context.clone().json(); } catch { /* retain original error */ }
+      }
+      const message = payload?.message || payload?.error || error.message;
+      return { data: payload, error: new Error(String(message)) };
+    }
     const path = `/functions/v1/${name}`;
     const response = await fetch(`${functionsBaseUrl()}${path}`, {
       method: "POST",

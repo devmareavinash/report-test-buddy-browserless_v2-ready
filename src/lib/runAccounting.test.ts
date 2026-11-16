@@ -23,12 +23,12 @@ describe("run accounting invariant", () => {
     expect(brandLifecycleFromAccounting("completed", c)).toBe("completed");
   });
 
-  it("B: scenario 5 fails, rest pass → overall FAIL, 0 pending", () => {
+  it("B: scenario 5 fails, rest pass → lifecycle COMPLETED, 1 fail in counts", () => {
     const ids = Array.from({ length: 44 }, (_, i) => `s${i}`);
     const existing = new Map(ids.map((id, i) => [id, i === 4 ? "fail" as const : "pass" as const]));
     const c = countAccountedCases(mergeExpectedCaseStatuses(existing, ids, "failed").values());
     expect(c).toEqual({ pass: 43, fail: 1, pending: 0, not_executed: 0, total: 44 });
-    expect(brandLifecycleFromAccounting("failed", c)).toBe("failed");
+    expect(brandLifecycleFromAccounting("failed", c)).toBe("completed");
   });
 
   it("C: multiple extraction failures still account all 44", () => {

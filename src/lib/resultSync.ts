@@ -31,7 +31,8 @@ export function summarizeResultRows(rows: any[], expectedUnits: number = rows.le
   const outcomes = rows.map(row => deriveExecutionOutcome(row, deriveStoredResultStatus({ actual: row.actual, expected: row.expected, diff: row.diff, fallbackStatus: row.status })));
   while (outcomes.length < expectedUnits) outcomes.push("pending");
   const summary = outcomeCounts(outcomes);
-  const status = summary.pending ? "running" : summary.cancelled ? "cancelled" : summary.fail ? "failed" : "completed";
+  // Comparison fails stay in summary; lifecycle is completed once every unit finished.
+  const status = summary.pending ? "running" : summary.cancelled ? "cancelled" : "completed";
   return { summary, status };
 }
 export async function syncScenarioResults(db: any, run: any, scenarioId: string, combos: any[], live: any[], snapshot: any) {

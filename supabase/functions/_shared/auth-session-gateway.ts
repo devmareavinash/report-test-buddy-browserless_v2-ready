@@ -4,6 +4,8 @@
 import { getSupabaseForRequest } from "./auth.ts";
 import { fetchCanonicalScript } from "./canonical-script.ts";
 import { authSessionLog } from "./auth-session-log.ts";
+import { parse } from "npm:acorn@^8.15.0";
+import { prepareReportExecution } from "./report-login-safety.ts";
 import {
   clearAuthSession,
   extractionLooksUnusable,
@@ -132,7 +134,7 @@ export function withPlaywrightAuthSession(handler: Handler): Handler {
 
     const scenarioId = typeof body.scenario_id === "string" ? body.scenario_id : undefined;
     const target: "main" | "reference" = body.target === "reference" ? "reference" : "main";
-    const code = typeof body.code === "string" ? body.code : "";
+    const code = typeof body.code === "string" ? prepareReportExecution(body.code, parse) : "";
     const profileId = await resolveCredentialProfileId(req, scenarioId, target);
 
     let storageState = null;

@@ -116,7 +116,7 @@ export function collapseScenarioStatuses(statuses: string[]): CaseOutcome {
   return "pending";
 }
 
-/** Parent Brand may only be COMPLETED when every expected case is terminal and passes. */
+/** Parent Brand is COMPLETED when every expected case finished; check fails stay in counts. */
 export function brandLifecycleFromAccounting(
   runStatus: string | null | undefined,
   counts: AccountedCounts,
@@ -134,7 +134,7 @@ export function brandLifecycleFromAccounting(
     if (st === "cancelled") return "cancelled";
     return "failed"; // incomplete — do not present as completed
   }
-  if (executionFailed || counts.fail > 0) return "failed";
+  if (executionFailed) return "failed";
   if (!counts.total) return st || "failed";
   return "completed";
 }
