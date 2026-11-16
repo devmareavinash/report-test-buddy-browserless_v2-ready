@@ -30,7 +30,8 @@ Deno.serve(async (req) => {
     const isProbe = explicitProbe || !hasCreds;
 
     // Refuse if any users already exist — bootstrap is a one-shot.
-    const { data: list } = await sb.auth.admin.listUsers({ page: 1, perPage: 1 });
+    const { data: list, error: listError } = await sb.auth.admin.listUsers({ page: 1, perPage: 1 });
+    if (listError || !list) throw listError || new Error("Could not verify initialization status");
     if (list && list.users.length > 0) {
       if (isProbe) {
         return new Response(
@@ -75,9 +76,11 @@ Deno.serve(async (req) => {
       email_confirm: true,
     });
     if (createErr) throw createErr;
-    const userId = created!.user!.id;
+    const userId = created?.user?.id;
+    if (!userId) throw new Error("Admin account creation returned no user");
 
-    await sb.from("user_roles").insert({ user_id: userId, role: "admin" });
+    const { error: roleError } = await sb.from("user_roles").insert({ user_id: userId, role: "admin" });
+    if (roleError) throw new Error("Account created, but admin role assignment failed");
 
     return new Response(
       JSON.stringify({ ok: true, status: "created", email }),

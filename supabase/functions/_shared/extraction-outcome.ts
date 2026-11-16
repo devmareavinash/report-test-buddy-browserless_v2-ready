@@ -2,6 +2,7 @@
  * Classify scrape payloads and completeness for Brand/Report reliability.
  * Used by agent-orchestrate (and mirrored tests). Does not change Browserless.
  */
+import { executionErrors } from "./execution-status.ts";
 
 export type ExtractionFailureCategory =
   | "pass"
@@ -53,7 +54,30 @@ export function isBrowserlessTimeoutError(error: unknown): boolean {
 
 export function isAuthFailureError(error: unknown): boolean {
   const text = String(error || "");
-  return /LOGIN_FAILED|AUTH_REQUIRED|session\s*expir|login\s*page|auth_failure|stayed_on_login/i.test(text);
+  return /LOGIN_FAILED|AUTH_REQUIRED|session[\s_]*expir|login\s*page|auth_failure|stayed_on_login|invalid[\s_]*(credential|password|user)|wrong[\s_]*password|account[\s_]*(locked|expired|disabled)|account.*(lock|expir|disabl|suspend)/i.test(text);
+}
+
+/** Nested execution envelopes must not hide a login failure from retry callers. */
+export function reportLoginFailure(payload: unknown): string | null {
+  const error = executionErrors(payload).find(isAuthFailureError);
+  if (error) return classifyAuthFailureReason(error);
+  const seen = new Set<object>();
+  const walk = (value: unknown, depth = 0): boolean => {
+    if (!value || typeof value !== "object" || depth > 12 || seen.has(value)) return false;
+    seen.add(value);
+    const node = value as Record<string, unknown>;
+    if (isAuthFailureError(node.error) || isAuthFailureError(node.message)) return true;
+    if (looksLikeLoginPageUrl(node.url) || looksLikeLoginPageUrl(node.final_url)) return true;
+    return Object.entries(node).some(([key, child]) => !["values", "rows", "data", "columns", "diff"].includes(key) && walk(child, depth + 1));
+  };
+  return walk(payload) ? "stayed_on_login_page" : null;
+}
+
+/** A timeout cannot establish whether the login submission already happened. */
+export function reportExecutionRetryStop(payload: unknown): string | null {
+  const login = reportLoginFailure(payload);
+  if (login) return login;
+  return executionErrors(payload).some(isBrowserlessTimeoutError) ? "browserless_timeout" : null;
 }
 
 /**
@@ -69,7 +93,7 @@ export function classifyAuthFailureReason(
   if (/account.*(lock|expir|disabl|suspend)|locked|disabled/i.test(text)) {
     return "account_locked_or_expired";
   }
-  if (/invalid.*(credential|password|user)|bad.?credential|wrong.?password|LOGIN_FAILED/i.test(text)) {
+  if (/invalid.*(credential|password|user)|bad.?credential|wrong.?password/i.test(text)) {
     return "invalid_credentials";
   }
   if (/sso|saml|oauth|interstitial|redirect/i.test(text)) {
@@ -156,10 +180,11 @@ export function classifyRuntimePayload(
   }
 
   const loginUrl = looksLikeLoginPageUrl(url);
-  const authErr = isAuthFailureError(error);
+  const nestedAuth = reportLoginFailure(payload);
+  const authErr = isAuthFailureError(error) || Boolean(nestedAuth);
   if (loginUrl || authErr) {
     const reason = classifyAuthFailureReason(
-      error || (loginUrl ? `${target}_stayed_on_login_page` : "authentication_failed"),
+      error || nestedAuth || (loginUrl ? `${target}_stayed_on_login_page` : "authentication_failed"),
       url,
     );
     return {

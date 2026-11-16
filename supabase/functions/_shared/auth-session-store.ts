@@ -3,6 +3,7 @@
 // on subsequent executions. Cookie values are never logged.
 
 import { authSessionLog } from "./auth-session-log.ts";
+import { isAuthFailureError, reportLoginFailure } from "./extraction-outcome.ts";
 
 export type PlaywrightStorageState = {
   cookies?: Array<Record<string, unknown>>;
@@ -74,12 +75,13 @@ export function looksLikeLoginPageUrl(url: unknown): boolean {
 }
 
 export function shouldClearAuthSession(extracted: unknown): boolean {
+  if (reportLoginFailure(extracted)) return true;
   const walk = (v: unknown, depth = 0): boolean => {
     if (!v || typeof v !== "object" || depth > 6) return false;
     const o = v as Record<string, unknown>;
     const err = String(o.error || o.message || "");
     // Dead/expired MicroStrategy sessions often surface as login failures.
-    if (/LOGIN_FAILED|AUTH_REQUIRED|session\s*expir/i.test(err)) return true;
+    if (isAuthFailureError(err)) return true;
     if (looksLikeLoginPageUrl(o.url) || looksLikeLoginPageUrl(o.final_url)) return true;
     if (o.result && walk(o.result, depth + 1)) return true;
     if (o.extracted && walk(o.extracted, depth + 1)) return true;
@@ -89,13 +91,14 @@ export function shouldClearAuthSession(extracted: unknown): boolean {
 }
 
 /**
- * Fresh-login retry + session clear is allowed only on explicit auth failure.
+ * A failed login clears cached cookies but never authorizes another submission.
  * Generic empty/partial KPI extraction must NOT clear a reusable session.
  */
 export function shouldRetryAuthSessionFresh(payload: unknown): boolean {
-  if (!payload || typeof payload !== "object") return false;
-  const p = payload as Record<string, unknown>;
-  return shouldClearAuthSession(p) || shouldClearAuthSession(p.extracted);
+  // Five wrong passwords lock the report account. Even LOGIN_FAILED may mean
+  // an unfinished redirect, so replaying it is unsafe without operator review.
+  void payload;
+  return false;
 }
 
 function isNoiseExtractionKey(k: string): boolean {

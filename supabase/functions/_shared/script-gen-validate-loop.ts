@@ -20,6 +20,7 @@ import {
 } from "./script-validation.ts";
 import { SCRIPT_GEN_SKILL_LLM_BLOCK } from "./script-gen-skill.ts";
 import type { ScriptAgentSessionLog } from "./script-agent-log.ts";
+import { reportExecutionRetryStop } from "./extraction-outcome.ts";
 
 export const SCRIPT_VALIDATE_MAX_ATTEMPTS = 5;
 
@@ -299,6 +300,13 @@ export async function runGenerateValidationLoop(opts: {
     const runMs = Date.now() - runStarted;
 
     const report = analyzeScriptRun(runPayload, expectations);
+    const loginFailure = reportExecutionRetryStop(runPayload);
+    if (loginFailure) {
+      report.ok = false;
+      report.summary = `Report sign-in stopped: ${loginFailure}`;
+      report.checks.push({ name: "runtime", pass: false, detail: loginFailure });
+      report.repairHints = "Do not retry report sign-in. Confirm account access before executing again.";
+    }
     report.attempt = attempt;
     reports.push(report);
 
@@ -345,6 +353,10 @@ export async function runGenerateValidationLoop(opts: {
       };
     }
 
+    if (loginFailure) {
+      await log?.log("script-validate", "login_stop", "Report sign-in failed; no automatic retry or script repair", { attempt, stop_loop: true, reason: loginFailure }, "warn");
+      break;
+    }
     if (isBrowserlessLaunchCrash(report, runPayload)) {
       if (!infraRetried && attempt < maxAttempts) {
         infraRetried = true;

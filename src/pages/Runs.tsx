@@ -6,17 +6,12 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Link, useSearchParams } from "react-router-dom";
 import { StatusChip } from "@/components/StatusChip";
 import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { XCircle, Trash2 } from "lucide-react";
 import { toast } from "@/hooks/use-toast";
 import { fetchRunAssertionSpecs, fetchRunTestResults } from "@/lib/runTestResults";
 import { deriveRunResults, matchesRunOutcome, presentedRunStatus } from "@/lib/runPresentation";
-import {
-  caseOutcomeFromStatus,
-  countAccountedCases,
-  mergeExpectedCaseStatuses,
-  type CaseOutcome,
-} from "@/lib/runAccounting";
 
 export default function Runs() {
   const queryClient = useQueryClient();
@@ -41,30 +36,12 @@ export default function Runs() {
       (await supabase.from("scenarios").select("id, report_id, deferred")).data ?? [],
   });
 
-  const { data: runs } = useQuery({
+  const { data: runs, error: runsError, isPending: runsLoading, refetch: refetchRuns } = useQuery({
     queryKey: ["all-runs"],
     queryFn: async () => {
-      // Recent history (may drop older rows once >200 newer runs exist).
-      const recent = (await supabase
-        .from("runs")
-        .select("*")
-        .order("started_at", { ascending: false })
-        .limit(200)).data ?? [];
-      // Always merge active locks — Screens uses the full running set, so a stuck
-      // run older than the recent window must still appear (and be cancellable).
-      const active = (await supabase
-        .from("runs")
-        .select("*")
-        .eq("status", "running")
-        .order("started_at", { ascending: false })
-        .limit(1000)).data ?? [];
-      const byId = new Map<string, any>();
-      for (const row of [...active, ...recent]) {
-        if (row?.id) byId.set(row.id, row);
-      }
-      return Array.from(byId.values()).sort(
-        (a, b) => new Date(b.started_at || 0).getTime() - new Date(a.started_at || 0).getTime(),
-      );
+      const { data, error } = await supabase.from("runs").select("*").order("started_at", { ascending: false }).limit(200);
+      if (error) throw error;
+      return data ?? [];
     },
     refetchInterval: (query) =>
       ((query.state.data as any[]) || []).some((run: any) => run.status === "running") ? 3000 : false,
@@ -113,15 +90,12 @@ export default function Runs() {
 
   const caseCounts = (run: any) => {
     const m = runMeta?.[run.id];
-    const caseStatus = new Map<string, CaseOutcome>();
+    const caseStatus = new Map<string, "pass" | "fail" | "pending">();
     for (const [scenarioId, statuses] of m?.cases || []) {
-      const outcomes = statuses.map((st) => caseOutcomeFromStatus(st));
-      if (outcomes.some((o) => o === "fail")) caseStatus.set(scenarioId, "fail");
-      else if (outcomes.some((o) => o === "pending")) caseStatus.set(scenarioId, "pending");
-      else if (outcomes.some((o) => o === "blocked")) caseStatus.set(scenarioId, "blocked");
-      else if (outcomes.some((o) => o === "cancelled")) caseStatus.set(scenarioId, "cancelled");
-      else if (outcomes.some((o) => o === "not_started")) caseStatus.set(scenarioId, "not_started");
-      else caseStatus.set(scenarioId, "pass");
+      caseStatus.set(
+        scenarioId,
+        statuses.includes("fail") ? "fail" : statuses.includes("pending") ? "pending" : "pass",
+      );
     }
     const reportIds = run.scope_type === "workstream"
       ? new Set((reports || []).filter((r: any) => r.workstream_id === run.scope_id).map((r: any) => r.id))
@@ -131,71 +105,16 @@ export default function Runs() {
       : (scenarios || [])
           .filter((s: any) => !s.deferred && reportIds.has(s.report_id))
           .map((s: any) => s.id);
-    // Finished runs must still account for never-started expected scenarios.
-    const merged = mergeExpectedCaseStatuses(
-      caseStatus,
-      scopedScenarioIds,
-      run.status,
-      run.summary,
-    );
-    const accounted = countAccountedCases(merged.values());
-    return {
-      pass: accounted.pass,
-      fail: accounted.fail,
-      pending: accounted.pending + accounted.not_executed,
-      not_executed: accounted.not_executed,
-      total: accounted.total,
-    };
-  };
-
-  const scopeLabels = (r: any): string[] => {
-    const out: string[] = [];
-    if (r.scope_type === "workstream" && r.scope_id) {
-      const ws = (workstreams || []).find((w: any) => w.id === r.scope_id);
-      if (ws?.name) out.push(String(ws.name).toLowerCase());
-    } else if (r.scope_type === "report" && r.scope_id) {
-      const rep = (reports || []).find((x: any) => x.id === r.scope_id);
-      if (rep?.name) out.push(String(rep.name).toLowerCase());
-      const ws = (workstreams || []).find((w: any) => w.id === rep?.workstream_id);
-      if (ws?.name) out.push(`${ws.name} / ${rep?.name || ""}`.toLowerCase());
-    } else if (r.scope_type === "scenario" && r.scope_id) {
-      const sc = (scenarios || []).find((s: any) => s.id === r.scope_id);
-      const rep = (reports || []).find((x: any) => x.id === sc?.report_id);
-      const ws = (workstreams || []).find((w: any) => w.id === rep?.workstream_id);
-      if (rep?.name) out.push(String(rep.name).toLowerCase());
-      if (ws?.name) out.push(String(ws.name).toLowerCase());
+    for (const scenarioId of run.status === "running" ? scopedScenarioIds : []) {
+      if (!caseStatus.has(scenarioId)) caseStatus.set(scenarioId, "pending");
     }
-    return out;
-  };
-
-  const runMatchesWorkstream = (r: any, m: any, wantWs: string) => {
-    if (m?.ws?.has(wantWs)) return true;
-    if (r.scope_type === "workstream" && r.scope_id === wantWs) return true;
-    if (r.scope_type === "report" && r.scope_id) {
-      const rep = (reports || []).find((x: any) => x.id === r.scope_id);
-      return rep?.workstream_id === wantWs;
+    let pass = 0, fail = 0, pending = 0;
+    for (const value of caseStatus.values()) {
+      if (value === "pass") pass++;
+      else if (value === "fail") fail++;
+      else pending++;
     }
-    if (r.scope_type === "scenario" && r.scope_id) {
-      const sc = (scenarios || []).find((s: any) => s.id === r.scope_id);
-      const rep = (reports || []).find((x: any) => x.id === sc?.report_id);
-      return rep?.workstream_id === wantWs;
-    }
-    return false;
-  };
-
-  const runMatchesReport = (r: any, m: any, wantReport: string) => {
-    if (m?.reports?.has(wantReport)) return true;
-    if (r.scope_type === "report" && r.scope_id === wantReport) return true;
-    if (r.scope_type === "scenario" && r.scope_id) {
-      const sc = (scenarios || []).find((s: any) => s.id === r.scope_id);
-      return sc?.report_id === wantReport;
-    }
-    if (r.scope_type === "workstream" && r.scope_id) {
-      return (reports || []).some((rep: any) =>
-        rep.workstream_id === r.scope_id && rep.id === wantReport
-      );
-    }
-    return false;
+    return { pass, fail, pending, total: caseStatus.size };
   };
 
   const filtered = useMemo(() => {
@@ -204,19 +123,16 @@ export default function Runs() {
       const counts = caseCounts(r);
       if (!matchesRunOutcome(r, counts, status)) return false;
       const m = runMeta?.[r.id];
-      // Scope-based match so stuck running workstream/report runs remain visible
-      // even when they have no (or incomplete) test_results yet.
-      if (wsId !== "all" && !runMatchesWorkstream(r, m, wsId)) return false;
-      if (reportId !== "all" && !runMatchesReport(r, m, reportId)) return false;
+      if (wsId !== "all" && !m?.ws.has(wsId)) return false;
+      if (reportId !== "all" && !m?.reports.has(reportId)) return false;
       if (!q) return true;
       if (r.id.toLowerCase().includes(q)) return true;
       if (r.trigger_source?.toLowerCase().includes(q)) return true;
       if (r.scope_type?.toLowerCase().includes(q)) return true;
       for (const lbl of m?.labels || []) if (lbl.includes(q)) return true;
-      for (const lbl of scopeLabels(r)) if (lbl.includes(q)) return true;
       return false;
     });
-  }, [runs, runMeta, reports, scenarios, workstreams, status, wsId, reportId, search]);
+  }, [runs, runMeta, reports, scenarios, status, wsId, reportId, search]);
 
   const setStatus = (s: string | null) => {
     const next = new URLSearchParams(params);
@@ -251,7 +167,7 @@ export default function Runs() {
 
         <div className="flex gap-2 flex-wrap items-center mb-4">
           <div className="rounded-md border bg-muted/40 px-3 py-2 text-xs font-semibold text-foreground mono">
-            {filtered.length} runs
+            {runsError ? "Runs unavailable" : runsLoading ? "Loading runs…" : `${filtered.length} runs`}
           </div>
           <Input
             placeholder="Search id, workstream, report, trigger…"
@@ -291,6 +207,7 @@ export default function Runs() {
 
         <Card>
           <CardContent className="space-y-1 overflow-x-auto p-0">
+            {runsError && <div role="alert" className="flex items-center gap-3 p-3 text-sm text-destructive">Unable to load runs.<Button variant="outline" size="sm" onClick={() => refetchRuns()}>Retry</Button></div>}
             {resultsError && <div role="alert" className="p-3 text-sm text-destructive">Unable to load run results. Please refresh to try again.</div>}
             <div className="grid min-w-[850px] grid-cols-[90px_minmax(180px,1fr)_90px_140px_190px_110px_28px] items-center gap-3 rounded-t-xl border-b bg-slate-100 px-3 py-3 text-xs font-bold text-slate-600 dark:bg-slate-800 dark:text-slate-200">
               <span>Run ID</span>
@@ -360,8 +277,6 @@ export default function Runs() {
                         else {
                           toast({ title: "Run cancelled" });
                           queryClient.invalidateQueries({ queryKey: ["all-runs"] });
-                          queryClient.invalidateQueries({ queryKey: ["active-execution-locks"] });
-                          queryClient.invalidateQueries({ queryKey: ["run-meta"] });
                         }
                       }}
                       title="Cancel run"
@@ -381,7 +296,7 @@ export default function Runs() {
                 </Link>
               );
             })}
-            {!filtered.length && <div className="p-4 text-sm text-muted-foreground">No runs match.</div>}
+            {!runsError && !runsLoading && !filtered.length && <div className="p-4 text-sm text-muted-foreground">No runs match.</div>}
           </CardContent>
         </Card>
       </div>

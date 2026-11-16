@@ -17,10 +17,17 @@ async function fireRun(scope_type: string, scope_id: string, schedule_id: string
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const schedulerKey = Deno.env.get("SCHEDULE_TICK_SECRET");
+  const token = (req.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "").trim();
+  if (!token || !(serviceKey && token === serviceKey || schedulerKey && token === schedulerKey)) {
+    return new Response(JSON.stringify({ error: "Scheduler authorization required" }), { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+  }
   try {
     const sb = getSupabase();
     const now = new Date();
-    const { data: schedules } = await sb.from("schedules").select("*").eq("enabled", true);
+    const { data: schedules, error: schedulesError } = await sb.from("schedules").select("*").eq("enabled", true);
+    if (schedulesError) throw schedulesError;
     const fired: any[] = [];
     const skipped: any[] = [];
 

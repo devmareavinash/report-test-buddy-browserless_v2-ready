@@ -7,6 +7,8 @@ import {
   resolveAuthMode,
   snowflakeConfigured,
   snowflakeSidecarConnector,
+  normalizeSnowflakeAccount,
+  resolveSnowflakeSecret,
 } from "../_shared/snowflake-auth.ts";
 
 function normalizeHost(v?: string | null): string {
@@ -18,11 +20,11 @@ function normalizeHost(v?: string | null): string {
 }
 
 async function testPasswordOrToken(connector: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const account = normalizeHost(connector.account as string) || normalizeHost(connector.host as string);
+  const account = normalizeSnowflakeAccount(connector.account as string) || normalizeSnowflakeAccount(connector.host as string);
   if (!account) throw new Error("Snowflake connector is missing 'account'");
 
   const tokenName = connector.token_secret_ref as string | undefined;
-  const token = tokenName ? Deno.env.get(tokenName) : undefined;
+  const token = resolveSnowflakeSecret(tokenName, "token", name => Deno.env.get(name));
   const authMode = token ? "token" : "password";
 
   let authHeader: string;
@@ -34,7 +36,7 @@ async function testPasswordOrToken(connector: Record<string, unknown>): Promise<
   } else {
     const username = connector.username as string | undefined;
     const passRef = connector.password_secret_ref as string | undefined;
-    const password = passRef ? (Deno.env.get(passRef) ?? passRef) : undefined;
+    const password = resolveSnowflakeSecret(passRef, "password", name => Deno.env.get(name));
     if (!username || !password) throw new Error("Username and password required for password auth");
 
     const loginUrl = `https://${account}.snowflakecomputing.com/session/v1/login-request?` +
@@ -46,6 +48,7 @@ async function testPasswordOrToken(connector: Record<string, unknown>): Promise<
       }).toString();
     const loginRes = await fetch(loginUrl, {
       method: "POST",
+      redirect: "error",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify({
         data: {
@@ -75,6 +78,7 @@ async function testPasswordOrToken(connector: Record<string, unknown>): Promise<
   if (tokenType === "OAUTH") {
     const sfRes = await fetch(`https://${account}.snowflakecomputing.com/api/v2/statements`, {
       method: "POST",
+      redirect: "error",
       headers: {
         Authorization: authHeader,
         "X-Snowflake-Authorization-Token-Type": "OAUTH",
@@ -106,6 +110,7 @@ async function testPasswordOrToken(connector: Record<string, unknown>): Promise<
     `https://${account}.snowflakecomputing.com/queries/v1/query-request?requestId=${reqId}`,
     {
       method: "POST",
+      redirect: "error",
       headers: {
         Authorization: authHeader,
         "Content-Type": "application/json",

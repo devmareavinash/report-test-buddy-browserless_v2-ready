@@ -51,17 +51,7 @@ export function getSupabaseForRequest(req: Request): SupabaseClient {
   if (serviceRole && token === serviceRole) {
     return createClient(Deno.env.get("SUPABASE_URL")!, serviceRole);
   }
-  // Local VDI: token refresh often fails behind Skyhigh. If requireAuth already
-  // accepted an expired user JWT, PostgREST would still 401 — use service role
-  // so Generate/Run can read/write the same rows the UI already showed.
-  const claims = decodeJwtPayload(token);
-  const expMs = typeof claims?.exp === "number" ? claims.exp * 1000 : null;
-  const expiredUser = looksLikeUserJwt(claims, { allowExpiredMs: 24 * 60 * 60 * 1000 })
-    && expMs != null
-    && expMs < Date.now();
-  if (expiredUser && serviceRole && devGraceEnabled()) {
-    return createClient(Deno.env.get("SUPABASE_URL")!, serviceRole);
-  }
+  // Never promote decoded (unverified) user claims to service-role access.
   return createClient(
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_ANON_KEY")!,
@@ -77,27 +67,8 @@ export async function requireAuth(req: Request): Promise<Response | null> {
   // Allow internal service-role calls.
   if (token === Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")) return null;
 
-  const claims = decodeJwtPayload(token);
-  // Expired-token grace is opt-in only (AUTH_DEV_GRACE=true, for VDI testing).
-  const strict = !devGraceEnabled();
-  const expiredGraceMs = strict ? 0 : 24 * 60 * 60 * 1000;
-  if (looksLikeUserJwt(claims, { allowExpiredMs: expiredGraceMs })) {
-    try {
-      const sb = createClient(
-        Deno.env.get("SUPABASE_URL")!,
-        Deno.env.get("SUPABASE_ANON_KEY")!,
-        { global: { headers: { Authorization: `Bearer ${token}` } } },
-      );
-      const { data, error } = await sb.auth.getUser();
-      if (!error && data?.user) return null;
-      if (strict) return unauthorized();
-    } catch {
-      if (strict) return unauthorized();
-    }
-    return null;
-  }
-
-  // Prefer online verification (AWS / normal network) for unusual tokens.
+  // Only the auth service can verify identity. Decoded claims and network
+  // failures never authorize a caller, including in development grace mode.
   try {
     const sb = createClient(
       Deno.env.get("SUPABASE_URL")!,
@@ -106,14 +77,7 @@ export async function requireAuth(req: Request): Promise<Response | null> {
     );
     const { data, error } = await sb.auth.getUser();
     if (!error && data?.user) return null;
-    if (error && !isNetworkishAuthError(error)) return unauthorized();
-  } catch (e) {
-    if (!isNetworkishAuthError(e)) return unauthorized();
-  }
-
-  if (strict) return unauthorized();
-  if (looksLikeUserJwt(claims)) return null;
-
+  } catch { /* fail closed */ }
   return unauthorized();
 }
 

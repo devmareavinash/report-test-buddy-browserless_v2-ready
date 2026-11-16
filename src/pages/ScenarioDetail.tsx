@@ -40,6 +40,7 @@ import { MessageSquare } from "lucide-react";
 import { runTracedHeadless } from "@/lib/headlessTraceRun";
 import type { HeadlessStep } from "@/lib/headlessTrace";
 import { HeadlessStepLog } from "@/components/HeadlessStepLog";
+import { reportLoginFailure, reportExecutionRetryStop } from "../../supabase/functions/_shared/extraction-outcome";
 
 const canonFilters = (f: Record<string, string>) => {
   const keys = Object.keys(f || {}).map((k) => k.trim()).filter(Boolean).sort();
@@ -463,6 +464,7 @@ export default function ScenarioDetail() {
   const saveScript = async () => {
     let parsedSpec: any = {};
     try { parsedSpec = JSON.parse(spec); } catch { return toast.error("Assertion spec is not valid JSON"); }
+    if (!parsedSpec || typeof parsedSpec !== "object" || Array.isArray(parsedSpec)) return toast.error("Assertion spec must be a JSON object");
     parsedSpec.__reference_playwright_code = refCode || undefined;
     const payload: any = { playwright_code: code, assertion_spec: parsedSpec, sql_template_id: tplId || null, credential_profile_id: credId || null, reference_credential_profile_id: refCredId || null };
     const { data, error } = await persistCanonicalScript(id!, payload, script?.id);
@@ -499,6 +501,8 @@ export default function ScenarioDetail() {
       const { data, error } = mode === "headless"
         ? await runTracedHeadless(request, setHeadlessSteps)
         : await invokeFunction("playwright-runtime", request);
+      const loginFailure = reportLoginFailure(data);
+      if (loginFailure) { setRunResult(data); setRunError(`Report sign-in stopped: ${loginFailure}. Confirm account access before rerunning.`); toast.error("Report sign-in failed; no retry was attempted."); return; }
       const errorMessage = data?.message || error?.message || (data?.ok === false ? data?.error : null) || (!data ? "Run failed" : null);
       if (errorMessage) { setRunError(errorMessage); toast.error(errorMessage); return; }
       if (mode === "headed") {
@@ -620,6 +624,12 @@ export default function ScenarioDetail() {
         setRunResult(runData || null);
         lastResult = runData;
         lastError = errMsg || null;
+        const loginFailure = reportExecutionRetryStop(runData || { error: runErr?.message });
+        if (loginFailure) {
+          const message = `Report sign-in stopped: ${loginFailure}. Confirm account access before rerunning.`;
+          setRunError(message); log(message); toast.error(message);
+          return;
+        }
         if (runData?.ok && !errMsg) {
           log(`✓ Script succeeded on attempt ${attempt}.`);
           toast.success(`Auto-heal converged after ${attempt} attempt(s)`);
@@ -717,6 +727,8 @@ export default function ScenarioDetail() {
         code: runCode,
         filter_combinations: [{ id: combo.id, label, filters: combo.filters || {} }],
       });
+      const loginFailure = reportLoginFailure(data);
+      if (loginFailure) { toast.error(`Report sign-in stopped: ${loginFailure}`, { id: `combo-run-${combo.id}` }); return; }
       const errorMessage = data?.message || error?.message
         || (data?.ok === false ? data?.error : null) || (!data ? "Run failed" : null);
       if (errorMessage) {
@@ -759,6 +771,8 @@ export default function ScenarioDetail() {
       const { data, error } = mode === "headless"
         ? await runTracedHeadless(request, setReferenceSteps)
         : await invokeFunction("playwright-runtime", request);
+      const loginFailure = reportLoginFailure(data);
+      if (loginFailure) { setRefRunResult(data); setRefRunError(`Report sign-in stopped: ${loginFailure}. Confirm account access before rerunning.`); toast.error("Reference sign-in failed; no retry was attempted."); return; }
       const errorMessage = data?.message || error?.message || (data?.ok === false ? data?.error : null) || (!data ? "Run failed" : null);
       if (errorMessage) { setRefRunError(errorMessage); toast.error(errorMessage); return; }
       if (mode === "headed") {
@@ -892,7 +906,7 @@ export default function ScenarioDetail() {
           scenarioId: id!,
           reportId: (scenario as any)?.reports?.id,
           combos: combos || [],
-          sqlByCombo: nextCombo,
+          sqlByCombo: { [combo.id]: nextCombo[combo.id] },
           sqlResult: data,
           tolerances: kpiTolerances,
         });
@@ -3126,8 +3140,8 @@ async function persistManualHeadlessRun(opts: {
     scope_id: scenarioId,
     trigger_source: "manual",
     started_at: payload?.__run_timing?.scenario_started_at || new Date().toISOString(),
-    status: scrapeFailed ? "failed" : "completed",
-    finished_at: new Date().toISOString(),
+    status: "running",
+    finished_at: null,
     summary: { source: "headless", total: 0 },
   }).select("id").single();
   if (runErr || !run) return false;
@@ -3205,7 +3219,11 @@ async function persistManualHeadlessRun(opts: {
   }
   if (!rows.length) return false;
   const { error: insErr } = await supabase.from("test_results").insert(rows);
-  if (insErr) return false;
+  if (insErr) {
+    const failure = await supabase.from("runs").update({ status: "failed", finished_at: new Date().toISOString(), summary: { source: "headless", total: 0, error: "Result persistence failed" } }).eq("id", run.id);
+    if (failure.error) throw failure.error;
+    throw insErr;
+  }
   const rollup = summarizeResultRows(rows);
   const finalized = await supabase.from("runs").update({ status: rollup.status, summary: { source: "headless", ...rollup.summary }, finished_at: rollup.status === "running" ? null : new Date().toISOString() }).eq("id", run.id);
   if (finalized.error) throw finalized.error;

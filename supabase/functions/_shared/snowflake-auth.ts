@@ -1,5 +1,26 @@
 // Snowflake auth helpers — password, OAuth token, SSO (external browser), and key-pair (JWT).
 
+/** Restrict outbound credentials to a real Snowflake account host. */
+export function normalizeSnowflakeAccount(value?: string | null): string {
+  const account = (value || "").trim().replace(/^https:\/\//i, "").replace(/\/+$/, "").replace(/\.snowflakecomputing\.com$/i, "");
+  if (!account) return "";
+  if (account.length > 240 || !/^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?)*$/i.test(account)) throw new Error("Invalid Snowflake account hostname");
+  return account;
+}
+
+/** Arbitrary connector input must never select unrelated backend secrets. */
+export function resolveSnowflakeSecret(reference: string | undefined, kind: "password" | "token", lookup: (name: string) => string | undefined): string | undefined {
+  if (!reference) return undefined;
+  const approved = new Set(["SNOWFLAKE_PASSWORD", "SNOWFLAKE_TOKEN", ...(lookup("SNOWFLAKE_SECRET_REFS") || "").split(",").map(name => name.trim()).filter(Boolean)]);
+  if (approved.has(reference)) {
+    const value = lookup(reference);
+    if (!value) throw new Error("Configured warehouse secret is unavailable");
+    return value;
+  }
+  if (kind === "password" && !/^[A-Z][A-Z0-9_]*$/.test(reference)) return reference;
+  throw new Error("Warehouse secret reference is not approved. Configure SNOWFLAKE_SECRET_REFS on the server.");
+}
+
 export function isSsoAuth(authenticator?: string | null): boolean {
   const a = (authenticator || "password").trim().toLowerCase();
   return a === "sso" || a === "externalbrowser" || a.startsWith("http");
@@ -237,8 +258,8 @@ export async function callSnowflakeSso(
 export function snowflakeSidecarConnector(connector: Record<string, unknown>): Record<string, unknown> {
   const extra = (connector.extra || {}) as Record<string, unknown>;
   return {
-    account: connector.account,
-    host: connector.host,
+    account: normalizeSnowflakeAccount(connector.account as string) || normalizeSnowflakeAccount(connector.host as string),
+    host: normalizeSnowflakeAccount(connector.host as string),
     database: connector.database,
     schema: connector.schema,
     warehouse: connector.warehouse,

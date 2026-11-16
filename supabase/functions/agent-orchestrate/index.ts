@@ -1291,6 +1291,9 @@ Deno.serve(async (req) => {
       let pass = 0, fail = 0;
       /** When set, stop dispatching further Browserless work and terminalize. */
       let browserlessInfraDown: string | null = null;
+      // Stop subsequent units sharing credentials after an auth failure within
+      // this worker. Cross-worker/process protection requires a shared breaker.
+      const stoppedReportLogins = new Map<string, any>();
       try {
         const health0 = await checkBrowserlessHealth({ timeoutMs: 4000 });
         if (!health0.ok) {
@@ -1535,11 +1538,17 @@ Deno.serve(async (req) => {
               target: "main" | "reference",
               comboLabel: string | null,
             ) => {
-              // Auth / Browserless timeouts: always allow a second bounded attempt.
+              // Only Browserless timeouts permit a second bounded attempt.
               // Generic empty KPI retries stay limited for long PCC scrapes, but
               // grid/chart (requireStructured) always gets EXTRACTION_MAX_ATTEMPTS
               // so intermittent empty Show Data / grid scrapes can recover.
-              const authOrTimeoutMax = 2;
+              // Timeout is ambiguous: the script may already have submitted a
+              // password. Do not replay automatically before operator review.
+              const authOrTimeoutMax = 1;
+              const profileKey = target === "reference"
+                ? script?.reference_credential_profile_id || report.reference_credential_profile_id || script?.credential_profile_id || report.credential_profile_id
+                : script?.credential_profile_id || report.credential_profile_id;
+              const loginKey = String(profileKey || `${reportId}:${target}`);
               const kpiMaxAttempts = (isPccScenario && !requireStructuredExtraction)
                 ? 1
                 : EXTRACTION_MAX_ATTEMPTS;
@@ -1547,9 +1556,15 @@ Deno.serve(async (req) => {
                 runtimeCtx(target, comboLabel, 1, "before_runtime"),
               );
               const timedBody = { ...body, code: instrumentReportTiming(String(body.code || ""), parse) };
-              const timedCall = (attempt: number, reason: string | null) =>
-                scenarioTiming.time({ target, combo: comboLabel, attempt }, () => callFn("playwright-runtime", timedBody),
+              const timedCall = async (attempt: number, reason: string | null) => {
+                const stopped = stoppedReportLogins.get(loginKey);
+                if (stopped) return { ...stopped, __rtb_login_blocked: true };
+                const result = await scenarioTiming.time({ target, combo: comboLabel, attempt }, () => callFn("playwright-runtime", timedBody),
                   (r: any) => { const c = classifyRuntimePayload(r, { target }); return c.auth_failure ? "auth_failure" : c.browserless_timeout ? "browserless_timeout" : reason; });
+                const classified = classifyRuntimePayload(result, { target });
+                if (classified.auth_failure) stoppedReportLogins.set(loginKey, { ok: false, error: classified.error, extracted: { ok: false, error: classified.error } });
+                return result;
+              };
               let response = await timedCall(1, null);
               await cancellation.throwIfCancelled(
                 runtimeCtx(target, comboLabel, 1, "after_runtime"),
@@ -1558,7 +1573,7 @@ Deno.serve(async (req) => {
 
               while (attempts < authOrTimeoutMax) {
                 const classified = classifyRuntimePayload(response, { target });
-                if (!classified.auth_failure && !classified.browserless_timeout) break;
+                if (classified.auth_failure || !classified.browserless_timeout) break;
                 if (classified.browserless_timeout) {
                   const health = await checkBrowserlessHealth({ timeoutMs: 4000 });
                   jsonLog("browserless_health_after_timeout", {
@@ -1602,6 +1617,8 @@ Deno.serve(async (req) => {
                 !(response as any).__rtb_browserless_unhealthy
               ) {
                 for (let attempt = attempts; attempt < kpiMaxAttempts; attempt++) {
+                  const currentOutcome = classifyRuntimePayload(response, { target });
+                  if (currentOutcome.auth_failure || currentOutcome.browserless_timeout) break;
                   const needsRetry = comboExtractionNeedsRetry(response, comboLabel, {
                     requireStructured: requireStructuredExtraction,
                     configuredLabels: comparisonKpiLabels,
@@ -1812,7 +1829,11 @@ Deno.serve(async (req) => {
               const ambiguous = combos.filter(c => c.label === combo.label).length > 1;
               let node = selectComboNode(response, combo.label, combo.id, ambiguous);
               if (!node && combo.id == null && combo.label == null) node = selectComboNode(response, null);
-              if (!node) return { ...response, ok: false, error: 'Unresolved combination identity', extracted: { result: {} } };
+              if (!node) {
+                const failure = classifyRuntimePayload(response);
+                const error = failure.error || 'Unresolved combination identity';
+                return { ...response, ok: false, error, extracted: { ok: false, error, result: {} } };
+              }
               return { ...response, extracted: { ...(response?.extracted || {}), result: { [combo.label || "__single__"]: node } } };
             };
             if (hasCombos && !isolateCombos && !isPccScenario) {
@@ -2721,7 +2742,7 @@ Deno.serve(async (req) => {
             } else {
               const admin = getServiceClient();
               const finisher = admin || sb;
-              await finisher.from("runs").update({
+              await checkedWrite(finisher.from("runs").update({
                 status: "failed",
                 finished_at: new Date().toISOString(),
                 summary: {
@@ -2731,7 +2752,7 @@ Deno.serve(async (req) => {
                   error: "auth_expired",
                   failure_category: "auth_failure",
                 },
-              }).eq("id", run.id).eq("status", "running");
+              }).eq("id", run.id).eq("status", "running"), "Auth-expired run update failed");
             }
           } catch (finErr) {
             jsonLog("run_auth_expired_finalize_failed", {
@@ -2799,7 +2820,7 @@ Deno.serve(async (req) => {
       // @ts-ignore
       EdgeRuntime.waitUntil(work());
     } else {
-      work().catch(() => {});
+      work().catch((error) => jsonLog("background_work_failed", { run_id: run.id, error: errorDetail(error).slice(0, 300) }));
     }
 
     return new Response(JSON.stringify({ run_id: run.id, status: "running", concurrency }), {

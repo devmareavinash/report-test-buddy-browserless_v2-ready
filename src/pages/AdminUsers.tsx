@@ -15,7 +15,7 @@ import { Plus, Trash2, KeyRound } from "lucide-react";
 
 export default function AdminUsers() {
   const qc = useQueryClient();
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, error: loadError, refetch } = useQuery({
     queryKey: ["admin-users"],
     queryFn: async () => {
       const { data, error } = await invokeFunction("admin-users", {});
@@ -83,7 +83,13 @@ export default function AdminUsers() {
                 </Button>
               </div>
             ))}
-            {!isLoading && !data?.length && <div className="text-sm text-muted-foreground">No users.</div>}
+            {loadError && (
+              <div className="flex items-center gap-3 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
+                <span className="flex-1">Couldn't load users: {(loadError as Error).message}</span>
+                <Button size="sm" variant="outline" onClick={() => refetch()}>Retry</Button>
+              </div>
+            )}
+            {!isLoading && !loadError && !data?.length && <div className="text-sm text-muted-foreground">No users.</div>}
           </CardContent>
         </Card>
       </div>

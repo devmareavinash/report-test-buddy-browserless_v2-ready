@@ -5,6 +5,8 @@ import {
   interpretSnowflakeError,
   resolveAuthMode,
   snowflakeSidecarConnector,
+  normalizeSnowflakeAccount,
+  resolveSnowflakeSecret,
 } from "../_shared/snowflake-auth.ts";
 import { extractFirstTableAlias, qualifyColumn, applyFilterPredicate } from "../_shared/sql-filter.ts";
 
@@ -191,11 +193,11 @@ Deno.serve(async (req) => {
         );
       }
 
-      const account = normalizeHost(connector.account as string) || normalizeHost(connector.host as string);
+      const account = normalizeSnowflakeAccount(connector.account as string) || normalizeSnowflakeAccount(connector.host as string);
       if (!account) throw new Error("Snowflake connector is missing 'account'");
 
       const tokenName = connector.token_secret_ref as string | undefined;
-      const token = tokenName ? Deno.env.get(tokenName) : undefined;
+      const token = resolveSnowflakeSecret(tokenName, "token", name => Deno.env.get(name));
 
       let authHeader: string;
       let tokenType: string;
@@ -206,7 +208,7 @@ Deno.serve(async (req) => {
       } else {
         const username = connector.username as string | undefined;
         const passRef = connector.password_secret_ref as string | undefined;
-        const password = passRef ? (Deno.env.get(passRef) ?? passRef) : undefined;
+        const password = resolveSnowflakeSecret(passRef, "password", name => Deno.env.get(name));
         if (!username) throw new Error("Connector has no token and no 'username' for password login");
         if (!password) throw new Error("Missing Snowflake password. Set the password in Settings → Warehouses.");
 
@@ -219,6 +221,7 @@ Deno.serve(async (req) => {
           }).toString();
         const loginRes = await fetch(loginUrl, {
           method: "POST",
+          redirect: "error",
           headers: { "Content-Type": "application/json", Accept: "application/json" },
           body: JSON.stringify({
             data: {
@@ -261,6 +264,7 @@ Deno.serve(async (req) => {
         };
         const sfRes = await fetch(url, {
           method: "POST",
+          redirect: "error",
           headers: {
             Authorization: authHeader,
             "X-Snowflake-Authorization-Token-Type": "OAUTH",
@@ -286,6 +290,7 @@ Deno.serve(async (req) => {
         const qUrl = `https://${account}.snowflakecomputing.com/queries/v1/query-request?requestId=${reqId}`;
         const qRes = await fetch(qUrl, {
           method: "POST",
+          redirect: "error",
           headers: {
             Authorization: authHeader,
             "Content-Type": "application/json",
@@ -314,6 +319,7 @@ Deno.serve(async (req) => {
         for (let i = 0; i < 30 && pingPath; i++) {
           await new Promise((r) => setTimeout(r, 1000));
           const pRes = await fetch(`https://${account}.snowflakecomputing.com${pingPath}`, {
+            redirect: "error",
             headers: { Authorization: authHeader, Accept: "application/snowflake" },
           });
           payload = await pRes.json();

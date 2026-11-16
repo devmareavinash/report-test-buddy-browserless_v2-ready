@@ -105,7 +105,7 @@ export default function Tests() {
     queryFn: async () => (await supabase.from("workstreams").select("id, name")).data ?? [],
   });
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["tests-overview"],
     queryFn: async () => {
       const scenarios: any[] = await collectPages((start, end) => supabase.from("scenarios")
@@ -225,14 +225,15 @@ export default function Tests() {
               <SelectItem value="pending">Pending</SelectItem>
             </SelectContent>
           </Select>
-          <div className="text-xs text-muted-foreground mono ml-auto">{filtered.length} tests</div>
-          <Button size="sm" variant="outline" onClick={exportExcel} disabled={!filtered.length || isLoading}>
+          <div className="text-xs text-muted-foreground mono ml-auto">{error ? "Tests unavailable" : isLoading ? "Loading tests…" : `${filtered.length} tests`}</div>
+          <Button size="sm" variant="outline" onClick={exportExcel} disabled={!filtered.length || isLoading || !!error}>
             <Download className="h-4 w-4 mr-1" />Export Excel
           </Button>
         </div>
 
         <Card>
           <CardContent className="p-0">
+            {error && <div role="alert" className="flex items-center gap-3 p-3 text-sm text-destructive">Unable to load tests.<Button variant="outline" size="sm" onClick={() => refetch()}>Retry</Button></div>}
             <Table>
               <TableHeader>
                 <TableRow>
