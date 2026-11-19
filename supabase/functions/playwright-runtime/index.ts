@@ -5,6 +5,13 @@ import { corsHeaders } from "../_shared/cors.ts";
 import { getSupabase } from "../_shared/llm.ts";
 import { getSupabaseForRequest, requireAuth } from "../_shared/auth.ts";
 import { fetchCanonicalScript } from "../_shared/canonical-script.ts";
+import {
+  headedFallbackHeadless,
+  headedUseLocalChrome,
+  localHeadedChannel,
+  runOneShotLocalHeadedChrome,
+} from "../_shared/local-headed-chrome.ts";
+import { logHeadedLaunch } from "../_shared/headed-launch-log.ts";
 
 type Mode = "headed" | "headless";
 
@@ -130,51 +137,62 @@ async function callBrowserlessFunction(rt: BrowserlessRuntime, jsCode: string) {
   const url = buildBrowserlessFunctionUrl(rt);
   // OSS /chromium/function schema is only { code, context }. Extra viewport/args/launch
   // fields are rejected (400) and used to 500 on some hosts.
+  // Browserless owns Chromium lifecycle for /function; we still use try/finally so
+  // timeouts/errors never skip logging or leave our side mid-flight without a clear end.
   const jsonBody = JSON.stringify({ code: jsCode, context: {} });
   console.log(
     `playwright-runtime: POST ${rt.functionPath} bytes=${jsonBody.length} timeoutMs=${browserlessTimeoutMs()}`,
   );
-  let resp: Response;
+  let resp: Response | null = null;
   try {
-    resp = await postBrowserless(url, rt.token, "application/json", jsonBody);
-    if (resp.status === 400 || resp.status === 415 || resp.status === 422) {
-      resp = await postBrowserless(url, rt.token, "application/javascript", jsCode);
+    try {
+      resp = await postBrowserless(url, rt.token, "application/json", jsonBody);
+      if (resp.status === 400 || resp.status === 415 || resp.status === 422) {
+        resp = await postBrowserless(url, rt.token, "application/javascript", jsCode);
+      }
+    } catch (e) {
+      throw new Error(formatFetchError(e, `Browserless ${rt.baseUrl}${rt.functionPath}`));
     }
-  } catch (e) {
-    throw new Error(formatFetchError(e, `Browserless ${rt.baseUrl}${rt.functionPath}`));
+    const text = await resp.text();
+    if (!resp.ok) {
+      let detail = text;
+      if (resp.status === 500 && /internal server error/i.test(text.trim())) {
+        detail =
+          "Internal Server Error — Chromium failed to launch or crashed. " +
+          "Usually a bad launch query flag, OOM from an oversized viewport, or a stuck Browserless container.";
+      }
+      const looksLikeCodespace = /github\.dev|github\.com|codespace|forwarded port/i.test(rt.baseUrl + " " + text);
+      if (resp.status === 401 && (!text || /github|codespace|forwarded port/i.test(text))) {
+        detail =
+          "401 from the Browserless URL (empty body usually means GitHub Codespaces, not Browserless). " +
+          "In the Codespace Ports tab set 3000 to Public, then retry. " +
+          `Host: ${rt.baseUrl}`;
+      } else if (resp.status === 404 && looksLikeCodespace && !text.trim()) {
+        detail =
+          `404 from ${rt.baseUrl} (empty body). This VDI cannot reach the Codespace port-forward URL ` +
+          "(GitHub returns 404 even when Ports shows 3000 Public). " +
+          "Use Docker Desktop Browserless OSS on http://127.0.0.1:3000 instead " +
+          "(scripts/dev-browserless.ps1 or docker compose). Restart the local backend after that.";
+      } else if (resp.status === 404 && !text.trim()) {
+        detail =
+          `404 from ${rt.baseUrl}${rt.functionPath} with an empty body. ` +
+          "The host is up but this path is missing — confirm BROWSERLESS_OSS=true (OSS uses /chromium/function) " +
+          "and that Browserless is running.";
+      }
+      const err: any = new Error(`browserless ${resp.status}: ${detail}`);
+      err.status = resp.status;
+      err.body = text;
+      throw err;
+    }
+    try { return JSON.parse(text); } catch { return { raw: text }; }
+  } finally {
+    // /chromium/function tears down Chromium when the HTTP job ends (success,
+    // script error, or Browserless timeout). Client abort also ends the job.
+    // No sticky userDataDir is passed, so no profile folders are retained.
+    if (resp && !resp.bodyUsed) {
+      try { await resp.body?.cancel(); } catch { /* ignore */ }
+    }
   }
-  const text = await resp.text();
-  if (!resp.ok) {
-    let detail = text;
-    if (resp.status === 500 && /internal server error/i.test(text.trim())) {
-      detail =
-        "Internal Server Error — Chromium failed to launch or crashed. " +
-        "Usually a bad launch query flag, OOM from an oversized viewport, or a stuck Browserless container.";
-    }
-    const looksLikeCodespace = /github\.dev|github\.com|codespace|forwarded port/i.test(rt.baseUrl + " " + text);
-    if (resp.status === 401 && (!text || /github|codespace|forwarded port/i.test(text))) {
-      detail =
-        "401 from the Browserless URL (empty body usually means GitHub Codespaces, not Browserless). " +
-        "In the Codespace Ports tab set 3000 to Public, then retry. " +
-        `Host: ${rt.baseUrl}`;
-    } else if (resp.status === 404 && looksLikeCodespace && !text.trim()) {
-      detail =
-        `404 from ${rt.baseUrl} (empty body). This VDI cannot reach the Codespace port-forward URL ` +
-        "(GitHub returns 404 even when Ports shows 3000 Public). " +
-        "Use Docker Desktop Browserless OSS on http://127.0.0.1:3000 instead " +
-        "(scripts/dev-browserless.ps1 or docker compose). Restart the local backend after that.";
-    } else if (resp.status === 404 && !text.trim()) {
-      detail =
-        `404 from ${rt.baseUrl}${rt.functionPath} with an empty body. ` +
-        "The host is up but this path is missing — confirm BROWSERLESS_OSS=true (OSS uses /chromium/function) " +
-        "and that Browserless is running.";
-    }
-    const err: any = new Error(`browserless ${resp.status}: ${detail}`);
-    err.status = resp.status;
-    err.body = text;
-    throw err;
-  }
-  try { return JSON.parse(text); } catch { return { raw: text }; }
 }
 
 /** Saved scripts waited for Overview "NBRx Total" / grid headers before tab nav. */
@@ -476,26 +494,20 @@ async function resolveFilterCombinations(sb: any, scenarioId?: string) {
   }));
 }
 
-function headedModeError(rt: BrowserlessRuntime): string {
-  if (rt.isOss) {
-    return (
-      "Headed (live browser) mode is not available in self-hosted Browserless OSS. " +
-      "Live debugging and /live iframe streaming require Browserless Enterprise or Cloud. " +
-      "Use headless mode — scripts still run via POST /chromium/function and return screenshots."
-    );
-  }
-  return (
-    "Headed (Live URL) mode requires a Browserless paid plan that includes Live URLs. " +
-    "Your current token's plan does not support this feature. Use headless mode, or upgrade your Browserless plan."
-  );
+function headedFallbackReason(rt: BrowserlessRuntime, detail?: string): string {
+  const base = rt.isOss
+    ? "Local headed Chrome failed; ran headless via /chromium/function instead. Install Chrome/Edge on this machine or set HEADED_LOCAL_CHANNEL=msedge."
+    : "Headed Live URL failed; ran headless instead.";
+  return detail ? `${base} (${detail})` : base;
 }
 
-async function runOnBrowserless(rt: BrowserlessRuntime, mode: Mode, code: string, creds: any, reportUrl?: string, filterCombinations: any[] = []) {
-  if (mode === "headed") {
-    throw new Error(headedModeError(rt));
-  }
-
-  // Headless: /function executes JS Playwright only. Auto-wrap if needed.
+function prepareWrappedScript(
+  code: string,
+  creds: any,
+  reportUrl: string | undefined,
+  filterCombinations: any[],
+): string {
+  // Headless: /function (or CDP session) executes JS Playwright only. Auto-wrap if needed.
   let jsCode = (code || "").trim();
   const looksPython = /^\s*(import|from |def |async def |class )/m.test(jsCode) || jsCode.includes("playwright.async_api");
   if (looksPython || !jsCode) {
@@ -592,6 +604,79 @@ export default async (ctx) => {
     console.error("playwright-runtime: generated script failed syntax check:", syntaxError);
     wrapped = safeNavigationScript(creds, reportUrl);
   }
+  return wrapped;
+}
+
+async function runOnBrowserless(
+  rt: BrowserlessRuntime,
+  mode: Mode,
+  code: string,
+  creds: any,
+  reportUrl?: string,
+  filterCombinations: any[] = [],
+) {
+  const wrapped = prepareWrappedScript(code, creds, reportUrl, filterCombinations);
+
+  // Headed Solo: open a real Chrome/Edge window on this host (no Browserless debugger).
+  if (mode === "headed") {
+    const errors: string[] = [];
+    const useLocal = headedUseLocalChrome();
+    const allowFallback = headedFallbackHeadless();
+    await logHeadedLaunch({
+      event: "headed_request",
+      useLocal,
+      allowFallback,
+      channel: localHeadedChannel(),
+      scenarioHint: Boolean(code),
+    });
+    console.log(
+      `playwright-runtime: headed requested useLocal=${useLocal} fallback=${allowFallback} channel=${localHeadedChannel()}`,
+    );
+    if (useLocal) {
+      try {
+        const local = await runOneShotLocalHeadedChrome({
+          wrappedCode: wrapped,
+          launchArgs: launchArgList(),
+          viewport: CAPTURE_VIEWPORT,
+          channel: localHeadedChannel(),
+        });
+        console.log("playwright-runtime: headed completed via local-chrome");
+        return {
+          ...local,
+          requested_mode: "headed",
+          mode: "headed",
+        };
+      } catch (e) {
+        const msg = String((e as any)?.message || e);
+        errors.push(`local-chrome: ${msg.slice(0, 180)}`);
+        console.warn(`playwright-runtime: local headed failed: ${msg.slice(0, 300)}`);
+        if (!allowFallback) {
+          throw new Error(
+            `Local headed Chrome failed to open: ${msg}. ` +
+              "Confirm Chrome is installed, restart scripts/dev-backend.ps1, and check backend/logs/headed-launch.jsonl. " +
+              "Set HEADED_FALLBACK_HEADLESS=true only if you want silent Browserless fallback.",
+          );
+        }
+      }
+    } else if (!allowFallback) {
+      throw new Error(
+        "Headed mode requires local Chrome/Edge on the host running the backend " +
+          "(set HEADED_USE_LOCAL_CHROME=true). Browserless OSS cannot show a desktop window.",
+      );
+    }
+    const payload = await callBrowserlessFunction(rt, wrapped);
+    const data = payload?.data ?? payload;
+    const screenshot_b64 = data?.screenshot || null;
+    if (data && typeof data === "object") delete (data as any).screenshot;
+    return {
+      extracted: data,
+      screenshot_b64,
+      provider: "browserless",
+      requested_mode: "headed",
+      mode: "headless",
+      fallback_reason: headedFallbackReason(rt, errors.join(" | ") || undefined),
+    };
+  }
 
   const payload = await callBrowserlessFunction(rt, wrapped);
   const data = payload?.data ?? payload;
@@ -607,19 +692,19 @@ Deno.serve(async (req) => {
   let jobId: string | null = null;
   let jobSb: any = null;
   try {
-    const {
-      mode = "headless",
-      scenario_id,
-      code = "",
-      target = "main",
-      filter_combinations: filterComboOverride,
-    } = await req.json() as {
-      mode: Mode;
+    const body = await req.json() as {
+      mode?: Mode;
       scenario_id?: string;
       code?: string;
       target?: "main" | "reference";
       filter_combinations?: { label?: string; filters?: Record<string, unknown> }[];
     };
+    const mode: Mode = body.mode || "headless";
+    const scenario_id = body.scenario_id;
+    const code = body.code || "";
+    const target = body.target || "main";
+    const filterComboOverride = body.filter_combinations;
+
     const sb = (() => {
       const serviceRole = (Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "").trim();
       // Prefer caller JWT (same as UI). Only use service role when it looks like a real JWT.
@@ -672,7 +757,14 @@ Deno.serve(async (req) => {
       fallbackReason = "Browserless Live URLs are not available on this plan, so the script ran headless instead.";
     }
 
-    const result = await runOnBrowserless(rt, effectiveMode, code, creds, reportUrl, filterCombinations);
+    const result = await runOnBrowserless(
+      rt,
+      effectiveMode,
+      code,
+      creds,
+      reportUrl,
+      filterCombinations,
+    );
     if (fallbackReason) {
       result.mode = effectiveMode;
       result.requested_mode = mode;

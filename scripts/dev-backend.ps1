@@ -35,6 +35,7 @@ Write-Host "  NO_PROXY            = $env:NO_PROXY"
 Write-Host "  DENO_TLS_CA_STORE   = $env:DENO_TLS_CA_STORE"
 
 Set-Location (Join-Path $root "backend")
+# --allow-run: Solo "Run headed" launches local Chrome/Edge via Playwright CDP
 deno run `
   --unsafely-ignore-certificate-errors `
   --allow-net `
@@ -42,4 +43,5 @@ deno run `
   --allow-read `
   --allow-write `
   --allow-sys `
+  --allow-run `
   server.ts

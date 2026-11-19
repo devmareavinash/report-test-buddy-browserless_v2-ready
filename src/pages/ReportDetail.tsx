@@ -441,7 +441,7 @@ function PrerunEditor({ reportId, existing }: { reportId: string; existing?: any
           <Button onClick={save}>Save</Button>
         </div>
         <p className="text-xs text-muted-foreground">
-          Headed / live debug is not available on self-hosted Browserless OSS. Use a scenario Run headless from the scenario page.
+          Shared prerun runs as part of scenario execution. Use <b>Run headless</b> or <b>Run headed</b> on the scenario Runtime card to execute and debug Playwright.
         </p>
       </CardContent>
     </Card>

@@ -153,6 +153,30 @@ function jsonLog(event: string, details: Record<string, unknown> = {}) {
   })));
 }
 
+// #region agent log
+function agentDebugLog(
+  hypothesisId: string,
+  location: string,
+  message: string,
+  data: Record<string, unknown> = {},
+  runId?: string | null,
+) {
+  fetch("http://127.0.0.1:7601/ingest/7fea574a-90a5-4c13-82f0-235afdf7c6c7", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "b772b1" },
+    body: JSON.stringify({
+      sessionId: "b772b1",
+      runId: runId || "suite-ref",
+      hypothesisId,
+      location,
+      message,
+      data,
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+}
+// #endregion
+
 function makeCallFn(getCallerAuthorization: () => Promise<string>) {
   return async (name: string, body: any) => {
     const callerAuthorization = await getCallerAuthorization();
@@ -1652,13 +1676,12 @@ Deno.serve(async (req) => {
             const isolatedRefResponses = new Map<string, any>();
             let runResp: any;
             let refRespRaw: any;
-            // Solo Scenario "Run headless" injects the full matrix in one Browserless
-            // call. Per-combo isolation was added for long PCC matrices, but for
-            // normal row-count/KPI/grid cases it caused Brand empties
-            // (useful_key_count=0) while the same script succeeded solo. Match solo
-            // unless PCC / large. Missing-grid retries still work via
+            // Always match Solo: one Browserless call with the full filter matrix.
+            // Per-combo isolation (PCC and/or combos.length > 8) made suite runs much
+            // slower (N × main[+reference]) while the same scripts succeed as a single
+            // full-matrix scrape. Missing-grid retries still work via
             // missingRequiredStructuredExtraction on the full-matrix payload.
-            const isolateCombos = hasCombos && (isPccScenario || combos.length > 8);
+            const isolateCombos = false;
             if (hasCombos && isolateCombos) {
               const isolated = await mapPool(combos, 1, async (combo) => {
                 await cancellation.throwIfCancelled({
@@ -1734,6 +1757,30 @@ Deno.serve(async (req) => {
                     }, "reference", null)
                   : Promise.resolve(null),
               ]);
+              // #region agent log
+              {
+                const resultKeys = (resp: any) => {
+                  const root = resp?.extracted?.result;
+                  if (!root || typeof root !== "object") return [];
+                  const nested = root.results && typeof root.results === "object" ? root.results : root;
+                  return Object.keys(nested).filter((k) => !String(k).startsWith("__")).slice(0, 20);
+                };
+                agentDebugLog("A", "agent-orchestrate/index.ts:after_parallel_scrape", "main+ref Promise.all finished", {
+                  run_id: run.id,
+                  scenario_id: s.id,
+                  ref_code_bytes: refCode ? refCode.length : 0,
+                  main_code_bytes: executableCode ? String(executableCode).length : 0,
+                  main_ok: runResp?.ok !== false && !runResp?.error,
+                  ref_ok: refRespRaw == null ? null : (refRespRaw?.ok !== false && !refRespRaw?.error),
+                  ref_error: refRespRaw?.error || refRespRaw?.extracted?.error || null,
+                  main_result_keys: resultKeys(runResp),
+                  ref_result_keys: resultKeys(refRespRaw),
+                  main_usable_null_label: countUsableKpisInPayload(runResp, null),
+                  ref_usable_null_label: refRespRaw ? countUsableKpisInPayload(refRespRaw, null) : null,
+                  combo_count: combos.length,
+                }, run.id);
+              }
+              // #endregion
               await cancellation.throwIfCancelled({
                 checkpoint: "after_runtime",
                 report_id: reportId,
@@ -1846,7 +1893,28 @@ Deno.serve(async (req) => {
                 }
                 if (isRef && !refError && refCode) {
                   const reference = selectedResponse(refResp, combo);
-                  if (comboExecutionError(reference, combo.label) || comboExtractionNeedsRetry(reference, combo.label, { requireStructured: requireStructuredExtraction, configuredLabels: comparisonKpiLabels })) {
+                  const refNeedsRetry = comboExecutionError(reference, combo.label) || comboExtractionNeedsRetry(reference, combo.label, { requireStructured: requireStructuredExtraction, configuredLabels: comparisonKpiLabels });
+                  // #region agent log
+                  {
+                    const scraped = pickComboKpis(reference, combo.label, comparisonKpiLabels, kpiAliases) || {};
+                    const configuredNonEmpty = comparisonKpiLabels.filter((lbl) => {
+                      const raw = lookupConfiguredKpiValue(scraped, lbl, kpiAliases);
+                      return raw != null && String(raw).trim() !== "";
+                    }).length;
+                    agentDebugLog("B", "agent-orchestrate/index.ts:ref_combo_retry_gate", "reference per-combo retry gate", {
+                      run_id: run.id,
+                      scenario_id: s.id,
+                      combo: combo.label,
+                      needs_retry: refNeedsRetry,
+                      exec_error: comboExecutionError(reference, combo.label),
+                      usable_count: countUsableKpisInPayload(reference, combo.label),
+                      configured_non_empty: configuredNonEmpty,
+                      configured_total: comparisonKpiLabels.length,
+                      scraped_keys: Object.keys(scraped).slice(0, 15),
+                    }, run.id);
+                  }
+                  // #endregion
+                  if (refNeedsRetry) {
                     const retried = await invokeRuntimeWithRetry({ mode: "headless", scenario_id: s.id, code: refCode, target: "reference", filter_combinations: [{ id: combo.id, label: combo.label, filters: combo.filters || {} }] }, "reference", combo.label);
                     isolatedRefResponses.set(String(combo.id), retried);
                   }
@@ -2002,6 +2070,27 @@ Deno.serve(async (req) => {
                     ? raw
                     : (looksLikeDateValue(raw) ? String(raw).trim() : preserveConfiguredScalar(raw, lbl));
                 }
+                // #region agent log
+                {
+                  const expNonEmpty = Object.entries(expectedMap).filter(([, v]) => v != null && String(v).trim() !== "").length;
+                  agentDebugLog("C", "agent-orchestrate/index.ts:ref_expected_build", "reference expected map built", {
+                    run_id: run.id,
+                    scenario_id: s.id,
+                    combo: combo.label,
+                    ref_filter_ok: refFilterVerificationOk,
+                    combo_ref_error: comboRefError,
+                    used_isolated_retry: isolatedRefResponses.has(String(combo.id)),
+                    exp_non_empty: expNonEmpty,
+                    exp_total: Object.keys(expectedMap).length,
+                    ref_scraped_keys: Object.keys(refScraped).slice(0, 15),
+                    filter_evidence: (referenceVerification.evidence || []).slice(0, 6).map((e: any) => ({
+                      key: e.key,
+                      outcome: e.verification_outcome,
+                      selection: e.selection_outcome,
+                    })),
+                  }, run.id);
+                }
+                // #endregion
                 const refGrid = pickStructured(refScraped);
                 if (refGrid && expectedMap[refGrid.k] == null) {
                   const alias = configuredStructuredKpiAlias(refGrid.k, comparisonKpiLabels);
@@ -2494,6 +2583,22 @@ Deno.serve(async (req) => {
 
               if (!filterVerification.ok || !refFilterVerificationOk) failureCategory = "partial_extraction";
               const status = statusFromCategory(failureCategory, comboPass);
+              // #region agent log
+              agentDebugLog("D", "agent-orchestrate/index.ts:combo_persist_outcome", "combo persist outcome", {
+                run_id: run.id,
+                scenario_id: s.id,
+                combo: combo.label,
+                status,
+                failure_category: failureCategory,
+                combo_pass: comboPass,
+                main_filter_ok: filterVerification.ok,
+                ref_filter_ok: refFilterVerificationOk,
+                main_missing: mainOutcome.missing_fields,
+                ref_missing: refOutcome?.missing_fields || [],
+                expected_non_empty: Object.entries(expectedMap).filter(([, v]) => v != null && String(v).trim() !== "").length,
+                actual_non_empty: Object.entries(actualMap).filter(([, v]) => v != null && String(v).trim() !== "").length,
+              }, run.id);
+              // #endregion
               const attemptCount = Number((comboRunResp as any)?.__rtb_attempts) ||
                 Number((comboRunResp as any)?.auth_session_attempts) || 1;
               const missingAll = Array.from(new Set([

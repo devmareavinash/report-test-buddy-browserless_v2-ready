@@ -12,7 +12,7 @@ import { PromptInput, PromptInputTextarea, PromptInputFooter, PromptInputSubmit 
 import { Tool, ToolHeader, ToolContent, ToolInput, ToolOutput } from "@/components/ai-elements/tool";
 import { Reasoning, ReasoningTrigger, ReasoningContent } from "@/components/ai-elements/reasoning";
 import { Shimmer } from "@/components/ai-elements/shimmer";
-import { canApplyScriptProposal, type ScriptProposal } from "../../supabase/functions/script-agent-chat/proposal";
+import { canApplyScriptProposal, parseConversationStore, type ScriptProposal } from "@/lib/script-agent-proposal";
 import logo from "@/assets/logo.png";
 import { FileCode2, Check } from "lucide-react";
 import { toast } from "sonner";
@@ -21,6 +21,8 @@ type Props = {
   open: boolean; onOpenChange: (open: boolean) => void;
   scriptId: string; title: string; code: string; runtimeError: string | null;
   onApply: (code: string) => void;
+  /** Which persisted thread to load (backend ConversationStore v2). */
+  target?: "main" | "reference";
 };
 
 export function ScriptAgentChat(props: Props) {
@@ -32,7 +34,11 @@ export function ScriptAgentChat(props: Props) {
       const { data, error } = await supabase.from("script_agent_conversations").select("messages")
         .eq("script_id", props.scriptId).eq("user_id", auth.user.id).maybeSingle();
       if (error) throw new Error(error.message);
-      return (data?.messages || []) as unknown as UIMessage[];
+      const raw = data?.messages;
+      const parsed = parseConversationStore(raw);
+      const target = props.target ?? "main";
+      const thread = parsed[target];
+      return (Array.isArray(thread) ? thread : []) as UIMessage[];
     },
   });
   return <Sheet open={props.open} onOpenChange={props.onOpenChange}>
@@ -63,7 +69,12 @@ function ChatSession({ initialMessages, ...props }: Props & { initialMessages: U
   const [applied, setApplied] = useState<string | null>(null);
   const transport = useMemo(() => new DefaultChatTransport({
     api: functionEndpoint("script-agent-chat"), headers: functionAuthHeaders,
-    body: () => ({ scriptId: current.current.scriptId, code: current.current.code, runtimeError: current.current.runtimeError }),
+    body: () => ({
+      scriptId: current.current.scriptId,
+      code: current.current.code,
+      runtimeError: current.current.runtimeError,
+      target: current.current.target ?? "main",
+    }),
     fetch: async (url, init) => {
       const response = await fetch(url, init);
       if (!response.ok) {
@@ -81,13 +92,14 @@ function ChatSession({ initialMessages, ...props }: Props & { initialMessages: U
   useEffect(() => {
     if (!busy) textarea.current?.focus();
   }, [busy, props.scriptId]);
+  const safeMessages = Array.isArray(messages) ? messages : [];
   return <div className="flex min-h-0 flex-1 flex-col">
     <Conversation className="min-h-0" aria-label="Script agent conversation">
       <ConversationContent className="gap-5">
-        {!messages.length && <div className="flex items-center gap-2 py-5 text-sm text-muted-foreground"><FileCode2 className="h-5 w-5" />{props.title}</div>}
-        {messages.map((message) => <Message key={message.id} from={message.role} className="max-w-full">
+        {!safeMessages.length && <div className="flex items-center gap-2 py-5 text-sm text-muted-foreground"><FileCode2 className="h-5 w-5" />{props.title}</div>}
+        {safeMessages.map((message) => <Message key={message.id} from={message.role} className="max-w-full">
           <MessageContent className={message.role === "user" ? "group-[.is-user]:bg-primary group-[.is-user]:text-primary-foreground rounded-md" : "w-full"}>
-            {message.parts.map((part, index) => {
+            {(Array.isArray(message.parts) ? message.parts : []).map((part, index) => {
               if (part.type === "text") return <MessageResponse key={index}>{part.text}</MessageResponse>;
               if (part.type === "reasoning") return <Reasoning key={index} defaultOpen={false} isStreaming={part.state === "streaming"}><ReasoningTrigger /><ReasoningContent>{part.text}</ReasoningContent></Reasoning>;
               if (isToolUIPart(part)) {

@@ -39,6 +39,33 @@ Deno.serve(async (req) => {
           ? cronParser.parseExpression(s.cron, { currentDate: now, utc: true })
           : cronParser.parseExpression(s.cron, { currentDate: now, tz });
         const prev = it.prev().toDate();
+        // #region agent log
+        if (s.scope_id === "ef76403d-8368-4f69-b8e8-8c7abeec75a7" || String(s.scope_id || "").startsWith("ef76403d")) {
+          fetch("http://127.0.0.1:7601/ingest/7fea574a-90a5-4c13-82f0-235afdf7c6c7", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "b772b1" },
+            body: JSON.stringify({
+              sessionId: "b772b1",
+              runId: "schedule-tick",
+              hypothesisId: "DUE",
+              location: "schedule-tick/index.ts:evaluate",
+              message: "evaluate report schedule",
+              data: {
+                id: s.id,
+                cron: s.cron,
+                tz,
+                enabled: s.enabled,
+                prev: prev.toISOString(),
+                baseline: baseline.toISOString(),
+                due: prev > baseline,
+                last_run_at: s.last_run_at,
+                created_at: s.created_at,
+              },
+              timestamp: Date.now(),
+            }),
+          }).catch(() => {});
+        }
+        // #endregion
         if (prev > baseline) {
           if (!["workstream", "report"].includes(s.scope_type) || !s.scope_id) {
             skipped.push({ id: s.id, reason: "invalid_scope" });

@@ -51,7 +51,9 @@
         { "name": "SNOWFLAKE_SSO_URL", "value": "http://127.0.0.1:8002" },
         { "name": "LOCAL_FUNCTIONS_URL", "value": "http://127.0.0.1:8000/functions/v1" },
         { "name": "ORCHESTRATE_CONCURRENCY", "value": "3" },
-        { "name": "PORT", "value": "8000" }
+        { "name": "PORT", "value": "8000" },
+        { "name": "SCHEDULE_TICK_ENABLED", "value": "true" },
+        { "name": "SCHEDULE_TICK_INTERVAL_MS", "value": "60000" }
       ],
       "secrets": [
         { "name": "SUPABASE_URL", "valueFrom": "arn:aws:secretsmanager:us-east-1:717998086494:secret:rtb/prod:SUPABASE_URL::" },

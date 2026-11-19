@@ -1,0 +1,7 @@
+{
+  "nodeModulesDir": "auto",
+  "imports": {
+    "playwright-core": "npm:playwright-core@1.47.0",
+    "acorn": "npm:acorn@8.15.0"
+  }
+}

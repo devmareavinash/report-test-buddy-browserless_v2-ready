@@ -33,14 +33,16 @@ ENV HTTP_PROXY=$HTTP_PROXY \
 # Copy edge functions and the gateway server
 COPY supabase/functions ./functions
 COPY backend/server.ts  ./server.ts
+COPY backend/deno.json  ./deno.json
 COPY backend/docker-entrypoint.sh ./docker-entrypoint.sh
 # Strip Windows CRLF line endings (prevents "exec ./docker-entrypoint.sh: no such file or directory")
 RUN sed -i 's/\r$//' ./docker-entrypoint.sh && chmod +x ./docker-entrypoint.sh
 
-# Pre-cache all function deps at build time.
+# Pre-cache all function deps at build time (includes playwright-core for Solo headed).
 # --unsafely-ignore-certificate-errors: Bayer SSL inspection breaks Deno's Mozilla CA store.
 # Runtime has no outbound DNS for esm.sh on many corp/Docker Desktop setups, so cache MUST succeed.
 RUN set -e; \
+    deno install --node-modules-dir=auto --unsafely-ignore-certificate-errors; \
     FILES=$(find functions -name '*.ts' ! -name '*.test.ts' | sort); \
     echo "Caching $(echo $FILES | wc -w) files in one resolution..."; \
     deno cache --lock=deno.lock --unsafely-ignore-certificate-errors --no-check $FILES server.ts

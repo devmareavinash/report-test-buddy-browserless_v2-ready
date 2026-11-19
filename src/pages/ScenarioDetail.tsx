@@ -498,37 +498,39 @@ export default function ScenarioDetail() {
       }
       if (dbCode && dbCode !== editorCode) setCode(dbCode);
       const request = { mode, scenario_id: id, code: runCode, script_version: (fresh as any)?.version, filter_combinations: combos?.map(c => ({ id: c.id, label: c.label, filters: c.filters })) };
-      const { data, error } = mode === "headless"
-        ? await runTracedHeadless(request, setHeadlessSteps)
-        : await invokeFunction("playwright-runtime", request);
+      if (mode === "headed") setLiveUrl(null);
+      const { data, error } = await runTracedHeadless(request, setHeadlessSteps);
       const loginFailure = reportLoginFailure(data);
       if (loginFailure) { setRunResult(data); setRunError(`Report sign-in stopped: ${loginFailure}. Confirm account access before rerunning.`); toast.error("Report sign-in failed; no retry was attempted."); return; }
       const errorMessage = data?.message || error?.message || (data?.ok === false ? data?.error : null) || (!data ? "Run failed" : null);
       if (errorMessage) { setRunError(errorMessage); toast.error(errorMessage); return; }
       if (mode === "headed") {
         if (data?.live_url) setLiveUrl(data.live_url);
-        else if (data?.requested_mode === "headed" && data?.mode === "headless") {
-          setRunResult(data);
-          toast.info(data.fallback_reason || "Live debug is unavailable; ran headless instead.");
-          setDetailTab("result");
-          const savedRunId = await persistManualHeadlessRun({
-            scenarioId: id!,
-            reportId: (scenario as any)?.reports?.id,
-            payload: data,
-            combos: combos || [],
-            criticality: (scenario as any)?.criticality,
-            referencePayload: refRunResultRef.current,
-            storedRows: latestResults || [],
-            tolerances: kpiTolerances,
-            sqlByCombo: comboResults,
-            sqlResult,
-            isReferenceMatch,
-          });
-          saveTarget.complete(savedRunId || null);
-          if (savedRunId) invalidateLatestStatusViews(qc, id, (scenario as any)?.reports?.id);
-          else toast.error("Run finished but latest status was not saved");
+        setRunResult(data);
+        if (data?.requested_mode === "headed" && data?.mode === "headless") {
+          toast.warning(data.fallback_reason || "Local Chrome did not open; ran headless instead. Restart scripts/dev-backend.ps1 (needs --allow-run).");
+        } else if (data?.provider === "local-chrome") {
+          toast.success("Headed run finished (local Chrome window)");
+        } else {
+          toast.success("Headed run finished");
         }
-        else setRunError("Runtime did not return a live_url");
+        setDetailTab("result");
+        const savedRunId = await persistManualHeadlessRun({
+          scenarioId: id!,
+          reportId: (scenario as any)?.reports?.id,
+          payload: data,
+          combos: combos || [],
+          criticality: (scenario as any)?.criticality,
+          referencePayload: refRunResultRef.current,
+          storedRows: latestResults || [],
+          tolerances: kpiTolerances,
+          sqlByCombo: comboResults,
+          sqlResult,
+          isReferenceMatch,
+        });
+        saveTarget.complete(savedRunId || null);
+        if (savedRunId) invalidateLatestStatusViews(qc, id, (scenario as any)?.reports?.id);
+        else toast.error("Run finished but latest status was not saved");
       } else {
         setRunResult(data);
         const kpis = extractKpisFromRun(data);
@@ -548,9 +550,9 @@ export default function ScenarioDetail() {
           sqlResult,
           isReferenceMatch,
         });
-          saveTarget.complete(savedRunId || null);
-          if (savedRunId) invalidateLatestStatusViews(qc, id, (scenario as any)?.reports?.id);
-          else toast.error("Run finished but latest status was not saved");
+        saveTarget.complete(savedRunId || null);
+        if (savedRunId) invalidateLatestStatusViews(qc, id, (scenario as any)?.reports?.id);
+        else toast.error("Run finished but latest status was not saved");
       }
     } catch (e: any) {
       setRunError(String(e?.message || e));
@@ -768,32 +770,27 @@ export default function ScenarioDetail() {
       }
       if (dbRef && dbRef !== String(refCode || "").trim()) setRefCode(dbRef);
       const request = { mode, scenario_id: id, code: runRef, target: "reference", filter_combinations: combos?.map(c => ({ id: c.id, label: c.label, filters: c.filters })) };
-      const { data, error } = mode === "headless"
-        ? await runTracedHeadless(request, setReferenceSteps)
-        : await invokeFunction("playwright-runtime", request);
+      if (mode === "headed") setRefLiveUrl(null);
+      const { data, error } = await runTracedHeadless(request, setReferenceSteps);
       const loginFailure = reportLoginFailure(data);
       if (loginFailure) { setRefRunResult(data); setRefRunError(`Report sign-in stopped: ${loginFailure}. Confirm account access before rerunning.`); toast.error("Reference sign-in failed; no retry was attempted."); return; }
       const errorMessage = data?.message || error?.message || (data?.ok === false ? data?.error : null) || (!data ? "Run failed" : null);
       if (errorMessage) { setRefRunError(errorMessage); toast.error(errorMessage); return; }
-      if (mode === "headed") {
-        if (data?.live_url) setRefLiveUrl(data.live_url);
-        else if (data?.requested_mode === "headed" && data?.mode === "headless") {
-          toast.info(data.fallback_reason || "Live debug is unavailable; ran headless instead.");
-        } else { setRefRunError("Runtime did not return a live_url"); return; }
+      if (data?.live_url) setRefLiveUrl(data.live_url);
+      setRefRunResult(data);
+      if (mode === "headed" && data?.requested_mode === "headed" && data?.mode === "headless") {
+        toast.warning(data.fallback_reason || "Local Chrome did not open; ran headless instead. Restart scripts/dev-backend.ps1 (needs --allow-run).");
       }
-      if (mode === "headless" || (data?.requested_mode === "headed" && data?.mode === "headless")) {
-        setRefRunResult(data);
-        const kpis = extractKpisFromRun(data);
-        toast.success(kpis ? `Reference: extracted ${Object.keys(kpis).length} KPIs` : "Reference run finished");
-        setDetailTab("result");
-        const targetRunId = await requireSavedRun(targetRun);
-        const ok = await persistReferenceHeadlessRun({
-          scenarioId: id || "", payload: data, combos: combos || [],
-          tolerances: kpiTolerances, targetRunId,
-        });
-        if (!ok) throw new Error("Reference finished but its matching Actual result could not be updated.");
-        invalidateLatestStatusViews(qc, id || "", (scenario as any)?.reports?.id);
-      }
+      const kpis = extractKpisFromRun(data);
+      toast.success(kpis ? `Reference: extracted ${Object.keys(kpis).length} KPIs` : "Reference run finished");
+      setDetailTab("result");
+      const targetRunId = await requireSavedRun(targetRun);
+      const ok = await persistReferenceHeadlessRun({
+        scenarioId: id || "", payload: data, combos: combos || [],
+        tolerances: kpiTolerances, targetRunId,
+      });
+      if (!ok) throw new Error("Reference finished but its matching Actual result could not be updated.");
+      invalidateLatestStatusViews(qc, id || "", (scenario as any)?.reports?.id);
     } catch (e: any) {
       setRefRunError(String(e?.message || e));
       toast.error(String(e?.message || e));
@@ -897,8 +894,10 @@ export default function ScenarioDetail() {
         limit: 5,
       });
       if (error) throw error;
-      const nextCombo = { ...comboResults, [combo.id]: { ...data, where_clause: where, pairs, missing } };
-      setComboResults(nextCombo);
+      const entry = { ...data, where_clause: where, pairs, missing };
+      // Functional update: runAllCombos awaits runComboSql in a loop that closes over a
+      // stale comboResults snapshot, so `{ ...comboResults, [id]: entry }` wiped prior combos.
+      setComboResults((prev) => ({ ...prev, [combo.id]: entry }));
       if (data?.ok) {
         toast.success(`${combo.label || "Combination"}: ${data.row_count} row(s)`);
         const persisted = await persistWarehouseExpected({
@@ -906,7 +905,7 @@ export default function ScenarioDetail() {
           scenarioId: id!,
           reportId: (scenario as any)?.reports?.id,
           combos: combos || [],
-          sqlByCombo: { [combo.id]: nextCombo[combo.id] },
+          sqlByCombo: { [combo.id]: entry },
           sqlResult: data,
           tolerances: kpiTolerances,
         });
@@ -1542,8 +1541,8 @@ export default function ScenarioDetail() {
           </TabsContent>
 
           {/* TAB 2 — Reference script + embedded runtime */}
-          <HeadlessStepLog steps={headlessSteps} running={running === "headless"} />
-          <HeadlessStepLog steps={referenceSteps} running={refRunning === "headless"} />
+          <HeadlessStepLog steps={headlessSteps} running={running === "headless" || running === "headed"} />
+          <HeadlessStepLog steps={referenceSteps} running={refRunning === "headless" || refRunning === "headed"} />
           {isReferenceMatch && (
             <TabsContent value="ref" className="space-y-3 mt-4">
               <Card>
@@ -2110,10 +2109,15 @@ function RuntimeBlock({
       <CardContent className="space-y-3">
         <div className="flex gap-2 flex-wrap items-center">
           <Button disabled={!!running} onClick={() => onRun("headless")}><Play className="h-3 w-3 mr-1" />{running === "headless" ? "Running…" : "Run headless"}</Button>
+          <Button variant="secondary" disabled={!!running} onClick={() => onRun("headed")}>
+            <Play className="h-3 w-3 mr-1" />{running === "headed" ? "Running headed…" : "Run headed"}
+          </Button>
           {extra}
         </div>
         <p className="text-xs text-muted-foreground">
-          Headed / live browser is not available on self-hosted Browserless OSS. Scripts run headless via /chromium/function and return screenshots.
+          Headless uses Browserless (screenshots only). Headed opens a real Chrome/Edge window on this
+          machine so you can watch the script — no Browserless debugger and no ChromeDriver.
+          If local Chrome cannot launch, it falls back to headless.
         </p>
         {footer}
         {runError && (
@@ -2124,7 +2128,7 @@ function RuntimeBlock({
         {liveUrl && (
           <div className="space-y-1">
             <div className="text-[10px] uppercase text-muted-foreground">Live browser · {liveUrl}</div>
-            <iframe src={liveUrl} className="w-full h-[640px] rounded border border-border bg-secondary/40" />
+            <iframe src={liveUrl} className="w-full h-[640px] rounded border border-border bg-secondary/40" title="Live browser" />
           </div>
         )}
         {runResult && !runError && (
